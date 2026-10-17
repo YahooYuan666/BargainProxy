@@ -23,6 +23,7 @@ type Request struct {
 	MaxTokens     int             `json:"max_tokens,omitempty"`
 	Temperature   *float64        `json:"temperature,omitempty"`
 	TopP          *float64        `json:"top_p,omitempty"`
+	TopK          *int            `json:"top_k,omitempty"`
 	StopSequences []string        `json:"stop_sequences,omitempty"`
 	Stream        bool            `json:"stream,omitempty"`
 	Thinking      *WireThinking   `json:"thinking,omitempty"`
@@ -61,6 +62,7 @@ func ParseMessagesRequest(body []byte) (*ir.ChatRequest, error) {
 		Stream:      w.Stream,
 		Temperature: w.Temperature,
 		TopP:        w.TopP,
+		TopK:        w.TopK,
 		MaxTokens:   w.MaxTokens,
 		Stop:        w.StopSequences,
 	}
@@ -101,9 +103,7 @@ func ParseMessagesRequest(body []byte) (*ir.ChatRequest, error) {
 		req.Tools = append(req.Tools, ir.ToolDef{Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
 	}
 	if len(w.ToolChoice) > 0 {
-		if t, ok := w.ToolChoice["type"].(string); ok {
-			req.ToolChoice = t
-		}
+		req.ToolChoice, req.ToolChoiceName, req.DisableParallel = ir.NormalizeToolChoice(map[string]any(w.ToolChoice))
 	}
 	// Session identity, three-level fallback: explicit metadata id →
 	// cache_control-marked block digest → system+first-user prefix digest.
@@ -230,7 +230,20 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 				main.Content = append(main.Content, ir.ContentPart{Kind: "text", Text: t})
 			}
 		case "thinking":
-			// Drop thinking blocks from history (not replayable).
+			// Preserve assistant reasoning for upstreams that can replay it.
+			// Kept out of Content so OpenAI-shaped drivers never treat it as
+			// body text; the zcode driver decides whether the signature makes
+			// the block replayable (BP-69).
+			if main.Role == ir.RoleAssistant {
+				text, _ := b["thinking"].(string)
+				sig, _ := b["signature"].(string)
+				if text != "" || sig != "" {
+					main.Thinking = append(main.Thinking, ir.ThinkingBlock{Text: text, Signature: sig})
+				}
+			}
+		case "redacted_thinking":
+			// Provider-encrypted reasoning (Anthropic-only): not replayable
+			// through a foreign gateway, keep dropping.
 		case "image":
 			if src, ok := b["source"].(map[string]any); ok {
 				if srcType, _ := src["type"].(string); srcType == "base64" {
@@ -288,6 +301,7 @@ func mergeAdjacent(in []ir.Message) []ir.Message {
 			if last.Role == m.Role && last.Role != ir.RoleTool && m.Role != ir.RoleTool {
 				last.Content = append(last.Content, m.Content...)
 				last.ToolCalls = append(last.ToolCalls, m.ToolCalls...)
+				last.Thinking = append(last.Thinking, m.Thinking...)
 				continue
 			}
 		}
@@ -401,11 +415,13 @@ func RenderMessage(id, model string, resp *ir.ChatResponse) *MessageResponse {
 	}
 	text := textOf(resp.Message.Content)
 	// Thinking first (Anthropic block order): the aggregated reasoning from
-	// the upstream is rendered as a thinking block. No signature field — our
-	// upstreams never issue Anthropic thinking signatures, and a fabricated
-	// one would fail verification on replay (BP-41).
+	// the upstream is rendered as a thinking block. The signature is forwarded
+	// only when the upstream issued one; fabricating it would fail verification
+	// on replay (BP-41/BP-69).
 	if resp.Thinking != "" {
-		out.Content = append(out.Content, ContentBlock{Type: "thinking", Thinking: resp.Thinking})
+		out.Content = append(out.Content, ContentBlock{
+			Type: "thinking", Thinking: resp.Thinking, Signature: resp.ThinkingSignature,
+		})
 	}
 	if text != "" {
 		out.Content = append(out.Content, ContentBlock{Type: "text", Text: text})
@@ -476,6 +492,9 @@ func EstimateTokens(req *ir.ChatRequest) int {
 	for _, m := range req.Messages {
 		for _, p := range m.Content {
 			count(p.Text)
+		}
+		for _, th := range m.Thinking {
+			count(th.Text)
 		}
 		for _, tc := range m.ToolCalls {
 			count(tc.Arguments)

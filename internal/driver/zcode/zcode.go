@@ -21,6 +21,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"bargainproxy/internal/config"
@@ -99,6 +100,11 @@ type Driver struct {
 	cfg  config.ZCodeSettings
 	http *http.Client // streaming chat calls (no total timeout + header/idle watchdogs)
 	rpc  *http.Client // short probe / plan calls (total timeout)
+	// allowUnsignedThinking gates replay of history thinking blocks whose
+	// upstream signature is empty. If the upstream ever rejects such a replay,
+	// one 400 is enough to disable it for this process — otherwise every tool
+	// turn would pay an extra round trip (BP-69).
+	allowUnsignedThinking atomic.Bool
 }
 
 // New builds the driver.
@@ -106,7 +112,9 @@ func New(cfg config.ZCodeSettings, httpClient *http.Client) *Driver {
 	if httpClient == nil {
 		httpClient = httpx.ChatClient()
 	}
-	return &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
+	d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
+	d.allowUnsignedThinking.Store(true)
+	return d
 }
 
 // Channel implements driver.Driver.
@@ -169,20 +177,52 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if creds.JWT == "" {
 		return nil, uperr.New(uperr.ClassAuth, 401, "zcode: missing jwt")
 	}
-	body, err := d.normalizeBody(call, creds)
+	body, hadThinking, hadUnsigned, err := d.normalizeBody(call, creds, true)
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "zcode: build body: %v", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.base()+messagesPath, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	do := func(wire []byte) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.base()+messagesPath, bytes.NewReader(wire))
+		if err != nil {
+			return nil, err
+		}
+		identityHeaders(req, creds, defaultAppVersion)
+		return d.http.Do(req)
 	}
-	identityHeaders(req, creds, defaultAppVersion)
-	resp, err := d.http.Do(req)
+	resp, err := do(body)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "zcode: %v", err)
 	}
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode == http.StatusBadRequest && hadThinking {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if thinkingReplayRejected(raw) {
+			// The replayed thinking block was rejected (foreign/stale
+			// signature). Degrade to the pre-BP-69 body — dropping history
+			// thinking is safe, so the request must not fail because we tried
+			// to preserve it.
+			if hadUnsigned {
+				d.allowUnsignedThinking.Store(false)
+				log.Printf("zcode: unsigned history thinking rejected; disabling unsigned replay for this process")
+			}
+			log.Printf("zcode: history thinking rejected by upstream; retrying without it")
+			degraded, _, _, berr := d.normalizeBody(call, creds, false)
+			if berr != nil {
+				return nil, uperr.New(uperr.ClassInternal, 0, "zcode: rebuild body: %v", berr)
+			}
+			resp, err = do(degraded)
+			if err != nil {
+				return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "zcode: %v", err)
+			}
+			if resp.StatusCode != http.StatusOK {
+				raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				resp.Body.Close()
+				return nil, classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+			}
+		} else {
+			return nil, classifyHTTP(http.StatusBadRequest, raw, call.UpstreamModel)
+		}
+	} else if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		return nil, classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
@@ -192,12 +232,21 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	return d.parseAnthropicSSE(ctx, streamBody, call, emit)
 }
 
+// thinkingReplayRejected recognizes the Anthropic 400 family that complains
+// about a replayed thinking/signature block.
+func thinkingReplayRejected(raw []byte) bool {
+	s := strings.ToLower(string(raw))
+	return strings.Contains(s, "thinking") || strings.Contains(s, "signature")
+}
+
 // normalizeBody converts the IR request into the Anthropic body expected by
 // the start-plan endpoint, applying: model alias resolution, official
 // identity blocks + dynamic currentModel block, user system appended after,
-// cache_control ephemeral on the last non-system block, and
-// metadata.user_id = JWT sub.
-func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds) ([]byte, error) {
+// cache_control ephemeral on the last non-system block, metadata.user_id =
+// JWT sub, and (BP-69) replayable assistant thinking blocks, tool_choice and
+// top_k. withThinkingHistory=false builds the degraded body used when the
+// upstream rejects replayed thinking.
+func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds, withThinkingHistory bool) ([]byte, bool, bool, error) {
 	req := call.Request
 	upstreamModel := ResolveModel(call.UpstreamModel)
 	if call.UpstreamModel != "" {
@@ -208,6 +257,8 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds) ([]byte, erro
 
 	var messages []map[string]any
 	var userSystem []string
+	hadThinking := false
+	hadUnsigned := false
 	for _, m := range req.Messages {
 		if m.Role == ir.RoleSystem {
 			for _, p := range m.Content {
@@ -219,6 +270,27 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds) ([]byte, erro
 		}
 		wire := map[string]any{"role": string(m.Role)}
 		var parts []map[string]any
+		// Replay signed/unsigned thinking blocks for assistant tool-use turns
+		// (Anthropic requires the block immediately preceding tool results).
+		// They must come before text and tool_use. Plain assistant turns are
+		// not replayed: dropping them is safe and saves prompt tokens.
+		if withThinkingHistory && m.Role == ir.RoleAssistant && len(m.ToolCalls) > 0 {
+			for _, th := range m.Thinking {
+				if th.Text == "" && th.Signature == "" {
+					continue
+				}
+				if th.Signature == "" && !d.allowUnsignedThinking.Load() {
+					continue
+				}
+				parts = append(parts, map[string]any{
+					"type": "thinking", "thinking": th.Text, "signature": th.Signature,
+				})
+				hadThinking = true
+				if th.Signature == "" {
+					hadUnsigned = true
+				}
+			}
+		}
 		for _, p := range m.Content {
 			switch p.Kind {
 			case "text":
@@ -307,6 +379,9 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds) ([]byte, erro
 	if req.TopP != nil {
 		body["top_p"] = *req.TopP
 	}
+	if req.TopK != nil {
+		body["top_k"] = *req.TopK
+	}
 	if len(req.Tools) > 0 {
 		var tools []map[string]any
 		for _, t := range req.Tools {
@@ -327,11 +402,48 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds) ([]byte, erro
 			thinking["budget_tokens"] = req.Thinking.BudgetTokens
 		}
 		body["thinking"] = thinking
+	} else if budget := ir.BudgetFromLevel(req.RequestedEffort); budget > 0 {
+		// Chat/Responses ingress carries reasoning_effort only. Without this
+		// fallback the zcode channel silently ran without thinking whenever
+		// the client did not send an Anthropic thinking block (BP-69).
+		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
+	}
+	if tc := anthropicToolChoice(req.ToolChoice, req.ToolChoiceName, req.DisableParallel); tc != nil {
+		body["tool_choice"] = tc
 	}
 	if uid := JWTSub(creds.JWT); uid != "" {
 		body["metadata"] = map[string]any{"user_id": uid}
 	}
-	return json.Marshal(body)
+	raw, err := json.Marshal(body)
+	return raw, hadThinking, hadUnsigned, err
+}
+
+// anthropicToolChoice renders the IR's portable choice vocabulary on the
+// Anthropic wire. The zcode driver previously sent no tool_choice at all, so
+// forced/named tool calls were silently ignored on this channel (BP-69).
+func anthropicToolChoice(choice any, name string, disableParallel bool) map[string]any {
+	var out map[string]any
+	switch c, _ := choice.(string); c {
+	case "required":
+		if name != "" {
+			out = map[string]any{"type": "tool", "name": name}
+		} else {
+			out = map[string]any{"type": "any"}
+		}
+	case "auto":
+		out = map[string]any{"type": "auto"}
+	case "none":
+		out = map[string]any{"type": "none"}
+	default:
+		if !disableParallel {
+			return nil
+		}
+		out = map[string]any{"type": "auto"}
+	}
+	if disableParallel {
+		out["disable_parallel_tool_use"] = true
+	}
+	return out
 }
 
 // parseAnthropicSSE consumes the Anthropic-shaped upstream stream.
@@ -342,6 +454,7 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 	var (
 		textBuf   strings.Builder
 		thinkBuf  strings.Builder
+		thinkSig  string
 		tools     = map[int]*ir.ToolCall{}
 		toolOrder []int
 		usage     ir.Usage
@@ -379,15 +492,17 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 			// content_block_start
 			Index        int `json:"index"`
 			ContentBlock *struct {
-				Type string `json:"type"`
-				ID   string `json:"id"`
-				Name string `json:"name"`
+				Type      string `json:"type"`
+				ID        string `json:"id"`
+				Name      string `json:"name"`
+				Signature string `json:"signature"`
 			} `json:"content_block"`
 			// content_block_delta
 			Delta *struct {
 				Type        string `json:"type"`
 				Text        string `json:"text"`
 				Thinking    string `json:"thinking"`
+				Signature   string `json:"signature"`
 				PartialJSON string `json:"partial_json"`
 			} `json:"delta"`
 			// message_delta
@@ -420,6 +535,12 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 				gotUsage = true
 			}
 		case "content_block_start":
+			if ev.ContentBlock != nil && ev.ContentBlock.Type == "thinking" && ev.ContentBlock.Signature != "" {
+				thinkSig = ev.ContentBlock.Signature
+				if err := emit(ir.StreamEvent{Kind: ir.EvThinkingSignature, Delta: thinkSig}); err != nil {
+					return nil, err
+				}
+			}
 			if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
 				tc := &ir.ToolCall{ID: ev.ContentBlock.ID, Name: ev.ContentBlock.Name}
 				tools[ev.Index] = tc
@@ -442,6 +563,13 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 				thinkBuf.WriteString(ev.Delta.Thinking)
 				if err := emit(ir.StreamEvent{Kind: ir.EvThinking, Delta: ev.Delta.Thinking}); err != nil {
 					return nil, err
+				}
+			case "signature_delta":
+				thinkSig = ev.Delta.Signature
+				if thinkSig != "" {
+					if err := emit(ir.StreamEvent{Kind: ir.EvThinkingSignature, Delta: thinkSig}); err != nil {
+						return nil, err
+					}
 				}
 			case "input_json_delta":
 				if tc, ok := tools[ev.Index]; ok {
@@ -493,6 +621,7 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 	}
 	out.Message.Content = []ir.ContentPart{{Kind: "text", Text: textBuf.String()}}
 	out.Thinking = thinkBuf.String()
+	out.ThinkingSignature = thinkSig
 	out.StopReason = stop
 	out.Usage = usage
 	if gotUsage {

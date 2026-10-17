@@ -853,6 +853,9 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 	if req.TopP != nil {
 		genConfig["topP"] = *req.TopP
 	}
+	if req.TopK != nil {
+		genConfig["topK"] = *req.TopK
+	}
 	if req.MaxTokens > 0 {
 		genConfig["maxOutputTokens"] = req.MaxTokens
 	}

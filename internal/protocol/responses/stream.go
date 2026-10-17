@@ -4,11 +4,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"bargainproxy/internal/ir"
 )
+
+// toolItemState is the per-tool-call state the streamed wire needs. The
+// Responses protocol identifies a function_call by item id in some events and
+// by output_index in others; one state keeps the id, call_id, name and the
+// accumulated arguments consistent across added/delta/done (BP-69).
+type toolItemState struct {
+	itemID    string
+	callID    string
+	name      string
+	args      strings.Builder
+	announced bool
+}
 
 // StreamWriter drives the Responses SSE state machine from IR events.
 type StreamWriter struct {
@@ -18,20 +33,27 @@ type StreamWriter struct {
 	model   string
 	created int64
 
-	mu           sync.Mutex
-	created0     bool
-	completed    bool
-	seq          int
-	itemOpen     bool
-	partOpen     bool
-	textBuf      string
-	usage        *Usage
-	toolItemOpen map[int]bool
+	mu        sync.Mutex
+	created0  bool
+	completed bool
+	seq       int
+	itemOpen  bool
+	partOpen  bool
+	textBuf   string
+	usage     *Usage
+	toolItems map[int]*toolItemState
 }
 
 // NewStreamWriter builds a stream writer.
 func NewStreamWriter(w io.Writer, flusher interface{ Flush() }, id, model string) *StreamWriter {
-	return &StreamWriter{w: w, flusher: flusher, id: id, model: model, created: time.Now().Unix(), toolItemOpen: map[int]bool{}}
+	return &StreamWriter{w: w, flusher: flusher, id: id, model: model, created: time.Now().Unix(), toolItems: map[int]*toolItemState{}}
+}
+
+func toolItemID(index int, callID string) string {
+	if callID != "" {
+		return "fc_" + callID
+	}
+	return "fc_" + strconv.Itoa(index)
 }
 
 func (s *StreamWriter) event(name string, payload map[string]any) error {
@@ -129,27 +151,41 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 				return err
 			}
 		}
-		idx := 1 + ev.ToolIndex
-		item := map[string]any{
-			"type": "function_call", "id": "fc_" + ev.ToolCall.ID, "call_id": ev.ToolCall.ID,
-			"name": ev.ToolCall.Name, "arguments": "", "status": "in_progress",
+		st := s.toolItems[ev.ToolIndex]
+		if st == nil {
+			st = &toolItemState{}
+			s.toolItems[ev.ToolIndex] = st
 		}
-		s.toolItemOpen[ev.ToolIndex] = true
-		return s.event("response.output_item.added", map[string]any{"output_index": idx, "item": item})
+		if ev.ToolCall != nil {
+			if ev.ToolCall.ID != "" {
+				st.callID = ev.ToolCall.ID
+			}
+			if ev.ToolCall.Name != "" {
+				st.name = ev.ToolCall.Name
+			}
+		}
+		if st.itemID == "" {
+			st.itemID = toolItemID(ev.ToolIndex, st.callID)
+		}
+		return s.announceToolItem(ev.ToolIndex, st)
 	case ir.EvToolArgs:
-		if !s.toolItemOpen[ev.ToolIndex] {
-			return nil
+		st := s.toolItems[ev.ToolIndex]
+		if st == nil {
+			// Arguments before their start event: never drop the text — the
+			// done event still carries the full call. The added event has no
+			// name yet; drivers emit EvToolStart first in practice.
+			st = &toolItemState{itemID: toolItemID(ev.ToolIndex, "")}
+			s.toolItems[ev.ToolIndex] = st
 		}
-		idx := 1 + ev.ToolIndex
+		if err := s.announceToolItem(ev.ToolIndex, st); err != nil {
+			return err
+		}
+		st.args.WriteString(ev.Delta)
 		return s.event("response.function_call_arguments.delta", map[string]any{
-			"item_id": fmt.Sprintf("fc_%d", ev.ToolIndex), "output_index": idx, "delta": ev.Delta,
+			"item_id": st.itemID, "output_index": 1 + ev.ToolIndex, "delta": ev.Delta,
 		})
 	case ir.EvUsage:
-		s.usage = &Usage{
-			InputTokens:  ev.Usage.InputTokens,
-			OutputTokens: ev.Usage.OutputTokens,
-			TotalTokens:  ev.Usage.InputTokens + ev.Usage.OutputTokens,
-		}
+		s.usage = usageFromIR(*ev.Usage)
 		return nil
 	case ir.EvDone:
 		return s.finish()
@@ -184,21 +220,52 @@ func (s *StreamWriter) closeMessageItem() error {
 	return nil
 }
 
+// announceToolItem emits the output_item.added event once per tool call.
+func (s *StreamWriter) announceToolItem(toolIndex int, st *toolItemState) error {
+	if st.announced {
+		return nil
+	}
+	st.announced = true
+	item := map[string]any{
+		"type": "function_call", "id": st.itemID, "call_id": st.callID,
+		"name": st.name, "arguments": "", "status": "in_progress",
+	}
+	return s.event("response.output_item.added", map[string]any{"output_index": 1 + toolIndex, "item": item})
+}
+
 func (s *StreamWriter) finish() error {
 	if err := s.ensureCreated(); err != nil {
 		return err
 	}
-	// Close any open tool items.
-	for toolIdx := range s.toolItemOpen {
-		idx := 1 + toolIdx
+	// Close open tool items in output order: the done events carry the full
+	// call (name/call_id/arguments). Clients such as ZCode assemble their
+	// final tool-call from exactly these fields (BP-69).
+	idxs := make([]int, 0, len(s.toolItems))
+	for idx := range s.toolItems {
+		idxs = append(idxs, idx)
+	}
+	sort.Ints(idxs)
+	for _, toolIdx := range idxs {
+		st := s.toolItems[toolIdx]
+		args := st.args.String()
+		if args == "" {
+			args = "{}"
+		}
+		callID := st.callID
+		if callID == "" {
+			callID = st.itemID
+		}
 		if err := s.event("response.function_call_arguments.done", map[string]any{
-			"item_id": fmt.Sprintf("fc_%d", toolIdx), "output_index": idx, "arguments": "{}",
+			"item_id": st.itemID, "output_index": 1 + toolIdx, "arguments": args,
 		}); err != nil {
 			return err
 		}
+		item := map[string]any{
+			"type": "function_call", "id": st.itemID, "call_id": callID,
+			"name": st.name, "arguments": args, "status": "completed",
+		}
 		if err := s.event("response.output_item.done", map[string]any{
-			"output_index": idx,
-			"item":         map[string]any{"type": "function_call", "id": fmt.Sprintf("fc_%d", toolIdx), "status": "completed"},
+			"output_index": 1 + toolIdx, "item": item,
 		}); err != nil {
 			return err
 		}

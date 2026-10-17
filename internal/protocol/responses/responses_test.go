@@ -111,8 +111,55 @@ func TestStreamToolFunctionCallEvents(t *testing.T) {
 	if !strings.Contains(out, "response.function_call_arguments.delta") {
 		t.Fatalf("function call deltas missing: %s", out)
 	}
-	if !strings.Contains(out, `"type":"function_call"`) {
-		t.Fatalf("function_call item missing: %s", out)
+	if strings.Count(out, "fc_call_1") < 4 {
+		t.Fatalf("added/delta/done must share one item id: %s", out)
+	}
+	if !strings.Contains(out, `"arguments":"{\"a\":1}"`) {
+		t.Fatalf("done events must carry accumulated arguments: %s", out)
+	}
+	if !strings.Contains(out, `"call_id":"call_1"`) || !strings.Contains(out, `"name":"f"`) {
+		t.Fatalf("output_item.done must carry call_id and name: %s", out)
+	}
+}
+
+// BP-69: reasoning/item_reference items are provider state this gateway cannot
+// replay; they must be skipped, never turned into empty user turns.
+func TestParseRequestSkipsReasoningItems(t *testing.T) {
+	req, err := ParseRequest([]byte(`{"model":"m","input":[
+		{"type":"reasoning","summary":[]},
+		{"type":"item_reference","id":"rs_1"},
+		{"role":"user","content":[{"type":"input_text","text":"q"}]}
+	]}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(req.Messages) != 1 || req.Messages[0].Role != ir.RoleUser {
+		t.Fatalf("messages = %+v", req.Messages)
+	}
+	if len(req.Messages[0].Content) != 1 || req.Messages[0].Content[0].Text != "q" {
+		t.Fatalf("content = %+v", req.Messages[0].Content)
+	}
+}
+
+func TestParseRequestRejectsPreviousResponseID(t *testing.T) {
+	_, err := ParseRequest([]byte(`{"model":"m","previous_response_id":"resp_1","input":"hi"}`))
+	if err == nil || !strings.Contains(err.Error(), "previous_response_id") {
+		t.Fatalf("expected previous_response_id error, got %v", err)
+	}
+}
+
+func TestUsageFromIRCarriesCacheAndReasoningDetails(t *testing.T) {
+	u := usageFromIR(ir.Usage{InputTokens: 100, OutputTokens: 20, CachedInputTokens: 80, CacheKnown: true, ReasoningTokens: 7})
+	if u.InputTokensDetails == nil || u.InputTokensDetails.CachedTokens != 80 {
+		t.Fatalf("input details = %+v", u.InputTokensDetails)
+	}
+	if u.OutputTokensDetails == nil || u.OutputTokensDetails.ReasoningTokens != 7 {
+		t.Fatalf("output details = %+v", u.OutputTokensDetails)
+	}
+	// Unknown cache accounting must stay absent rather than claiming 0 hits.
+	unknown := usageFromIR(ir.Usage{InputTokens: 10, OutputTokens: 2})
+	if unknown.InputTokensDetails != nil || unknown.OutputTokensDetails != nil {
+		t.Fatalf("unknown details must be omitempty: %+v", unknown)
 	}
 }
 

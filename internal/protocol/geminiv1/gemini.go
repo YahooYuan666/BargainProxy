@@ -156,7 +156,7 @@ func ParseRequest(body []byte, sessionKey string) (*ir.ChatRequest, error) {
 		}
 	}
 	if w.ToolConfig != nil {
-		req.ToolChoice = strings.ToLower(w.ToolConfig.FunctionCallingConfig.Mode)
+		req.ToolChoice, req.ToolChoiceName, req.DisableParallel = ir.NormalizeToolChoice(strings.ToLower(w.ToolConfig.FunctionCallingConfig.Mode))
 	}
 	// Session identity fallback: Gemini has no in-body session field, so a
 	// missing X-Session-Id header falls back to the system+first-user prefix

@@ -170,6 +170,20 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 			"type": "content_block_delta", "index": s.blockIdx,
 			"delta": map[string]any{"type": "thinking_delta", "thinking": ev.Delta},
 		})
+	case ir.EvThinkingSignature:
+		// Anthropic emits the signature as its own delta at the end of the
+		// thinking block. Forwarding it is what lets strict clients replay the
+		// block in later turns (BP-69).
+		if ev.Delta == "" {
+			return nil
+		}
+		if err := s.openThinking(); err != nil {
+			return err
+		}
+		return s.event("content_block_delta", map[string]any{
+			"type": "content_block_delta", "index": s.blockIdx,
+			"delta": map[string]any{"type": "signature_delta", "signature": ev.Delta},
+		})
 	case ir.EvToolStart:
 		return s.openTool(ev.ToolIndex, ev.ToolCall)
 	case ir.EvToolArgs:

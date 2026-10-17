@@ -4,6 +4,8 @@
 // converted back through it.
 package ir
 
+import "strings"
+
 // Role values for messages in the normalized conversation.
 type Role string
 
@@ -30,6 +32,15 @@ type ToolCall struct {
 	Arguments string `json:"arguments"`
 }
 
+// ThinkingBlock is one assistant reasoning block from history. It is kept
+// separate from Content so OpenAI-shaped drivers (which have no replayable
+// thinking concept) never mistake it for body text. Signature is the
+// upstream's opaque proof; empty means the provider did not issue one (BP-69).
+type ThinkingBlock struct {
+	Text      string `json:"text,omitempty"`
+	Signature string `json:"signature,omitempty"`
+}
+
 // Message is one normalized conversation message.
 type Message struct {
 	Role       Role          `json:"role"`
@@ -37,6 +48,10 @@ type Message struct {
 	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`   // assistant messages
 	ToolCallID string        `json:"tool_call_id,omitempty"` // tool messages
 	ToolName   string        `json:"tool_name,omitempty"`    // tool messages
+	// Thinking carries replayable assistant reasoning blocks (Anthropic
+	// history). Only anthropic-shaped upstream drivers may replay them; the
+	// ingress never drops them before routing (BP-69).
+	Thinking []ThinkingBlock `json:"thinking,omitempty"`
 }
 
 // ToolDef declares an available function tool.
@@ -75,18 +90,98 @@ func LevelFromBudget(budget int) string {
 	}
 }
 
+// BudgetFromLevel is the inverse of LevelFromBudget for channels whose wire
+// speaks Anthropic thinking budgets but whose client only sent a gear name
+// (ZCode's Chat/Responses ingress sends reasoning_effort, not budget). The
+// values map back into the same bands LevelFromBudget defines (BP-69).
+func BudgetFromLevel(level string) int {
+	switch strings.ToLower(strings.TrimSpace(level)) {
+	case "minimal":
+		return 1024
+	case "low":
+		return 2048
+	case "medium":
+		return 8192
+	case "high":
+		return 16384
+	case "xhigh", "max":
+		return 32768
+	default:
+		return 0
+	}
+}
+
+// NormalizeToolChoice folds every ingress dialect (OpenAI chat object,
+// Responses flat object, Anthropic {"type":"tool","name":...}) into the
+// portable string vocabulary the drivers share: "auto" | "none" | "required".
+// The specific tool name and disable_parallel_tool_use ride alongside instead
+// of inside an object — workbuddy/trae upstreams reject objects outright
+// (BP-69).
+func NormalizeToolChoice(v any) (choice any, name string, disableParallel bool) {
+	switch t := v.(type) {
+	case nil:
+		return nil, "", false
+	case string:
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "auto":
+			return "auto", "", false
+		case "none":
+			return "none", "", false
+		case "required", "any", "tool":
+			return "required", "", false
+		default:
+			return nil, "", false
+		}
+	case map[string]any:
+		dp, _ := t["disable_parallel_tool_use"].(bool)
+		switch typ, _ := t["type"].(string); typ {
+		case "function":
+			if fn, ok := t["function"].(map[string]any); ok {
+				if n, _ := fn["name"].(string); n != "" {
+					return "required", n, dp
+				}
+			}
+			if n, _ := t["name"].(string); n != "" {
+				return "required", n, dp
+			}
+			return "required", "", dp
+		case "tool":
+			n, _ := t["name"].(string)
+			return "required", n, dp
+		case "any", "required":
+			return "required", "", dp
+		case "auto":
+			return "auto", "", dp
+		case "none":
+			return "none", "", dp
+		}
+		return nil, "", dp
+	default:
+		return nil, "", false
+	}
+}
+
 // ChatRequest is the normalized chat request.
 type ChatRequest struct {
-	Model       string
-	Messages    []Message
-	Tools       []ToolDef
-	ToolChoice  any
-	Temperature *float64
-	TopP        *float64
-	MaxTokens   int
-	Stop        []string
-	Stream      bool
-	Thinking    *ThinkingConfig
+	Model      string
+	Messages   []Message
+	Tools      []ToolDef
+	ToolChoice any
+	// ToolChoiceName is the specific tool an Anthropic-style
+	// {"type":"tool","name":"x"} asked for; ToolChoice itself is normalized to
+	// the portable "required"/"auto"/"none" vocabulary (BP-69).
+	ToolChoiceName string
+	// DisableParallel carries Anthropic tool_choice.disable_parallel_tool_use.
+	// Only anthropic-shaped upstreams consume it today.
+	DisableParallel bool
+	Temperature     *float64
+	TopP            *float64
+	// TopK is Anthropic/Gemini-only sampling; OpenAI-shaped drivers ignore it.
+	TopK      *int
+	MaxTokens int
+	Stop      []string
+	Stream    bool
+	Thinking  *ThinkingConfig
 
 	// RequestedEffort mirrors OpenAI reasoning_effort when supplied.
 	RequestedEffort string
@@ -151,18 +246,25 @@ type ChatResponse struct {
 	// (Anthropic thinking block / OpenAI reasoning_content / Gemini thought
 	// part). Empty when the upstream produced none — BP-41.
 	Thinking string `json:"thinking,omitempty"`
+	// ThinkingSignature is the upstream-issued signature for Thinking. Only
+	// anthropic-shaped upstreams issue one; when present the Anthropic egress
+	// renders it and the client can replay the block (BP-69).
+	ThinkingSignature string `json:"thinking_signature,omitempty"`
 }
 
 // StreamEventKind enumerates incremental stream events.
 type StreamEventKind string
 
 const (
-	EvText      StreamEventKind = "text"       // Delta = text fragment
-	EvThinking  StreamEventKind = "thinking"   // Delta = reasoning fragment
-	EvToolStart StreamEventKind = "tool_start" // ToolCall = {ID,Name}; ToolIndex set
-	EvToolArgs  StreamEventKind = "tool_args"  // Delta = arguments fragment; ToolIndex identifies the call
-	EvUsage     StreamEventKind = "usage"      // Usage set
-	EvDone      StreamEventKind = "done"       // Stop set (terminal event)
+	EvText     StreamEventKind = "text"     // Delta = text fragment
+	EvThinking StreamEventKind = "thinking" // Delta = reasoning fragment
+	// EvThinkingSignature carries the upstream's signature_delta for the
+	// currently open thinking block (Anthropic wire only). Delta = signature.
+	EvThinkingSignature StreamEventKind = "thinking_signature"
+	EvToolStart         StreamEventKind = "tool_start" // ToolCall = {ID,Name}; ToolIndex set
+	EvToolArgs          StreamEventKind = "tool_args"  // Delta = arguments fragment; ToolIndex identifies the call
+	EvUsage             StreamEventKind = "usage"      // Usage set
+	EvDone              StreamEventKind = "done"       // Stop set (terminal event)
 )
 
 // StreamEvent is one incremental event from a driver stream.

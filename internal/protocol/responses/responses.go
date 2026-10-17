@@ -51,6 +51,12 @@ func ParseRequest(body []byte) (*ir.ChatRequest, error) {
 	if err := json.Unmarshal(body, &w); err != nil {
 		return nil, fmt.Errorf("responses: parse request: %w", err)
 	}
+	// The gateway is stateless: it cannot reconstruct the omitted prefix of a
+	// previous_response_id chain. Silently ignoring the id would drop context
+	// and produce wrong answers, so fail loudly and ask for the full history.
+	if strings.TrimSpace(w.PreviousID) != "" {
+		return nil, fmt.Errorf("responses: previous_response_id is not supported (stateless gateway); send the full input history")
+	}
 	req := &ir.ChatRequest{
 		Model:       strings.TrimSpace(w.Model),
 		Stream:      w.Stream,
@@ -75,7 +81,7 @@ func ParseRequest(body []byte) (*ir.ChatRequest, error) {
 		}
 		req.Tools = append(req.Tools, ir.ToolDef{Name: t.Name, Description: t.Description, Parameters: t.Parameters})
 	}
-	req.ToolChoice = w.ToolChoice
+	req.ToolChoice, req.ToolChoiceName, req.DisableParallel = ir.NormalizeToolChoice(w.ToolChoice)
 	// Session identity, three-level fallback: explicit metadata ids →
 	// cache_control marked part digest → system/instructions + first-user
 	// prefix digest. Model-independent, so switching models mid-conversation
@@ -184,17 +190,29 @@ func parseInput(raw json.RawMessage) ([]ir.Message, error) {
 				}
 			}
 			out = append(out, ir.Message{Role: ir.RoleTool, ToolCallID: callID, Content: []ir.ContentPart{{Kind: "text", Text: text}}})
+		case "reasoning", "item_reference":
+			// Reasoning items carry provider-encrypted state that only the
+			// issuing Responses backend can replay; the gateway has no
+			// equivalent. Dropping is safe — treating them as messages would
+			// inject an empty user turn and make upstreams reject the request
+			// (BP-69).
+			continue
 		default:
 			role, _ := item["role"].(string)
+			parts, err := parseContent(item["content"])
+			if err != nil {
+				return nil, err
+			}
+			// Unknown item shapes must never become empty messages. A message
+			// with no usable content is not a turn the upstream can use.
+			if len(parts) == 0 {
+				continue
+			}
 			r := ir.RoleUser
 			if role == "assistant" {
 				r = ir.RoleAssistant
 			} else if role == "system" || role == "developer" {
 				r = ir.RoleSystem
-			}
-			parts, err := parseContent(item["content"])
-			if err != nil {
-				return nil, err
 			}
 			out = append(out, ir.Message{Role: r, Content: parts})
 		}
@@ -271,9 +289,38 @@ type ResponseObject struct {
 
 // Usage is the Responses usage shape.
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	InputTokens         int                  `json:"input_tokens"`
+	InputTokensDetails  *InputTokensDetails  `json:"input_tokens_details,omitempty"`
+	OutputTokens        int                  `json:"output_tokens"`
+	OutputTokensDetails *OutputTokensDetails `json:"output_tokens_details,omitempty"`
+	TotalTokens         int                  `json:"total_tokens"`
+}
+
+// InputTokensDetails carries the prefix-cache subset. ZCode reads
+// input_tokens_details.cached_tokens; omitting it makes every hit look like a
+// miss on the client side (BP-69).
+type InputTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+// OutputTokensDetails carries the reasoning-token subset.
+type OutputTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+func usageFromIR(u ir.Usage) *Usage {
+	out := &Usage{
+		InputTokens:  u.InputTokens,
+		OutputTokens: u.OutputTokens,
+		TotalTokens:  u.InputTokens + u.OutputTokens,
+	}
+	if u.CacheKnown {
+		out.InputTokensDetails = &InputTokensDetails{CachedTokens: u.CachedInputTokens}
+	}
+	if u.ReasoningTokens > 0 {
+		out.OutputTokensDetails = &OutputTokensDetails{ReasoningTokens: u.ReasoningTokens}
+	}
+	return out
 }
 
 // Render builds a non-streamed response object.
@@ -306,11 +353,7 @@ func Render(id, model string, createdAt int64, resp *ir.ChatResponse, outputText
 		})
 	}
 	out.OutputText = outputText
-	out.Usage = &Usage{
-		InputTokens:  resp.Usage.InputTokens,
-		OutputTokens: resp.Usage.OutputTokens,
-		TotalTokens:  resp.Usage.InputTokens + resp.Usage.OutputTokens,
-	}
+	out.Usage = usageFromIR(resp.Usage)
 	return out
 }
 

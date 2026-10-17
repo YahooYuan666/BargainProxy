@@ -129,7 +129,7 @@ func ParseChatRequest(body []byte) (*ir.ChatRequest, error) {
 		}
 		req.Tools = append(req.Tools, ir.ToolDef{Name: t.Function.Name, Description: t.Function.Description, Parameters: t.Function.Parameters})
 	}
-	req.ToolChoice = w.ToolChoice
+	req.ToolChoice, req.ToolChoiceName, req.DisableParallel = ir.NormalizeToolChoice(w.ToolChoice)
 	// Session identity, three-level fallback: explicit ids → cache_control
 	// marked part digest → system+first-user prefix digest. Model-independent
 	// so switching models inside a conversation keeps the binding.
@@ -315,18 +315,39 @@ type RespToolCall struct {
 
 // Usage is the OpenAI usage block.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
 }
 
-// UsageFromIR converts normalized usage.
+// PromptTokensDetails carries the prefix-cache subset (ZCode reads
+// prompt_tokens_details.cached_tokens).
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+// CompletionTokensDetails carries the reasoning-token subset.
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// UsageFromIR converts normalized usage. Cache accounting is emitted only
+// when the upstream reported it (unknown must stay absent — BP-53/BP-69).
 func UsageFromIR(u ir.Usage) *Usage {
-	return &Usage{
+	out := &Usage{
 		PromptTokens:     u.InputTokens,
 		CompletionTokens: u.OutputTokens,
 		TotalTokens:      u.InputTokens + u.OutputTokens,
 	}
+	if u.CacheKnown {
+		out.PromptTokensDetails = &PromptTokensDetails{CachedTokens: u.CachedInputTokens}
+	}
+	if u.ReasoningTokens > 0 {
+		out.CompletionTokensDetails = &CompletionTokensDetails{ReasoningTokens: u.ReasoningTokens}
+	}
+	return out
 }
 
 // RenderCompletion renders a full ChatCompletion.

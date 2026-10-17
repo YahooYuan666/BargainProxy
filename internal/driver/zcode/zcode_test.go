@@ -76,9 +76,12 @@ func TestNormalizeBodyIdentityBlocksAndCacheControl(t *testing.T) {
 			},
 		},
 	}
-	raw, err := d.normalizeBody(call, creds)
+	raw, hadThinking, _, err := d.normalizeBody(call, creds, true)
 	if err != nil {
 		t.Fatalf("normalize: %v", err)
+	}
+	if hadThinking {
+		t.Fatal("no assistant thinking in this request")
 	}
 	var doc map[string]any
 	if err := json.Unmarshal(raw, &doc); err != nil {
@@ -286,5 +289,219 @@ func TestProbeReadTruncatedBodyFails(t *testing.T) {
 	ue, ok := uperr.As(err)
 	if !ok || ue.Class != uperr.ClassTransport {
 		t.Fatalf("truncated plan body must surface as transport, got %v", err)
+	}
+}
+
+// BP-69: Chat/Responses ingress carries reasoning_effort only; the zcode
+// driver must still turn thinking on, or the same upstream model silently
+// runs without it depending on which protocol the client used.
+func TestNormalizeBodyEffortEnablesThinking(t *testing.T) {
+	d := testDriver("http://unused")
+	raw, _, _, err := d.normalizeBody(driver.ChatCall{
+		UpstreamModel: "glm-5.3",
+		Request: &ir.ChatRequest{
+			Model:           "glm-5.3",
+			RequestedEffort: "medium",
+			Messages:        []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}}},
+		},
+	}, &Creds{JWT: makeJWT("u1")}, true)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	thinking, ok := doc["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "enabled" {
+		t.Fatalf("thinking = %v", doc["thinking"])
+	}
+	if budget, _ := thinking["budget_tokens"].(float64); budget != 8192 {
+		t.Fatalf("budget = %v, want 8192", thinking["budget_tokens"])
+	}
+}
+
+func TestNormalizeBodyToolChoiceAndTopK(t *testing.T) {
+	d := testDriver("http://unused")
+	topK := 40
+	raw, _, _, err := d.normalizeBody(driver.ChatCall{
+		UpstreamModel: "glm-5.3",
+		Request: &ir.ChatRequest{
+			Model:           "glm-5.3",
+			ToolChoice:      "required",
+			ToolChoiceName:  "get_weather",
+			DisableParallel: true,
+			TopK:            &topK,
+			Messages:        []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}}},
+		},
+	}, &Creds{JWT: makeJWT("u1")}, true)
+	if err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	tc, ok := doc["tool_choice"].(map[string]any)
+	if !ok {
+		t.Fatalf("tool_choice = %v", doc["tool_choice"])
+	}
+	if tc["type"] != "tool" || tc["name"] != "get_weather" || tc["disable_parallel_tool_use"] != true {
+		t.Fatalf("tool_choice = %v", tc)
+	}
+	if doc["top_k"] != float64(40) {
+		t.Fatalf("top_k = %v", doc["top_k"])
+	}
+}
+
+func TestNormalizeBodyReplaysToolTurnThinking(t *testing.T) {
+	d := testDriver("http://unused")
+	call := driver.ChatCall{
+		UpstreamModel: "glm-5.3",
+		Request: &ir.ChatRequest{
+			Model: "glm-5.3",
+			Messages: []ir.Message{
+				{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "weather?"}}},
+				{
+					Role:      ir.RoleAssistant,
+					Thinking:  []ir.ThinkingBlock{{Text: "先想", Signature: "sig-1"}},
+					ToolCalls: []ir.ToolCall{{ID: "call_1", Name: "get_weather", Arguments: `{"city":"Paris"}`}},
+				},
+				{Role: ir.RoleTool, ToolCallID: "call_1", Content: []ir.ContentPart{{Kind: "text", Text: "18C"}}},
+			},
+		},
+	}
+	creds := &Creds{JWT: makeJWT("u1")}
+	raw, had, _, err := d.normalizeBody(call, creds, true)
+	if err != nil || !had {
+		t.Fatalf("normalize: had=%v err=%v", had, err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !hasThinkingBlock(t, doc) {
+		t.Fatalf("thinking block missing: %s", raw)
+	}
+	raw2, had2, _, err := d.normalizeBody(call, creds, false)
+	if err != nil || had2 {
+		t.Fatalf("degraded normalize: had=%v err=%v", had2, err)
+	}
+	var doc2 map[string]any
+	if err := json.Unmarshal(raw2, &doc2); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if hasThinkingBlock(t, doc2) {
+		t.Fatalf("degraded body must not replay thinking: %s", raw2)
+	}
+}
+
+func hasThinkingBlock(t *testing.T, doc map[string]any) bool {
+	t.Helper()
+	msgs, _ := doc["messages"].([]any)
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		content, _ := mm["content"].([]any)
+		for _, c := range content {
+			cc, _ := c.(map[string]any)
+			if cc["type"] == "thinking" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// A rejected replayed thinking block must degrade to the old (safe) body and
+// still succeed — preserving history must never make the request fail.
+func TestThinkingReplayRejectedRetriesWithoutIt(t *testing.T) {
+	var bodies []map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var doc map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&doc)
+		bodies = append(bodies, doc)
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"invalid signature in thinking block"}}`)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}`)
+		fmt.Fprintln(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`)
+		fmt.Fprintln(w, `data: {"type":"message_delta","usage":{"output_tokens":1}}`)
+		fmt.Fprintln(w, `data: {"type":"message_stop"}`)
+	}))
+	defer upstream.Close()
+
+	d := testDriver(upstream.URL)
+	call := driver.ChatCall{
+		Account:       testAccount(),
+		UpstreamModel: "glm-5.3",
+		Request: &ir.ChatRequest{
+			Model: "glm-5.3",
+			Messages: []ir.Message{
+				{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "weather?"}}},
+				{
+					Role:      ir.RoleAssistant,
+					Thinking:  []ir.ThinkingBlock{{Text: "先想"}}, // unsigned
+					ToolCalls: []ir.ToolCall{{ID: "call_1", Name: "get_weather", Arguments: `{}`}},
+				},
+				{Role: ir.RoleTool, ToolCallID: "call_1", Content: []ir.ContentPart{{Kind: "text", Text: "18C"}}},
+			},
+		},
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := d.Stream(context.Background(), call, func(ev ir.StreamEvent) error { return nil })
+		if err != nil {
+			t.Fatalf("stream %d: %v", i, err)
+		}
+		if resp.Message.Content[0].Text != "ok" {
+			t.Fatalf("stream %d text = %q", i, resp.Message.Content[0].Text)
+		}
+	}
+	if len(bodies) != 3 {
+		t.Fatalf("requests = %d, want 3 (400, retry, second call)", len(bodies))
+	}
+	if !hasThinkingBlock(t, bodies[0]) {
+		t.Fatal("first attempt must replay thinking")
+	}
+	if hasThinkingBlock(t, bodies[1]) {
+		t.Fatal("retry must drop thinking")
+	}
+	if hasThinkingBlock(t, bodies[2]) {
+		t.Fatal("unsigned replay must stay disabled after one rejection")
+	}
+}
+
+func TestSignatureDeltaCaptured(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}`)
+		fmt.Fprintln(w, `data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`)
+		fmt.Fprintln(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"想"}}`)
+		fmt.Fprintln(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-9"}}`)
+		fmt.Fprintln(w, `data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}`)
+		fmt.Fprintln(w, `data: {"type":"message_delta","usage":{"output_tokens":1}}`)
+		fmt.Fprintln(w, `data: {"type":"message_stop"}`)
+	}))
+	defer upstream.Close()
+
+	d := testDriver(upstream.URL)
+	var sig string
+	resp, err := d.Stream(context.Background(), driver.ChatCall{
+		Account:       testAccount(),
+		UpstreamModel: "glm-5.3",
+		Request:       &ir.ChatRequest{Model: "glm-5.3", Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}}}},
+	}, func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EvThinkingSignature {
+			sig = ev.Delta
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if resp.ThinkingSignature != "sig-9" || sig != "sig-9" {
+		t.Fatalf("signature resp=%q emitted=%q", resp.ThinkingSignature, sig)
 	}
 }

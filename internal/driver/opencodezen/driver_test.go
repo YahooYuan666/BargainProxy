@@ -282,10 +282,10 @@ func TestToolChoiceNormalization(t *testing.T) {
 		{"unknown", "banana", nil, nil},
 	}
 	for _, c := range cases {
-		if got := chatToolChoice(c.in); !reflect.DeepEqual(got, c.wantChat) {
+		if got := chatToolChoice(c.in, ""); !reflect.DeepEqual(got, c.wantChat) {
 			t.Errorf("%s: chat = %#v, want %#v", c.name, got, c.wantChat)
 		}
-		if got := responsesToolChoice(c.in); !reflect.DeepEqual(got, c.wantResponses) {
+		if got := responsesToolChoice(c.in, ""); !reflect.DeepEqual(got, c.wantResponses) {
 			t.Errorf("%s: responses = %#v, want %#v", c.name, got, c.wantResponses)
 		}
 	}

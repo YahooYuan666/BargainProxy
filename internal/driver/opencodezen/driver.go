@@ -279,26 +279,33 @@ func toolChoiceName(v any) (kind, name string) {
 }
 
 // chatToolChoice maps any ingress dialect onto the chat lane's accepted values.
-func chatToolChoice(v any) any {
-	kind, name := toolChoiceName(v)
+// The specific tool name rides in IR separately after BP-69 normalization.
+func chatToolChoice(v any, name string) any {
+	kind, n := toolChoiceName(v)
+	if name != "" {
+		kind, n = "name", name
+	}
 	switch kind {
 	case "auto", "none", "required":
 		return kind
 	case "name":
-		return map[string]any{"type": "function", "function": map[string]any{"name": name}}
+		return map[string]any{"type": "function", "function": map[string]any{"name": n}}
 	}
 	return nil
 }
 
 // responsesToolChoice maps onto the Responses lane: never "none" (upstream 400),
 // and a named tool uses the flat function object.
-func responsesToolChoice(v any) any {
-	kind, name := toolChoiceName(v)
+func responsesToolChoice(v any, name string) any {
+	kind, n := toolChoiceName(v)
+	if name != "" {
+		kind, n = "name", name
+	}
 	switch kind {
 	case "auto", "required":
 		return kind
 	case "name":
-		return map[string]any{"type": "function", "name": name}
+		return map[string]any{"type": "function", "name": n}
 	}
 	return nil // "none" and unknown are omitted on purpose
 }
@@ -390,7 +397,7 @@ func (d *Driver) buildWire(call driver.ChatCall) ([]byte, error) {
 			tools = capped
 		}
 		body["tools"] = tools
-		if tc := chatToolChoice(req.ToolChoice); tc != nil {
+		if tc := chatToolChoice(req.ToolChoice, req.ToolChoiceName); tc != nil {
 			body["tool_choice"] = tc
 		}
 	}
@@ -737,7 +744,7 @@ func (d *Driver) buildResponsesWire(call driver.ChatCall) ([]byte, error) {
 			tools = capped
 		}
 		body["tools"] = tools
-		if tc := responsesToolChoice(req.ToolChoice); tc != nil {
+		if tc := responsesToolChoice(req.ToolChoice, req.ToolChoiceName); tc != nil {
 			body["tool_choice"] = tc
 		}
 	}
