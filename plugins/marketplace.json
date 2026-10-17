@@ -1,0 +1,19 @@
+{
+  "name": "bargainproxy-local",
+  "plugins": [
+    {
+      "name": "bargainproxy-opencode",
+      "source": "./bargainproxy-opencode",
+      "version": "0.1.0",
+      "description": "Sync ZCode's personal providers with the OpenCode free models served by a local BargainProxy gateway (chat / responses / anthropic).",
+      "displayName": "BargainProxy OpenCode 免费模型",
+      "displayName_i18n": {
+        "zh-CN": "BargainProxy OpenCode 免费模型"
+      },
+      "description_i18n": {
+        "zh-CN": "从本机 BargainProxy 网关同步 OpenCode 免费模型：维护三个个人供应商（Chat / Response / Anthropic 三条协议线），ZCode 启动时自动刷新；只动自己的三个供应商，写前备份、写后校验、失败回滚。"
+      },
+      "category": "utilities"
+    }
+  ]
+}

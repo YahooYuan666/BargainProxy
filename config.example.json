@@ -1,0 +1,127 @@
+{
+  "listen": "127.0.0.1:13140",
+  "api_key": "",
+  "store": "postgres",
+  "database": "postgres://bargainproxy:bargainproxy@127.0.0.1:5432/bargainproxy?sslmode=disable",
+  "data_dir": "./data",
+  "log_keep_days": 14,
+  "max_queue_wait": "120s",
+  "fallback_wait": "8s",
+  "session_ttl": "30m",
+  "cost_ttl": "6h",
+  "log_retention": "336h",
+  "workbuddy_global": false,
+  "sentinels": [
+    "DANGEROUS_ACTIVITY_BLOCKED"
+  ],
+  "channels": {
+    "antigravity": {
+      "enabled": true,
+      "max_in_flight": 3,
+      "google_oauth_client_id": "",
+      "google_oauth_client_secret": ""
+    },
+    "workbuddy": {
+      "enabled": true,
+      "max_in_flight": 2,
+      "prompt_mode": "custom"
+    },
+    "trae": {
+      "enabled": true,
+      "max_in_flight": 1
+    },
+    "zcode": {
+      "enabled": true,
+      "max_in_flight": 2
+    },
+    "autoclaw": {
+      "enabled": true,
+      "max_in_flight": 2,
+      "app_secret": ""
+    },
+    "qoder": {
+      "enabled": true,
+      "max_in_flight": 1
+    },
+    "openaicompat": {
+      "enabled": false,
+      "base_url": "",
+      "api_key": "",
+      "models": []
+    }
+  },
+  "models": [
+    {
+      "canonical": "gemini-3-pro",
+      "channel": "antigravity",
+      "upstream_model": "gemini-pro-agent",
+      "priority": 0
+    },
+    {
+      "canonical": "gemini-3.1-pro-preview",
+      "channel": "antigravity",
+      "upstream_model": "gemini-pro-agent",
+      "priority": 0
+    },
+    {
+      "canonical": "gemini-3.5-flash-high",
+      "channel": "antigravity",
+      "upstream_model": "gemini-3.5-flash-high",
+      "priority": 0
+    },
+    {
+      "canonical": "glm-5.3",
+      "channel": "workbuddy",
+      "upstream_model": "glm-5.3",
+      "priority": 0
+    },
+    {
+      "canonical": "glm-5.2",
+      "channel": "workbuddy",
+      "upstream_model": "glm-5.2",
+      "priority": 0
+    },
+    {
+      "canonical": "deepseek-v4-flash",
+      "channel": "workbuddy",
+      "upstream_model": "deepseek-v4-flash",
+      "priority": 0
+    },
+    {
+      "canonical": "deepseek-v4-pro",
+      "channel": "workbuddy",
+      "upstream_model": "deepseek-v4-pro",
+      "priority": 0
+    },
+    {
+      "canonical": "kimi-k2.6",
+      "channel": "workbuddy",
+      "upstream_model": "kimi-k2.6",
+      "priority": 0
+    },
+    {
+      "canonical": "kimi-k3",
+      "channel": "trae",
+      "upstream_model": "kimi-k3",
+      "priority": 0
+    },
+    {
+      "canonical": "kimi-k3",
+      "channel": "workbuddy",
+      "upstream_model": "kimi-k3",
+      "priority": 1
+    },
+    {
+      "canonical": "minimax-m3",
+      "channel": "workbuddy",
+      "upstream_model": "minimax-m3",
+      "priority": 0
+    },
+    {
+      "canonical": "claude-sonnet-4-6",
+      "channel": "zcode",
+      "upstream_model": "claude-sonnet-4-6",
+      "priority": 0
+    }
+  ]
+}

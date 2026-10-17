@@ -1,0 +1,46 @@
+# BargainProxy + PostgreSQL — one-command local deployment.
+#
+# Usage:
+#   cp config.example.json config.json   # then edit listen/database/keys
+#   docker compose up -d --build
+#   open http://127.0.0.1:13140/panel/   # panel (set a password first, see below)
+#
+# First run — set the panel password (stored bcrypt-hashed in PostgreSQL):
+#   docker compose exec bargainproxy /app/bargainproxy -config /app/config.json -set-password 'your-password'
+#
+# The gateway listens on 127.0.0.1 only by default (local single-user use).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bargainproxy
+      POSTGRES_PASSWORD: bargainproxy          # change for non-local use
+      POSTGRES_DB: bargainproxy
+    volumes:
+      - bp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bargainproxy -d bargainproxy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  bargainproxy:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:13140:13140"
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - bp_data:/app/data
+    environment:
+      TZ: Asia/Shanghai
+      # Optional: provide the master key via env instead of the key file.
+      # BARGAINPROXY_MASTER_KEY: "<base64 of 32 random bytes>"
+    restart: unless-stopped
+
+volumes:
+  bp_pgdata:
+  bp_data:

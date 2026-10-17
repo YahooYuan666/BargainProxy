@@ -1,0 +1,49 @@
+# NOTICE
+
+BargainProxy bundles or adapts code and protocol knowledge from the following
+projects. Attribution and license compliance:
+
+## Ported code / assets (MIT — code copied or closely adapted)
+
+1. **workbuddy2api-panel** (https://github.com/linguo2625469/workbuddy2api-panel)
+   MIT License. Original upstream: **Sliverkiss/workbuddy2api**
+   (https://github.com/Sliverkiss/workbuddy2api, deleted; attribution preserved).
+   Ported/adapted: workbuddy channel error taxonomy and cooldown semantics
+   (6004 model-scope / 402 next-4AM / 401 grace / 11101 no-penalty); credit
+   cost-tier scheduling and expiring-credit weighting; session stickiness
+   semantics; prompt replacement and fingerprint sanitization; credits
+   parsing with expiry buckets; growth-task endpoint set and desktop/web
+   event-chain shapes (chat / buddy-app / template / playbook / canvas /
+   expert summon+use / automation / library); streak redeem & lottery flow;
+   buddy adoption/travel flow; request-log metadata discipline.
+
+2. **zcode identity blocks asset**
+   `internal/driver/zcode/assets/zcode_system.json` is ported from the same
+   MIT project (internal/zcode/gateway/assets/zcode_system.json). The ZCode
+   upstream content inspection requires the official client identity blocks.
+
+## Behaviour-level references (no code copied)
+
+3. **AIClient-2-API** (https://github.com/justlovemaki/AIClient-2-API, GPLv3)
+   — reverse-engineering knowledge for the Antigravity channel (v1internal
+   payload shape, project discovery, quota windows, force-stream handling)
+   was used as a behaviour specification only. No GPL code was copied.
+
+4. **sub2api** (https://github.com/Wei-Shaw/sub2api, LGPL-3.0) — session
+   fingerprint strategy, three-state admission and 401 grace were adopted as
+   patterns (clean-room re-implementation).
+
+5. **CLIProxyAPI** (https://github.com/router-for-me/CLIProxyAPI, MIT) and
+   **gemini-openai-proxy** (https://github.com/zhu327/gemini-openai-proxy,
+   MIT) — layering and protocol-mapping ideas.
+
+## User-owned algorithm
+
+6. The greedy burn-rate scheduling for window-quota accounts
+   (`weeklyGreed = remainingFraction / max(secondsToReset, 600)`) follows the
+   scheduler the user authored in their AIClient2API fork.
+
+---
+
+All trademarks and service names belong to their owners. This project is a
+personal-use tool; it grants no rights to the upstream services it talks to.

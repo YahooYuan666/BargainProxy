@@ -1,0 +1,15 @@
+{
+  "name": "bargainproxy-opencode",
+  "version": "0.1.0",
+  "description": "Keep ZCode's personal provider list in sync with a local BargainProxy gateway: nine providers (OpenCode free / 国模 / Gemini-Claude, each over chat / responses / anthropic), refreshed when ZCode starts; user-disabled or hidden entries are preserved.",
+  "author": {
+    "name": "BargainProxy"
+  },
+  "keywords": [
+    "bargainproxy",
+    "opencode",
+    "free-models",
+    "provider"
+  ],
+  "hooks": "./hooks/hooks.json"
+}

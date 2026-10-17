@@ -1,0 +1,124 @@
+// Qoder quota detail for the panel: the raw OpenAPI document carries more
+// than the single remain/total pair used by the account card — plan usage,
+// add-on and org packages, the exceeded flag and the account tier. The daily
+// check-in status (+100 credits) is fetched from the same openapi host.
+//
+// Field mapping mirrors agentpoints2 internal/qoder (quotaView):
+// userQuota.remaining/total/used, addOnQuota.remaining,
+// orgResourcePackage.available/remaining, isQuotaExceeded, userType.
+package qoder
+
+import (
+	"context"
+	"net/http"
+
+	"bargainproxy/internal/model"
+)
+
+// QuotaDetail is the panel payload for one Qoder account.
+type QuotaDetail struct {
+	Account      string        `json:"account,omitempty"`
+	UserType     string        `json:"user_type,omitempty"`
+	Unit         string        `json:"unit,omitempty"`
+	PlanRemain   int64         `json:"plan_remaining"`
+	PlanTotal    int64         `json:"plan_total"`
+	PlanUsed     int64         `json:"plan_used"`
+	AddonRemain  int64         `json:"addon_remaining"`
+	OrgRemain    int64         `json:"org_remaining"`
+	Exceeded     bool          `json:"exceeded"`
+	ExpiresAtMs  int64         `json:"expires_at,omitempty"`
+	Checkin      *CheckinState `json:"checkin,omitempty"`
+	CheckinError string        `json:"checkin_error,omitempty"`
+}
+
+// CheckinState is the daily check-in status without claiming.
+type CheckinState struct {
+	Status     string `json:"status"`
+	StreakDays int64  `json:"streak_days"`
+	Claimable  bool   `json:"claimable"`
+	Claimed    bool   `json:"claimed"`
+	Disabled   bool   `json:"disabled"`
+}
+
+// QuotaDetail fetches the quota document and the check-in status.
+func (d *Driver) QuotaDetail(ctx context.Context, acc *model.Account) (*QuotaDetail, error) {
+	doc, err := d.QuotaRaw(ctx, acc)
+	if err != nil {
+		return nil, err
+	}
+	out := parseQuotaDetail(doc)
+	out.Account = acc.ID
+	if st, serr := d.CheckinStatus(ctx, acc); serr != nil {
+		out.CheckinError = serr.Error()
+	} else {
+		out.Checkin = st
+	}
+	return out, nil
+}
+
+// parseQuotaDetail maps the OpenAPI document (live nested shape, legacy flat
+// shape) to the panel payload.
+func parseQuotaDetail(doc map[string]any) *QuotaDetail {
+	out := &QuotaDetail{}
+	if uq, ok := doc["userQuota"].(map[string]any); ok {
+		out.PlanRemain = toInt64(uq["remaining"])
+		out.PlanTotal = toInt64(uq["total"])
+		out.PlanUsed = toInt64(uq["used"])
+		out.Unit = toString(uq["unit"])
+	}
+	if aq, ok := doc["addOnQuota"].(map[string]any); ok {
+		out.AddonRemain = toInt64(aq["remaining"])
+	}
+	if oq, ok := doc["orgResourcePackage"].(map[string]any); ok {
+		if avail, _ := oq["available"].(bool); avail {
+			out.OrgRemain = toInt64(oq["remaining"])
+		}
+	}
+	out.Exceeded, _ = doc["isQuotaExceeded"].(bool)
+	out.UserType = toString(doc["userType"])
+	out.ExpiresAtMs = toInt64(doc["expiresAt"])
+	if out.PlanTotal == 0 { // legacy flat document
+		out.PlanRemain = toInt64(doc["plan_remaining"])
+		out.PlanTotal = toInt64(doc["plan_total"])
+		out.PlanUsed = toInt64(doc["plan_used"])
+		if out.AddonRemain == 0 {
+			out.AddonRemain = toInt64(doc["addon_remaining"])
+		}
+		if out.OrgRemain == 0 {
+			out.OrgRemain = toInt64(doc["org_remaining"])
+		}
+	}
+	return out
+}
+
+// CheckinStatus reads the daily check-in status without claiming it.
+func (d *Driver) CheckinStatus(ctx context.Context, acc *model.Account) (*CheckinState, error) {
+	rt, err := d.runtimeFor(acc)
+	if err != nil {
+		return nil, err
+	}
+	bearer, err := d.openBearer(ctx, rt)
+	if err != nil {
+		return nil, qoderError(err)
+	}
+	rt.mu.Lock()
+	uid := rt.uid
+	rt.mu.Unlock()
+	out, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+pathCheckStatus, nil, uid, bearer)
+	if err != nil {
+		return nil, qoderError(err)
+	}
+	st := &CheckinState{
+		Status:     toString(out["status"]),
+		StreakDays: toInt64(out["currentStreakDays"]),
+	}
+	switch st.Status {
+	case "CLAIMABLE":
+		st.Claimable = true
+	case "CLAIMED":
+		st.Claimed = true
+	case "DISABLED":
+		st.Disabled = true
+	}
+	return st, nil
+}

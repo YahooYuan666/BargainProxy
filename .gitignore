@@ -1,0 +1,35 @@
+# 本机真实配置与凭据（模板见 config.example.json）
+/config.json
+/data/
+*.key
+
+# 运行日志与临时导出
+/logs/
+/.tmp-*.json
+
+# 便携版 PostgreSQL（约 200MB，可整目录删除）
+/.tools/
+
+# 构建产物
+/*.exe
+/*.exe.bak-*
+
+# 工作台草稿、内部流程与调研资料（保留在本地，不随源码发布）
+/.scratch/
+/research/
+/specs/
+/workflow-state.md
+/execution-report.md
+/review-report.md
+/user-acceptance.md
+/execution-handoff.md
+
+# 安全钩子运行态
+.mimosa/
+
+# ZCode 插件同步状态（属于本机 ZCode 配置）
+/plugins/bargainproxy-opencode/bargainproxy-opencode.state.json
+
+# 编辑器/系统生成的备份副本
+/*.exe~
+/*.exe.bak*
