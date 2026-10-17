@@ -327,6 +327,10 @@ func (d *Driver) buildWire(call driver.ChatCall) ([]byte, error) {
 		switch {
 		case len(m.Content) == 0 && m.Role == ir.RoleAssistant && len(m.ToolCalls) > 0:
 			// content stays absent
+		case m.Role == ir.RoleTool:
+			// OpenAI tool messages carry a plain string; image parts are not
+			// representable on the chat lane (BP-70).
+			wire["content"] = joinText(m.Content)
 		case hasImage(m.Content):
 			wire["content"] = chatContentParts(m.Content)
 		case len(m.Content) == 1 && m.Content[0].Kind == "text":

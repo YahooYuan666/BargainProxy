@@ -316,9 +316,28 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds, withThinkingH
 			}
 		}
 		if m.Role == ir.RoleTool {
-			var result any = ""
-			if len(m.Content) > 0 && m.Content[0].Kind == "text" {
-				result = m.Content[0].Text
+			text := ir.TextOf(m.Content)
+			var blocks []map[string]any
+			hasImage := false
+			for _, p := range m.Content {
+				switch p.Kind {
+				case "text":
+					if p.Text != "" {
+						blocks = append(blocks, map[string]any{"type": "text", "text": p.Text})
+					}
+				case "image":
+					hasImage = true
+					blocks = append(blocks, map[string]any{
+						"type": "image",
+						"source": map[string]any{
+							"type": "base64", "media_type": p.ImageMIME, "data": p.ImageB64,
+						},
+					})
+				}
+			}
+			var result any = text
+			if hasImage {
+				result = blocks
 			}
 			wire = map[string]any{
 				"role": "user",

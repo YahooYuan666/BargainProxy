@@ -12,6 +12,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"bargainproxy/internal/driver"
@@ -30,6 +31,57 @@ type packageAccountView struct {
 	Size     int64            `json:"size"`
 	Packages []driver.Package `json:"packages,omitempty"`
 	Error    string           `json:"error,omitempty"`
+}
+
+// cleanProbeError turns noisy upstream errors (e.g. raw nginx 401 HTML
+// bodies from APISIX) into human-readable one-liners suitable for panel
+// cards and table cells. It strips HTML tags, collapsing whitespace, and
+// maps common HTTP codes to plain explanations (BP-71).
+func cleanProbeError(s string) string {
+	s = strings.TrimSpace(s)
+	lower := strings.ToLower(s)
+	switch {
+	case strings.Contains(lower, "401") || strings.Contains(lower, "unauthorized") || strings.Contains(lower, "authorization required"):
+		return "401 凭据失效（需重新登录）"
+	case strings.Contains(lower, "403") || strings.Contains(lower, "forbidden"):
+		return "403 权限不足或被风控拦截"
+	case strings.Contains(lower, "429") || strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests"):
+		return "429 频率受限 / 额度耗尽"
+	case strings.Contains(lower, "502") || strings.Contains(lower, "bad gateway"):
+		return "502 上游网关错误"
+	case strings.Contains(lower, "503") || strings.Contains(lower, "service unavailable"):
+		return "503 上游服务暂不可用"
+	case strings.Contains(lower, "504") || strings.Contains(lower, "gateway timeout"):
+		return "504 上游响应超时"
+	case strings.Contains(lower, "timeout") || strings.Contains(lower, "deadline exceeded"):
+		return "探测超时（上游未在时限内响应）"
+	}
+	// Strip HTML if any remains.
+	if strings.Contains(s, "<") && strings.Contains(s, ">") {
+		var b strings.Builder
+		inTag := false
+		for _, r := range s {
+			if r == '<' {
+				inTag = true
+				continue
+			}
+			if r == '>' {
+				inTag = false
+				continue
+			}
+			if !inTag {
+				b.WriteRune(r)
+			}
+		}
+		s = strings.Join(strings.Fields(b.String()), " ")
+	}
+	if len(s) > 80 {
+		s = s[:80] + "…"
+	}
+	if s == "" {
+		return "探测失败"
+	}
+	return s
 }
 
 // creditOverviewRow is one domestic pool/account at a glance. Kind tells the
@@ -100,7 +152,7 @@ func (p *Panel) handlePackages(w http.ResponseWriter, r *http.Request) {
 			defer cancel()
 			packs, err := prober.CreditPackages(ctx, acc)
 			if err != nil {
-				v.Error = err.Error()
+				v.Error = cleanProbeError(err.Error())
 				out[i] = v
 				done <- i
 				return
@@ -162,7 +214,7 @@ func (p *Panel) handlePackages(w http.ResponseWriter, r *http.Request) {
 			defer cancel()
 			res, err := prober.Probe(ctx, acc)
 			if err != nil {
-				row.Error = err.Error()
+				row.Error = cleanProbeError(err.Error())
 				results <- probeResult{row: row}
 				return
 			}

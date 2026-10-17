@@ -151,8 +151,10 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	// First-byte window: base from config, widened by context size. Large ZCode
 	// conversations can spend >8s in prefill before the first token; a fixed
 	// window cancelled a healthy workbuddy binding and cascaded to AutoClaw
-	// (user report 2026-10-17).
-	fbWait := fbWaitFor(g.cfg.FallbackWait.D(), req)
+	// (user report 2026-10-17). The widening ceiling is per channel: the
+	// AutoClaw sandbox relay's prefill on 300k-token contexts routinely
+	// exceeds the global 30s cap, so it raises its own ceiling via config
+	// instead of every request cascading at 30s (BP-71).
 	// Attempt tracing (BP-38): where a request can cascade across bindings,
 	// the log must show how many legs it actually paid. Handlers inject a
 	// Trace via context; when absent (tests, internal callers) a private one
@@ -173,6 +175,10 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	}
 	emitted := func() bool { return firstEvent }
 	for bi, binding := range bindings {
+		// The window is per binding: slow-to-first-byte channels (AutoClaw's
+		// sandbox relay) raise their own ceiling without making healthy quick
+		// channels wait longer (BP-71).
+		win := fbWaitFor(g.cfg.FallbackWait.D(), req, g.fbCeiling(binding.Channel))
 		// Pre-flight availability gate (BP-64): do not queue on a channel
 		// that has nothing usable right now when another binding can serve.
 		// Structural blocks (empty pool, all disabled/paused, credit floor)
@@ -182,7 +188,7 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// always attempted — the user asked for its honest answer.
 		if !pinned {
 			ok, earliest := g.pool.NextAvailable(binding.Channel, req.Model)
-			if skipUnavailable(ok, earliest, time.Now(), fbWait) {
+			if skipUnavailable(ok, earliest, time.Now(), win) {
 				lastErr = g.classifyPoolError(&pool.ErrNoCapacity{
 					Channel: binding.Channel, EarliestReset: earliest,
 				}, binding.Channel, req.Model)
@@ -207,7 +213,7 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 			var wcancel context.CancelFunc
 			bctx, wcancel = context.WithCancel(ctx)
 			cancel = wcancel
-			timer := time.AfterFunc(fbWait, wcancel)
+			timer := time.AfterFunc(win, wcancel)
 			attemptEmit = func(ev ir.StreamEvent) error {
 				timer.Stop()
 				return guardSeen(ev)
@@ -223,7 +229,7 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		lastErr = err
 		if ue, ok := uperr.As(err); ok && bi < len(bindings)-1 {
 			if ue.Class == uperr.ClassCanceled || ue.Class == uperr.ClassUpstreamTimeout {
-				log.Printf("gateway: %s first-byte window expired (%s); cascading", binding.Channel, fbWait)
+				log.Printf("gateway: %s first-byte window expired (%s); cascading", binding.Channel, win)
 			}
 		}
 		if ctx.Err() != nil {
@@ -272,10 +278,40 @@ func estimatePromptTokens(req *ir.ChatRequest) int {
 	return chars / 3
 }
 
+// fbWindowCeiling is the global first-byte window cap: base plus 1s per 8k
+// estimated prompt tokens can never exceed this — unless a channel raises its
+// own ceiling via config (AutoClaw, BP-71).
+const fbWindowCeiling = 30 * time.Second
+
+// fbCeiling returns the first-byte window ceiling for one channel. AutoClaw's
+// sandbox relay prefill on 300k-token ZCode contexts exceeds the global 30s
+// cap (measured: cascades logged at exactly 30s on every long request while
+// the relay was healthy), so the AutoClaw binding defaults to a wider ceiling
+// and channels.autoclaw.first_byte_window can tune it (BP-71, user report
+// 2026-10-17). Every other channel keeps the original 30s cap.
+func (g *Gateway) fbCeiling(channel string) time.Duration {
+	if channel == model.ChannelAutoClaw {
+		if w := g.cfg.Channels.AutoClaw.FirstByteWindow.D(); w > 0 {
+			return w
+		}
+		return defaultAutoClawFBWindow
+	}
+	return fbWindowCeiling
+}
+
+// defaultAutoClawFBWindow bounds how long the AutoClaw binding may take its
+// first byte before the cascade moves on. The relay answers small requests
+// in ~7s but needs long prefill on full ZCode sessions; the old global 30s
+// cap killed every such request before the first byte arrived.
+const defaultAutoClawFBWindow = 90 * time.Second
+
 // fbWaitFor returns the first-byte window for this request: base plus one
-// second per 8k estimated prompt tokens, capped at 30s.
-func fbWaitFor(base time.Duration, req *ir.ChatRequest) time.Duration {
-	const maxWindow = 30 * time.Second
+// second per 8k estimated prompt tokens, capped at ceiling (global 30s unless
+// the binding's channel raises it).
+func fbWaitFor(base time.Duration, req *ir.ChatRequest, ceiling time.Duration) time.Duration {
+	if ceiling <= 0 {
+		ceiling = fbWindowCeiling
+	}
 	if base <= 0 {
 		base = fallbackWait
 	}
@@ -283,14 +319,11 @@ func fbWaitFor(base time.Duration, req *ir.ChatRequest) time.Duration {
 	if n <= 0 {
 		return base
 	}
-	extra := time.Duration(n/8000) * time.Second
-	if extra > maxWindow {
-		extra = maxWindow
+	w := base + time.Duration(n/8000)*time.Second
+	if w > ceiling {
+		w = ceiling
 	}
-	if base+extra > maxWindow {
-		return maxWindow
-	}
-	return base + extra
+	return w
 }
 
 // skipUnavailable is the pre-flight gate predicate (BP-64): a binding with

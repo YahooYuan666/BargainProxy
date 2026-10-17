@@ -203,7 +203,11 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds) ([]byte, error) {
 			continue
 		}
 		wire := map[string]any{"role": string(m.Role)}
-		if len(m.Content) == 1 && m.Content[0].Kind == "text" {
+		if m.Role == ir.RoleTool {
+			// OpenAI tool messages carry a plain string; image parts are not
+			// representable here and must not leak into the request (BP-70).
+			wire["content"] = ir.TextOf(m.Content)
+		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
 			wire["content"] = m.Content[0].Text
 		} else {
 			var parts []map[string]any

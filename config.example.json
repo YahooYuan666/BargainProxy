@@ -37,6 +37,7 @@
     "autoclaw": {
       "enabled": true,
       "max_in_flight": 2,
+      "first_byte_window": "90s",
       "app_secret": ""
     },
     "qoder": {

@@ -1897,7 +1897,7 @@ async function loadPackages(){
     const accts = (d.accounts||[]).filter(a => !a.error);
     const errs = (d.accounts||[]).filter(a => a.error);
     document.getElementById('pkNote').textContent = errs.length
-      ? `${accts.length} 个账号可查，${errs.length} 个失败（${errs[0].error}）` : '实时查询上游';
+      ? `${accts.length} 个账号可查，${errs.length} 个失效（需重登）` : '实时查询上游';
     renderOverview(d);
     renderExpiry(d);
     // 到期分布条：每账号一行分段色块（按包到期先后排列）

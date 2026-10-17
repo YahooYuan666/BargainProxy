@@ -117,6 +117,15 @@ type AutoClawSettings struct {
 	UserAPIBase string `json:"userapi_base"` // default https://autoglm-acceleration-api.zhipuai.cn
 	MaxInFlight int    `json:"max_in_flight"`
 
+	// FirstByteWindow raises the first-byte wait ceiling for THIS channel
+	// only (BP-71). The global window is 8s + 1s per 8k prompt tokens capped
+	// at 30s; the sandbox relay routinely needs more prefill time on long
+	// ZCode conversations, so those requests were cascading to the next
+	// binding before AutoClaw produced its first byte. 0 = follow the global
+	// formula. Requests that answer quickly are unaffected — the timer is
+	// cancelled by the first event either way.
+	FirstByteWindow Duration `json:"first_byte_window"`
+
 	// AppSecret signs the userapi requests (X-Auth-Sign). It is a constant
 	// baked into the official client, NOT this project's credential, and it
 	// is intentionally not shipped in source: set it in config.json from the

@@ -4,10 +4,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"bargainproxy/internal/ir"
 )
+
+// toolBlock is the buffered state for one assistant tool call. Tool blocks
+// are emitted only at the end of the turn: upstream OpenAI-compatible streams
+// may interleave argument deltas across tool indexes, and an Anthropic stream
+// can only have one open content block at a time (BP-70).
+type toolBlock struct {
+	id   string
+	name string
+	args strings.Builder
+}
 
 // StreamWriter converts IR stream events into an Anthropic Messages SSE
 // stream. Event sequence per the protocol:
@@ -19,16 +30,17 @@ import (
 // the next index, then one block per tool call. Deltas are routed to the
 // currently open block by kind.
 type StreamWriter struct {
-	w           io.Writer
-	flusher     interface{ Flush() }
-	id          string
-	model       string
-	mu          sync.Mutex
-	started     bool
-	closed      bool
-	blockIdx    int
-	openKind    string // "", "text", "thinking", "tool"
-	openToolIdx int    // tool index when openKind == "tool"
+	w          io.Writer
+	flusher    interface{ Flush() }
+	id         string
+	model      string
+	mu         sync.Mutex
+	started    bool
+	closed     bool
+	blockIdx   int
+	openKind   string // "", "text", "thinking"
+	toolOrder  []int
+	toolStates map[int]*toolBlock
 
 	// usage is the upstream's authoritative accounting for this response,
 	// kept whole so message_delta can emit the Anthropic split (UsageFromIR).
@@ -46,7 +58,7 @@ type StreamWriter struct {
 // placeholder — never a fabricated 0 for a non-empty prompt — and
 // message_delta then overwrites it with the upstream's authoritative usage.
 func NewStreamWriter(w io.Writer, flusher interface{ Flush() }, id, model string, estInputTokens int) *StreamWriter {
-	return &StreamWriter{w: w, flusher: flusher, id: id, model: model, blockIdx: -1, initInput: estInputTokens}
+	return &StreamWriter{w: w, flusher: flusher, id: id, model: model, blockIdx: -1, initInput: estInputTokens, toolStates: map[int]*toolBlock{}}
 }
 
 func (s *StreamWriter) event(name string, payload any) error {
@@ -124,22 +136,6 @@ func (s *StreamWriter) openThinking() error {
 	})
 }
 
-func (s *StreamWriter) openTool(toolIndex int, tc *ir.ToolCall) error {
-	if s.openKind == "tool" && s.openToolIdx == toolIndex {
-		return nil
-	}
-	if err := s.closeBlock(); err != nil {
-		return err
-	}
-	s.blockIdx++
-	s.openKind = "tool"
-	s.openToolIdx = toolIndex
-	return s.event("content_block_start", map[string]any{
-		"type": "content_block_start", "index": s.blockIdx,
-		"content_block": map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": map[string]any{}},
-	})
-}
-
 // Send routes one IR event into the Anthropic stream.
 func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 	s.mu.Lock()
@@ -185,15 +181,32 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 			"delta": map[string]any{"type": "signature_delta", "signature": ev.Delta},
 		})
 	case ir.EvToolStart:
-		return s.openTool(ev.ToolIndex, ev.ToolCall)
-	case ir.EvToolArgs:
-		if err := s.openTool(ev.ToolIndex, &ir.ToolCall{ID: fmt.Sprintf("call_%d", ev.ToolIndex)}); err != nil {
-			return err
+		st := s.toolStates[ev.ToolIndex]
+		if st == nil {
+			st = &toolBlock{}
+			s.toolStates[ev.ToolIndex] = st
+			s.toolOrder = append(s.toolOrder, ev.ToolIndex)
 		}
-		return s.event("content_block_delta", map[string]any{
-			"type": "content_block_delta", "index": s.blockIdx,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": ev.Delta},
-		})
+		if ev.ToolCall != nil {
+			if ev.ToolCall.ID != "" {
+				st.id = ev.ToolCall.ID
+			}
+			if ev.ToolCall.Name != "" {
+				st.name = ev.ToolCall.Name
+			}
+		}
+		return nil
+	case ir.EvToolArgs:
+		st := s.toolStates[ev.ToolIndex]
+		if st == nil {
+			// Arguments without a start event: keep them anyway (the client
+			// still gets a usable call with a synthetic id).
+			st = &toolBlock{id: fmt.Sprintf("call_%d", ev.ToolIndex)}
+			s.toolStates[ev.ToolIndex] = st
+			s.toolOrder = append(s.toolOrder, ev.ToolIndex)
+		}
+		st.args.WriteString(ev.Delta)
+		return nil
 	case ir.EvUsage:
 		if ev.Usage != nil {
 			u := *ev.Usage
@@ -206,9 +219,56 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 	return nil
 }
 
+// emitToolBlocks flushes buffered tool calls as complete Anthropic tool_use
+// blocks, in first-seen order. Buffering is what makes interleaved upstream
+// deltas safe: Anthropic allows only one open content block at a time, and a
+// tool block must be started and stopped with its own arguments (BP-70).
+func (s *StreamWriter) emitToolBlocks() error {
+	for _, idx := range s.toolOrder {
+		st := s.toolStates[idx]
+		if st == nil {
+			continue
+		}
+		id := st.id
+		if id == "" {
+			id = fmt.Sprintf("call_%d", idx)
+		}
+		s.blockIdx++
+		if err := s.event("content_block_start", map[string]any{
+			"type": "content_block_start", "index": s.blockIdx,
+			"content_block": map[string]any{"type": "tool_use", "id": id, "name": st.name, "input": map[string]any{}},
+		}); err != nil {
+			return err
+		}
+		if args := st.args.String(); args != "" {
+			if err := s.event("content_block_delta", map[string]any{
+				"type": "content_block_delta", "index": s.blockIdx,
+				"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
+			}); err != nil {
+				return err
+			}
+		}
+		if err := s.event("content_block_stop", map[string]any{
+			"type": "content_block_stop", "index": s.blockIdx,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // finish closes open blocks and emits message_delta + message_stop.
 func (s *StreamWriter) finish(stop string) error {
 	if err := s.closeBlock(); err != nil {
+		return err
+	}
+	if !s.started {
+		if err := s.messageStart(); err != nil {
+			return err
+		}
+		s.started = true
+	}
+	if err := s.emitToolBlocks(); err != nil {
 		return err
 	}
 	reason := mapStop(ir.StopReason(stop))
@@ -258,5 +318,8 @@ func (s *StreamWriter) FinishWithError(msg string) error {
 	}); err != nil {
 		return err
 	}
+	// A failed turn must not emit half-buffered tool calls.
+	s.toolStates = map[int]*toolBlock{}
+	s.toolOrder = nil
 	return s.finish(string(ir.StopEnd))
 }

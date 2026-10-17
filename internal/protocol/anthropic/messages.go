@@ -98,6 +98,7 @@ func ParseMessagesRequest(body []byte) (*ir.ChatRequest, error) {
 	// alternation; clients that diverged from it are normalized here so
 	// downstream channels never see double-user turns).
 	req.Messages = mergeAdjacent(req.Messages)
+	capToolResultImages(req.Messages, maxToolResultImages)
 
 	for _, t := range w.Tools {
 		req.Tools = append(req.Tools, ir.ToolDef{Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
@@ -262,25 +263,48 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 			main.ToolCalls = append(main.ToolCalls, ir.ToolCall{ID: id, Name: name, Arguments: string(inputRaw)})
 		case "tool_result":
 			id, _ := b["tool_use_id"].(string)
-			var resultText string
+			var resultParts []ir.ContentPart
 			switch cv := b["content"].(type) {
 			case string:
-				resultText = cv
+				if cv != "" {
+					resultParts = append(resultParts, ir.ContentPart{Kind: "text", Text: cv})
+				}
 			case []any:
-				var parts []string
 				for _, item := range cv {
-					if sub, ok := item.(map[string]any); ok {
+					sub, ok := item.(map[string]any)
+					if !ok {
+						continue
+					}
+					switch typ, _ := sub["type"].(string); typ {
+					case "text":
 						if t, _ := sub["text"].(string); t != "" {
-							parts = append(parts, t)
+							resultParts = append(resultParts, ir.ContentPart{Kind: "text", Text: t})
+						}
+					case "image":
+						if src, ok := sub["source"].(map[string]any); ok {
+							switch srcType, _ := src["type"].(string); srcType {
+							case "base64":
+								mime, _ := src["media_type"].(string)
+								data, _ := src["data"].(string)
+								if data != "" {
+									resultParts = append(resultParts, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: data})
+								}
+							case "url":
+								if u, _ := src["url"].(string); u != "" {
+									resultParts = append(resultParts, ir.ContentPart{Kind: "image_url_unsupported", Text: u})
+								}
+							}
 						}
 					}
 				}
-				resultText = strings.Join(parts, "\n")
+			}
+			if len(resultParts) == 0 {
+				resultParts = []ir.ContentPart{{Kind: "text", Text: ""}}
 			}
 			toolMsgs = append(toolMsgs, ir.Message{
 				Role:       ir.RoleTool,
 				ToolCallID: id,
-				Content:    []ir.ContentPart{{Kind: "text", Text: resultText}},
+				Content:    resultParts,
 			})
 		}
 	}
@@ -290,6 +314,42 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 	}
 	out = append(out, toolMsgs...)
 	return out, nil
+}
+
+// maxToolResultImages bounds how many tool-result images one request may carry.
+// Images are expensive and a single tool round can return many; keeping the
+// most recent five matches AIClient2API's #718 budget while still giving the
+// model the latest screenshots (BP-70).
+const maxToolResultImages = 5
+
+// capToolResultImages keeps only the most recent max images across all tool
+// messages. Text blocks stay; only image parts are dropped.
+func capToolResultImages(msgs []ir.Message, max int) {
+	if max <= 0 {
+		return
+	}
+	kept := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != ir.RoleTool {
+			continue
+		}
+		parts := msgs[i].Content
+		out := make([]ir.ContentPart, 0, len(parts))
+		for j := len(parts) - 1; j >= 0; j-- {
+			p := parts[j]
+			if p.Kind == "image" {
+				if kept >= max {
+					continue
+				}
+				kept++
+			}
+			out = append(out, p)
+		}
+		for l, r := 0, len(out)-1; l < r; l, r = l+1, r-1 {
+			out[l], out[r] = out[r], out[l]
+		}
+		msgs[i].Content = out
+	}
 }
 
 // mergeAdjacent merges consecutive messages with the same role.

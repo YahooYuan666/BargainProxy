@@ -686,7 +686,9 @@ func buildBody(call driver.ChatCall) ([]byte, string, error) {
 	var messages []map[string]any
 	for _, m := range req.Messages {
 		wire := map[string]any{"role": string(m.Role)}
-		if len(m.Content) == 1 && m.Content[0].Kind == "text" {
+		if m.Role == ir.RoleTool {
+			wire["content"] = ir.TextOf(m.Content)
+		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
 			wire["content"] = m.Content[0].Text
 		} else if len(m.Content) > 0 {
 			var parts []map[string]any

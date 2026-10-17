@@ -510,6 +510,8 @@ func irPayload(call driver.ChatCall) (map[string]any, error) {
 	for _, m := range req.Messages {
 		wire := map[string]any{"role": string(m.Role)}
 		switch {
+		case m.Role == ir.RoleTool:
+			wire["content"] = ir.TextOf(m.Content)
 		case len(m.Content) == 1 && m.Content[0].Kind == "text":
 			wire["content"] = m.Content[0].Text
 		case len(m.Content) > 0:

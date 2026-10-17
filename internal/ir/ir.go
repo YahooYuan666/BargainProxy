@@ -24,6 +24,20 @@ type ContentPart struct {
 	ImageB64  string `json:"image_b64,omitempty"`  // base64 payload without data: prefix
 }
 
+// TextOf concatenates the text parts, ignoring images and other kinds.
+// OpenAI-shaped tool messages accept a plain string only; drivers use this for
+// RoleTool so image parts can never leak into a field the upstream rejects
+// (BP-70).
+func TextOf(parts []ContentPart) string {
+	var b strings.Builder
+	for _, p := range parts {
+		if p.Kind == "text" {
+			b.WriteString(p.Text)
+		}
+	}
+	return b.String()
+}
+
 // ToolCall is an assistant-issued function call. Arguments is a JSON string
 // (possibly partial during streaming).
 type ToolCall struct {
