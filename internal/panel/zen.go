@@ -40,22 +40,27 @@ func (p *Panel) ZenAutoTick(ctx context.Context) bool {
 	return true
 }
 
-// ZenProbeTick implements tasks.ZenRunner: probe the candidate set. Reports
-// whether it ran.
-func (p *Panel) ZenProbeTick(ctx context.Context) bool {
-	if p.zenSetting(KeyZenAutoSync, "true") != "true" || p.zenDriver() == nil {
-		return false
+// ZenBootProbe runs the single availability pass at startup: refresh the
+// catalog when it is empty (fresh install), probe every candidate once, then
+// apply the routes so the ZCode picker matches reality. This is deliberately
+// the only automatic probe — a scheduled one spends the shared anonymous
+// quota and turns any transient 429 into a page full of "unavailable" models.
+// After boot the user probes from the panel on demand.
+func (p *Panel) ZenBootProbe(ctx context.Context) {
+	c := p.zenCatalog()
+	if c == nil || p.zenDriver() == nil {
+		return
 	}
-	okCount, total := p.zenCatalog().ProbeCandidates(ctx, p.zenDriver(), 60*time.Second)
-	log.Printf("opencodezen: scheduled probe %d/%d ok", okCount, total)
-	// Probe results change the usable set, so the route table must follow
-	// immediately — the manual probe action does this too. Without it a model
-	// that just recovered stays 404 ("model not found") until the next hourly
-	// auto-sync.
+	if len(c.Candidates()) == 0 {
+		if err := c.Sync(ctx); err != nil {
+			log.Printf("opencodezen: startup sync: %v", err)
+		}
+	}
+	okCount, limitedCount, total := c.ProbeCandidates(ctx, p.zenDriver(), 60*time.Second)
+	log.Printf("opencodezen: startup probe %d/%d ok, %d limited", okCount, total, limitedCount)
 	if _, err := p.zenSyncNow(context.Background()); err != nil {
 		log.Printf("opencodezen: post-probe sync: %v", err)
 	}
-	return true
 }
 
 // SetZen registers the OpenCode Zen pieces (called from main).
@@ -107,13 +112,20 @@ func (p *Panel) handleZenState(w http.ResponseWriter, r *http.Request) {
 	if c := p.zenCatalog(); c != nil {
 		snap := c.Snapshot()
 		out["snapshot"] = snap
-		okCount := 0
+		okCount, limitedCount := 0, 0
 		for _, m := range snap.Models {
-			if m.Candidate && m.ProbeStatus == "ok" {
+			if !m.Candidate {
+				continue
+			}
+			switch m.ProbeStatus {
+			case opencodezen.ProbeOK:
 				okCount++
+			case opencodezen.ProbeLimited:
+				limitedCount++
 			}
 		}
 		out["probe_ok"] = okCount
+		out["probe_limited"] = limitedCount
 	}
 	writeJSON(w, http.StatusOK, out)
 }
@@ -150,8 +162,8 @@ func (p *Panel) handleZenManage(w http.ResponseWriter, r *http.Request) {
 		go func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 			defer cancel()
-			okCount, total := p.zenCatalog().ProbeCandidates(ctx, p.zenDriver(), 60*time.Second)
-			log.Printf("opencodezen: probe finished %d/%d ok", okCount, total)
+			okCount, limitedCount, total := p.zenCatalog().ProbeCandidates(ctx, p.zenDriver(), 60*time.Second)
+			log.Printf("opencodezen: manual probe %d/%d ok, %d limited", okCount, total, limitedCount)
 			// Probe results feed the route table (usable set may have changed).
 			if _, err := p.zenSyncNow(context.Background()); err != nil {
 				log.Printf("opencodezen: post-probe sync: %v", err)
@@ -189,29 +201,32 @@ func (p *Panel) zenSaveSettings(w http.ResponseWriter, req *zenModelsRequest) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "applied": apply})
 }
 
-// zenUsableModels returns the model ids to expose: candidates probed OK, or
-// all candidates when none has been probed yet (first-run visibility).
+// zenUsableModels returns the model ids to expose: candidates whose verdict is
+// not a definitive failure. "limited" (429/timeout/transport) keeps the route —
+// a temporary upstream condition must not make a working model vanish. When
+// every candidate failed definitively the full candidate list is returned:
+// emptying the table over one bad probe cycle is worse than letting requests
+// surface the real upstream error.
 func (p *Panel) zenUsableModels() []string {
-	if c := p.zenCatalog(); c != nil {
-		snap := c.Snapshot()
-		var okList, all []string
-		anyOk := false
-		for _, m := range snap.Models {
-			if !m.Candidate {
-				continue
-			}
-			all = append(all, m.ID)
-			if m.ProbeStatus == "ok" {
-				anyOk = true
-				okList = append(okList, m.ID)
-			}
-		}
-		if anyOk {
-			return okList
-		}
-		return all
+	c := p.zenCatalog()
+	if c == nil {
+		return nil
 	}
-	return nil
+	snap := c.Snapshot()
+	var usable, all []string
+	for _, m := range snap.Models {
+		if !m.Candidate {
+			continue
+		}
+		all = append(all, m.ID)
+		if m.ProbeStatus != opencodezen.ProbeFail {
+			usable = append(usable, m.ID)
+		}
+	}
+	if len(usable) > 0 {
+		return usable
+	}
+	return all
 }
 
 // zenSyncNow refreshes the catalog and applies the gateway routes (optional).

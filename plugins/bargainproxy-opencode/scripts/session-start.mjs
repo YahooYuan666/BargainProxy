@@ -14,10 +14,15 @@
  *   anthropic 线的 baseUrl 不带 /v1，ZCode 会追加 /v1/messages。
  * api.type 是 ZCode 的严格枚举，只有上面三个合法值。
  *
- * 用户意图保留（本版新增）：
- *   - provider 级：沿用原规则的 enabled / visibility（你在 ZCode 里关掉或隐藏的供应商不会被重新打开）；
- *   - 模型级：上一次同步写过、但之后从 personalModelIds 里消失的模型视为"用户隐藏"，
- *     后续同步不会再把它塞回来；用户重新加回来自动解除；
+ * 用户意图保留（本版修正：之前只按"族"判断，隐藏单条协议线上的模型会被
+ * 另外两条线的并集掩盖，同步时又塞回去——本次改成逐 provider 判定）：
+ *   - provider 级：沿用原规则的 enabled / visibility（你在 ZCode 里关掉或隐藏的
+ *     供应商不会被重新打开）；整组被删掉的 provider 也不再自动重建，
+ *     需要恢复时显式跑 `--readd`；
+ *   - 模型级：某条协议线的 personalModelIds 里消失的模型 = 你在这条线上隐藏了它，
+ *     后续同步不会再塞回来；重新加回即自动解除。逐 provider 独立记录，
+ *     不再用三条线并集判断；
+ *   - 排序：你调整过的 modelOrder 保留，新模型追加到末尾；
  *   - 未知字段：原 provider / model 规则里的其它键原样保留。
  *
  * 安全轨（对着两次真实事故的根因逐条设防）：
@@ -34,6 +39,7 @@
  *   node scripts/session-start.mjs --status        # 看当前安装状态（不改动）
  *   node scripts/session-start.mjs --dry-run       # 打印将要发生的改动（不落盘）
  *   node scripts/session-start.mjs --remove        # 从 ZCode 里摘掉这 9 个供应商
+ *   node scripts/session-start.mjs --readd         # 把用户整组删掉的供应商重新加回
  *   node scripts/session-start.mjs --config <path> --gateway <url> --api-key <key> --verbose
  */
 
@@ -91,7 +97,7 @@ const TAG = "bargainproxy-opencode";
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const out = { mode: "sync", config: "", gateway: "", apiKey: "", verbose: false };
+  const out = { mode: "sync", config: "", gateway: "", apiKey: "", verbose: false, readd: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = () => argv[++i] ?? "";
@@ -101,6 +107,7 @@ function parseArgs(argv) {
     else if (a === "--config") out.config = next();
     else if (a === "--gateway") out.gateway = next();
     else if (a === "--api-key") out.apiKey = next();
+    else if (a === "--readd") out.readd = true;
     else if (a === "--verbose" || a === "-v") out.verbose = true;
     else if (a === "--help" || a === "-h") out.help = true;
   }
@@ -154,8 +161,21 @@ function readState(configFile) {
   }
 }
 
+/**
+ * 把 buildDoc 记录的逐 provider 状态收拢成 state.families。
+ * 来源不可达（本次没碰）的族沿用旧状态，否则它们的隐藏记录会被抹掉。
+ */
+function stateFromPlan(plan, prevState) {
+  const families = { ...(prevState?.families ?? {}) };
+  for (const f of plan) {
+    if (!f?.state) continue;
+    families[f.key] = f.state;
+  }
+  return families;
+}
+
 function writeState(configFile, families) {
-  const doc = { version: 1, updatedAt: new Date().toISOString(), families };
+  const doc = { version: 2, updatedAt: new Date().toISOString(), families };
   const file = statePathFor(configFile);
   const tmp = `${file}.${process.pid}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n");
@@ -179,18 +199,20 @@ async function getJson(url, timeoutMs = HTTP_TIMEOUT_MS, apiKey = "") {
   }
 }
 
-// ── 来源 1：OpenCode 免费模型（面板同口径：候选 ∩ 探测通过；全未探测给全候选）
+// ── 来源 1：OpenCode 免费模型（面板同口径：候选里没被判定失败的；全失败给全候选）
+// probe_status：ok 可用 / limited 临时限流（429、超时，路由保留）/ fail 确定性失败。
+// 限流不是"模型坏了"，所以和 ok 一起写进 ZCode；只有 fail 才排除。
 function usableModels(state) {
   const models = state?.snapshot?.models;
   if (!Array.isArray(models)) return null;
-  const ok = [];
+  const usable = [];
   const all = [];
   for (const m of models) {
     if (!m || m.candidate !== true || typeof m.id !== "string" || !m.id) continue;
     all.push(m.id);
-    if (m.probe_status === "ok") ok.push(m.id);
+    if (m.probe_status !== "fail") usable.push(m.id);
   }
-  if (ok.length > 0) return ok;
+  if (usable.length > 0) return usable;
   return all;
 }
 
@@ -279,34 +301,71 @@ const stable = (v) => {
 };
 const sameJson = (a, b) => JSON.stringify(stable(a)) === JSON.stringify(stable(b));
 
-/** 从现有 provider 规则里取用户可见模型（三条线的清单应一致，取并集）。*/
-function visibleIdsOf(existing, ids) {
-  const set = new Set();
-  for (const r of asArray(existing?.config?.providerConfigRules?.providerRules)) {
-    if (!ids.includes(r?.providerId)) continue;
-    for (const id of asArray(r?.config?.personalModelIds)) {
-      if (typeof id === "string") set.add(id);
+/**
+ * Provider 级历史状态。v1 的 state 只有族级 writtenIds/hiddenIds（三条协议线
+ * 共用一个清单），v2 起按 provider 分开，因为 ZCode 的"隐藏某个模型"是**逐
+ * provider** 从 personalModelIds 里删掉该模型——族级并集会把它当成仍可见，
+ * 于是下一次同步又把它塞回去（这就是"改了但没改干净"的根因）。
+ */
+function providerState(familyState, providerId) {
+  const map = familyState?.providers;
+  if (map && typeof map === "object") {
+    const p = map[providerId];
+    if (p && typeof p === "object") {
+      return {
+        wrote: p.wrote === true,
+        writtenIds: asArray(p.writtenIds).filter((x) => typeof x === "string"),
+        hiddenIds: asArray(p.hiddenIds).filter((x) => typeof x === "string"),
+      };
     }
+    return { wrote: false, writtenIds: [], hiddenIds: [] };
   }
-  return set;
+  // v1 迁移：族级清单视为每条协议线都写过。
+  const writtenIds = asArray(familyState?.writtenIds).filter((x) => typeof x === "string");
+  return {
+    wrote: writtenIds.length > 0,
+    writtenIds,
+    hiddenIds: asArray(familyState?.hiddenIds).filter((x) => typeof x === "string"),
+  };
+}
+
+/** 保留用户已有的模型排序，新模型追加在末尾。*/
+function mergeModelOrder(prevOrder, effective) {
+  const keep = asArray(prevOrder).filter((id) => effective.includes(id));
+  const seen = new Set(keep);
+  return [...keep, ...effective.filter((id) => !seen.has(id))];
 }
 
 /**
- * 计算本次应写入的模型清单，并识别"用户隐藏"：
- *   - 上次写过、但现在 personalModelIds 里没有的模型 = 用户隐藏；
- *   - 用户重新加回（出现在 personalModelIds）= 自动解除隐藏；
- *   - 隐藏集合持久化在 state.hiddenIds，跨多次同步保持。
+ * 计算某条协议线本次应写入的模型清单，并识别"用户隐藏"（逐 provider）：
+ *   - 上次写过、但这条线的 personalModelIds 里没有 = 用户在这里隐藏了它；
+ *   - 用户重新加回（出现在本条 personalModelIds）= 自动解除隐藏；
+ *   - 隐藏集合持久化在 state.providers[providerId].hiddenIds。
+ * 只在该 provider 规则仍然存在时才做"新隐藏"推断：规则整体消失是删号/
+ * 换配置，不能据此把模型全判成隐藏。
  */
-function computeEffective(existing, family, state) {
-  const visible = visibleIdsOf(existing, family.providers.map((p) => p.id));
-  const st = state?.families?.[family.key] || {};
-  const prevWritten = asArray(st.writtenIds).filter((x) => typeof x === "string");
-  const prevHidden = asArray(st.hiddenIds).filter((x) => typeof x === "string");
-  const newlyHidden = prevWritten.filter((id) => !visible.has(id));
-  const hidden = new Set([...prevHidden, ...newlyHidden].filter((id) => !visible.has(id)));
+function computeEffective(existing, family, state, providerId) {
+  const familyState = state?.families?.[family.key] || {};
+  const st = providerState(familyState, providerId);
+  const prevRule = asArray(existing?.config?.providerConfigRules?.providerRules)
+    .find((r) => r?.providerId === providerId);
   const source = Array.isArray(family.ids) ? family.ids : [];
+  const visible = new Set(
+    prevRule
+      ? asArray(prevRule?.config?.personalModelIds).filter((x) => typeof x === "string")
+      : st.writtenIds,
+  );
+  const newlyHidden = prevRule ? st.writtenIds.filter((id) => !visible.has(id)) : [];
+  const hidden = new Set([...st.hiddenIds, ...newlyHidden].filter((id) => !visible.has(id)));
   const effective = source.filter((id) => !hidden.has(id));
-  return { effective, hidden: [...hidden], source };
+  return {
+    effective,
+    order: mergeModelOrder(prevRule?.config?.modelOrder, effective),
+    hidden: [...hidden],
+    source,
+    prevRule,
+    st,
+  };
 }
 
 /**
@@ -314,9 +373,13 @@ function computeEffective(existing, family, state) {
  * - 只重建"有最新清单"的族；来源不可达的族原样保留；
  * - provider 规则沿用原规则的 enabled / visibility / 未知字段；
  * - 模型规则对已存在的模型整条复用（保留用户可能写入的隐藏字段）；
- * - 用户隐藏 = 上次写过但当前 personalModelIds 里没有的模型，永不再加回。
+ * - 模型隐藏逐 provider 判定（见 computeEffective），不再用族级并集；
+ * - 用户整组删掉/隐藏的 provider 不再自动重建（--readd 可强制加回）；
+ * - 模型全被隐藏的 provider 原样保留，不写空清单（写空会让 ZCode 丢掉该组
+ *   连同里面的 enabled / visibility 用户设置）；
+ * - 用户调整过的 modelOrder 保留原顺序，新模型追加到末尾。
  */
-function buildDoc(existing, base, apiKey, plan, metaFor, prevState) {
+function buildDoc(existing, base, apiKey, plan, metaFor, prevState, opts = {}) {
   const doc = JSON.parse(JSON.stringify(existing));
   const cfg = doc.config;
   const providerRules = asArray(cfg?.providerConfigRules?.providerRules);
@@ -330,27 +393,48 @@ function buildDoc(existing, base, apiKey, plan, metaFor, prevState) {
   }
 
   const active = plan.filter((f) => f.ids !== null && f.ids.length > 0);
-  const activeProviderIds = active.flatMap((f) => f.providers.map((p) => p.id));
-  const activeSet = new Set(activeProviderIds);
-
-  const keptProviderRules = providerRules.filter((r) => !activeSet.has(r?.providerId));
-  const keptModelRules = existingModelRules.filter((r) => !activeSet.has(r?.providerId));
-  const keptManualRules = asArray(modelRules.manualProviderModelRules).filter((r) => !activeSet.has(r?.providerId));
-  const keptOrder = asArray(cfg.providerOrder).filter((v) => !(typeof v === "string" && activeSet.has(v)));
 
   const ourProviderRules = [];
   const ourModelRules = [];
+  const writtenIds = new Set(); // providers we rewrite this round
   for (const family of active) {
-    const { effective } = computeEffective(existing, family, prevState);
-    if (effective.length === 0) continue;
+    family.written = [];
+    family.skipped = [];
+    family.state = { sourceIds: [...family.ids], providers: {} };
     for (const p of family.providers) {
-      const prev = providerRules.find((r) => r?.providerId === p.id) ?? {};
-      const prevCfg = prev.config && typeof prev.config === "object" ? prev.config : {};
+      const prev = providerRules.find((r) => r?.providerId === p.id);
+      const st = providerState(prevState?.families?.[family.key], p.id);
+      // The user removed/hid this whole provider group in ZCode: it is gone
+      // from the rules. Re-creating it every sync undoes that choice, so only
+      // --readd brings it back.
+      if (!prev && st.wrote && !opts.readd) {
+        family.skipped.push(p.id);
+        family.state.providers[p.id] = {
+          wrote: true,
+          writtenIds: st.writtenIds,
+          hiddenIds: st.hiddenIds,
+        };
+        continue;
+      }
+      const { effective, order, hidden } = computeEffective(existing, family, prevState, p.id);
+      const prevCfg = prev?.config && typeof prev.config === "object" ? prev.config : {};
+      if (effective.length === 0 && prev) {
+        // Everything on this line is hidden by the user: keep the rule byte
+        // for byte so its enabled/visibility survive.
+        family.written.push({
+          id: p.id,
+          effective: asArray(prevCfg.personalModelIds),
+          order: asArray(prevCfg.modelOrder),
+          untouched: true,
+        });
+        family.state.providers[p.id] = { wrote: true, writtenIds: st.writtenIds, hiddenIds: hidden };
+        continue;
+      }
       const rule = {
-        ...prev,
+        ...(prev ?? {}),
         providerId: p.id,
         providerName: p.name,
-        enabled: typeof prev.enabled === "boolean" ? prev.enabled : true,
+        enabled: typeof prev?.enabled === "boolean" ? prev.enabled : true,
         config: {
           ...prevCfg,
           group: typeof prevCfg.group === "string" ? prevCfg.group : "standard-personal",
@@ -358,10 +442,13 @@ function buildDoc(existing, base, apiKey, plan, metaFor, prevState) {
           access: { type: "api-key", apiKey },
           api: { type: p.apiType, baseUrl: p.v1 ? `${base}/v1` : base },
           personalModelIds: [...effective],
-          modelOrder: [...effective],
+          modelOrder: order,
         },
       };
       ourProviderRules.push(rule);
+      writtenIds.add(p.id);
+      family.written.push({ id: p.id, effective, order, untouched: false });
+      family.state.providers[p.id] = { wrote: true, writtenIds: effective, hiddenIds: hidden };
       for (const id of effective) {
         const reused = existingByKey.get(`${p.id}\u0000${id}`);
         if (reused) {
@@ -372,6 +459,13 @@ function buildDoc(existing, base, apiKey, plan, metaFor, prevState) {
       }
     }
   }
+
+  // Rules we did not rewrite (other vendors + untouched/removed providers) are
+  // carried over verbatim.
+  const keptProviderRules = providerRules.filter((r) => !writtenIds.has(r?.providerId));
+  const keptModelRules = existingModelRules.filter((r) => !writtenIds.has(r?.providerId));
+  const keptManualRules = asArray(modelRules.manualProviderModelRules).filter((r) => !writtenIds.has(r?.providerId));
+  const keptOrder = asArray(cfg.providerOrder).filter((v) => !(typeof v === "string" && writtenIds.has(v)));
 
   doc.schemaVersion = 1;
   cfg.providerOrder = [...keptOrder, ...ourProviderRules.map((r) => r.providerId)];
@@ -457,27 +551,38 @@ function validateDoc(doc, { base, plan, previous, expectOurs = true }) {
   if (expectOurs) {
     const active = plan.filter((f) => f.ids !== null && f.ids.length > 0);
     for (const family of active) {
-      const { effective } = computeEffective(previous, family, plan?.prevState);
-      if (effective.length === 0) continue;
-      for (const p of family.providers) {
-        const rule = ourRules.find((r) => r.providerId === p.id);
+      // buildDoc records exactly which lines it wrote and with what; verify
+      // against that instead of recomputing (recomputing would re-derive the
+      // old family-wide union and mask a wrong write).
+      const written = asArray(family.written);
+      for (const w of written) {
+        const rule = ourRules.find((r) => r.providerId === w.id);
         if (!rule) {
-          problems.push(`缺少供应商 ${p.id}`);
+          problems.push(`缺少供应商 ${w.id}`);
           continue;
         }
+        const p = family.providers.find((x) => x.id === w.id);
+        if (!p) continue;
         if (rule.config?.api?.type !== p.apiType) problems.push(`${p.id}: api.type=${rule.config?.api?.type} 非法`);
         const want = p.v1 ? `${base}/v1` : base;
         if (rule.config?.api?.baseUrl !== want) problems.push(`${p.id}: baseUrl=${rule.config?.api?.baseUrl}，应为 ${want}`);
         if (rule.config?.access?.type !== "api-key" || !rule.config?.access?.apiKey) problems.push(`${p.id}: access 形状不对`);
-        if (!sameJson(rule.config?.personalModelIds, effective)) problems.push(`${p.id}: personalModelIds 与可用清单不一致`);
-        if (!sameJson(rule.config?.modelOrder, effective)) problems.push(`${p.id}: modelOrder 与可用清单不一致`);
+        if (!w.untouched) {
+          if (!sameJson(rule.config?.personalModelIds, w.effective)) problems.push(`${p.id}: personalModelIds 与可用清单不一致`);
+          if (!sameJson(rule.config?.modelOrder, w.order)) problems.push(`${p.id}: modelOrder 与预期顺序不一致`);
+        }
         const prev = asArray(previous?.config?.providerConfigRules?.providerRules).find((r) => r?.providerId === p.id);
         for (const msg of preservedOurs(prev, rule)) problems.push(`${p.id}: ${msg}`);
       }
+      // A provider the user removed must not be re-created behind their back.
+      for (const id of asArray(family.skipped)) {
+        if (ourRules.some((r) => r.providerId === id)) problems.push(`用户已删除的供应商被重建：${id}`);
+      }
       const ruleKeys = new Set(asArray(modelRules?.providerModelRules).map((r) => `${r?.providerId}\u0000${r?.modelId}`));
-      for (const p of family.providers) {
-        for (const id of effective) {
-          if (!ruleKeys.has(`${p.id}\u0000${id}`)) problems.push(`${p.id}: 缺少模型声明 ${id}`);
+      for (const w of written) {
+        if (w.untouched) continue;
+        for (const id of w.effective) {
+          if (!ruleKeys.has(`${w.id}\u0000${id}`)) problems.push(`${w.id}: 缺少模型声明 ${id}`);
         }
       }
     }
@@ -656,19 +761,13 @@ async function main(argv) {
 
   const planWithState = plan.map((f) => ({ ...f }));
   planWithState.prevState = prevState;
-  const doc = buildDoc(existing, base, apiKey, planWithState, metaFor, prevState);
+  const doc = buildDoc(existing, base, apiKey, planWithState, metaFor, prevState, { readd: args.readd });
   if (sameJson(doc, existing)) {
     note("目标与现状一致，未写盘", true);
     // 状态文件缺失时补齐，保证下次能识别用户隐藏
-    const needState = plan.some((f) => f.ids !== null && f.ids.length > 0 && !prevState.families?.[f.key]?.writtenIds);
+    const needState = plan.some((f) => f.ids !== null && f.ids.length > 0 && !prevState.families?.[f.key]?.providers);
     if (needState) {
-      const families = {};
-      for (const f of plan) {
-        if (f.ids === null || f.ids.length === 0) continue;
-        const { effective, hidden, source } = computeEffective(existing, f, prevState);
-        families[f.key] = { sourceIds: source, writtenIds: effective, hiddenIds: hidden };
-      }
-      try { writeState(file, families); } catch { /* state is advisory */ }
+      try { writeState(file, stateFromPlan(planWithState, prevState)); } catch { /* state is advisory */ }
     }
     return 0;
   }
@@ -710,14 +809,8 @@ async function main(argv) {
     return quiet ? 0 : 1;
   }
 
-  // 记录本次实际写入的清单，供下次识别"用户隐藏"
-  const families = {};
-  for (const f of plan) {
-    if (f.ids === null || f.ids.length === 0) continue;
-    const { effective, hidden, source } = computeEffective(existing, f, prevState);
-    families[f.key] = { sourceIds: source, writtenIds: effective, hiddenIds: hidden };
-  }
-  try { writeState(file, families); } catch { /* state is advisory */ }
+  // 记录本次实际写入的清单（逐 provider），供下次识别"用户隐藏"
+  try { writeState(file, stateFromPlan(planWithState, prevState)); } catch { /* state is advisory */ }
 
   if (!quiet) {
     console.log(`已写入 ${file}`);

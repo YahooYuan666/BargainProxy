@@ -44,6 +44,17 @@ type mockWorkBuddy struct {
 	// {"code":10001,"msg":"今天已签到"}.
 	checkinReply  string
 	checkinStatus int
+
+	// authGate, when set, is the only access token the growth domain accepts:
+	// any other bearer gets a JSON 401 (a server-side revocation). The refresh
+	// endpoint then hands out authGate as the new access token, so a task that
+	// self-heals must show up as one refresh + a successful retry.
+	authGate     string
+	refreshCalls int
+	refreshed    string
+	// refreshDead makes the refresh endpoint answer 401 code 12153 (the
+	// refresh token itself was revoked → only a manual re-login helps).
+	refreshDead bool
 }
 
 func (m *mockWorkBuddy) handler() http.Handler {
@@ -52,6 +63,19 @@ func (m *mockWorkBuddy) handler() http.Handler {
 		defer m.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.URL.Path == "/v2/plugin/auth/token/refresh":
+			m.refreshCalls++
+			m.refreshed = r.Header.Get("X-Refresh-Token")
+			if m.refreshDead {
+				w.WriteHeader(http.StatusUnauthorized)
+				fmt.Fprint(w, `{"code":12153,"msg":"12153:refresh token failed"}`)
+				return
+			}
+			fmt.Fprintf(w, `{"code":0,"data":{"accessToken":%q,"expiresIn":5184000}}`, m.authGate)
+		case m.authGate != "" && r.Header.Get("Authorization") != "Bearer "+m.authGate:
+			// Revoked token: the growth/billing domains reject every call.
+			w.WriteHeader(http.StatusUnauthorized)
+			fmt.Fprint(w, `{"code":12153,"msg":"12153:offline session invalid"}`)
 		case r.URL.Path == "/v2/billing/meter/daily-checkin":
 			m.checkins++
 			if m.checkinReply != "" {
@@ -83,9 +107,14 @@ func (m *mockWorkBuddy) handler() http.Handler {
 			m.draws++
 			fmt.Fprint(w, `{"code":0,"data":{"prize":"5c"}}`)
 		case r.URL.Path == "/v2/activity/growth/tasks" && r.Method == "GET":
+			// Real upstream shape (verified 2026-10-18): progress is an OBJECT
+			// {current,target} and `status` is absent. chat_5 is done+unclaimed,
+			// template_5 is not accepted yet, and a third task is done but
+			// already claimed — it must NOT be claimed again.
 			fmt.Fprint(w, `{"code":0,"data":{"tasks":[
-			  {"task_code":"chat_5","status":"completed","accept_status":"accepted"},
-			  {"task_code":"template_5","status":"in_progress","accept_status":"not_accepted"}
+			  {"task_code":"chat_5","accept_status":"accepted","progress":{"current":5,"target":5}},
+			  {"task_code":"template_5","accept_status":"not_accepted","progress":{"current":1,"target":5}},
+			  {"task_code":"automation_1","accept_status":"claimed","progress":{"current":1,"target":1}}
 			]}}`)
 		case r.URL.Path == "/v2/activity/growth/tasks/accept":
 			var body struct {
@@ -138,7 +167,7 @@ func buildScheduler(t *testing.T) (*tasks.Scheduler, *mockWorkBuddy, *pool.Pool,
 	st := store.NewMemory()
 	p := pool.New(pool.Params{MaxQueueWait: time.Second}, map[string]int{model.ChannelWorkBuddy: 2},
 		func(acc *model.Account) { _ = st.SaveAccount(acc) })
-	creds, _ := json.Marshal(map[string]any{"access_token": testToken("wb"), "uid": "u-task", "realm": "cn", "nickname": "task-acct"})
+	creds, _ := json.Marshal(map[string]any{"access_token": testToken("wb"), "refresh_token": testToken("refresh"), "uid": "u-task", "realm": "cn", "nickname": "task-acct"})
 	p.Upsert(&model.Account{ID: "workbuddy:u-task", Channel: model.ChannelWorkBuddy, CredsJSON: creds, UID: "u-task", Realm: "cn", Nickname: "task-acct"})
 
 	drivers := map[string]driver.Driver{
@@ -245,7 +274,7 @@ func TestGrowthPipelineAcceptsAndClaims(t *testing.T) {
 	if !foundAccept {
 		t.Fatalf("accept pass missing template_5: %v", mock.accepts)
 	}
-	// chat_5 was completed → claim pass must claim it.
+	// chat_5 was done and unclaimed → claim pass must claim it.
 	foundClaim := false
 	for _, code := range mock.claims {
 		if code == "chat_5" {
@@ -254,6 +283,18 @@ func TestGrowthPipelineAcceptsAndClaims(t *testing.T) {
 	}
 	if !foundClaim {
 		t.Fatalf("claim pass missing chat_5: %v", mock.claims)
+	}
+	// A task whose progress is short (template_5) must not be claimed.
+	for _, code := range mock.claims {
+		if code == "template_5" {
+			t.Fatalf("claim pass must skip incomplete template_5: %v", mock.claims)
+		}
+	}
+	// An already-claimed task (automation_1) must not be claimed twice.
+	for _, code := range mock.claims {
+		if code == "automation_1" {
+			t.Fatalf("claim pass must skip already-claimed automation_1: %v", mock.claims)
+		}
 	}
 	if !strings.Contains(detail, "claim_pass") {
 		t.Fatalf("detail missing claim_pass: %q", detail)
@@ -268,5 +309,72 @@ func TestRefreshTokensAndProbe(t *testing.T) {
 	}
 	if _, err := sched.RunTask(ctx, tasks.TaskRefreshTokens, ""); err != nil {
 		t.Fatalf("refresh task: %v", err)
+	}
+}
+
+// A server-side token revocation (401 with a JSON body, not an edge HTML
+// page) must be self-healed: the task wrapper forces one token refresh and
+// retries, so the day's row records success instead of a permanent failure.
+func TestWorkBuddyTaskRecoversFromRevokedToken(t *testing.T) {
+	sched, mock, _, st := buildScheduler(t)
+	mock.mu.Lock()
+	mock.authGate = testToken("rotated")
+	mock.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	detail, err := sched.RunTask(ctx, tasks.TaskActivityWorkBuddy, "")
+	if err != nil {
+		t.Fatalf("activity task should recover after refresh: %v (%s)", err, detail)
+	}
+	mock.mu.Lock()
+	refreshCalls, refreshed := mock.refreshCalls, mock.refreshed
+	mock.mu.Unlock()
+	if refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1", refreshCalls)
+	}
+	if refreshed != testToken("refresh") {
+		t.Fatalf("refresh used token %q, want the stored refresh token", refreshed)
+	}
+	// The rotated token must be persisted, not just held in memory.
+	accs, aerr := st.LoadAccounts()
+	if aerr != nil {
+		t.Fatalf("load accounts: %v", aerr)
+	}
+	if len(accs) != 1 {
+		t.Fatalf("accounts = %d, want 1", len(accs))
+	}
+	creds, err := workbuddy.ParseCreds(accs[0].CredsJSON)
+	if err != nil {
+		t.Fatalf("parse persisted creds: %v", err)
+	}
+	if creds.AccessToken != testToken("rotated") {
+		t.Fatalf("persisted access token = %q, want the rotated one", creds.AccessToken)
+	}
+}
+
+// A dead refresh token (nothing to recover) must surface the original auth
+// failure rather than silently "succeeding".
+func TestWorkBuddyTaskReportsAuthFailureWhenRefreshDead(t *testing.T) {
+	sched, mock, _, _ := buildScheduler(t)
+	mock.mu.Lock()
+	mock.authGate = testToken("unreachable")
+	mock.refreshDead = true
+	mock.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := sched.RunTask(ctx, tasks.TaskActivityWorkBuddy, "")
+	if err == nil {
+		t.Fatal("expected an auth error when the refresh cannot help")
+	}
+	mock.mu.Lock()
+	calls := mock.refreshCalls
+	mock.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("refresh calls = %d, want exactly 1 (one attempt, then give up)", calls)
+	}
+	if !strings.Contains(err.Error(), "12153") && !strings.Contains(strings.ToLower(err.Error()), "auth") {
+		t.Fatalf("error = %v, want an auth failure", err)
 	}
 }

@@ -49,6 +49,7 @@ type Error struct {
 	Message  string
 	ResetAt  time.Time // precise upstream reset when known
 	Model    string    // set when the error is scoped to a single model
+	Channel  string    // binding that produced the failure (final one for pool errors)
 	Sentinel string    // matched sentinel text for ClassSentinel
 	// Code is the upstream business code when the body carried one (e.g.
 	// workbuddy "6004"); the panel shows it as the rate-limit label (BP-49).

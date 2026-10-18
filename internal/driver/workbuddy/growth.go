@@ -61,8 +61,46 @@ func (d *Driver) webBase() string {
 // --- generic transport ---
 
 // growthCall posts/gets a growth-domain JSON call (chatBase + Billing-style
-// headers + {code,data} envelope unwrap).
+// headers + {code,data} envelope unwrap). Edge-level 401s are retried once —
+// see edgeJitter401.
 func (d *Driver) growthCall(ctx context.Context, creds *Creds, method, path string, body any, extraHeaders map[string]string) (json.RawMessage, error) {
+	data, err := d.growthCallOnce(ctx, creds, method, path, body, extraHeaders)
+	if err == nil || !edgeJitter401(err) {
+		return data, err
+	}
+	select {
+	case <-ctx.Done():
+		return nil, err
+	case <-time.After(300 * time.Millisecond):
+	}
+	return d.growthCallOnce(ctx, creds, method, path, body, extraHeaders)
+}
+
+// edgeJitter401 reports whether err is the CDN/edge HTML 401 (APISIX
+// "<title>401 Authorization Required</title>") that occasionally replaces a
+// normal response. It is a transient gateway fault, not a dead credential:
+// the same request usually succeeds on an immediate retry.
+func edgeJitter401(err error) bool {
+	ue, ok := uperr.As(err)
+	if !ok || ue.Status != 401 {
+		return false
+	}
+	msg := strings.ToLower(ue.Message)
+	return strings.Contains(msg, "<html") || strings.Contains(msg, "authorization required")
+}
+
+// IsAuthDead reports whether err means the credential itself is unusable
+// (as opposed to an edge/CDN hiccup that merely looks like a 401).
+func IsAuthDead(err error) bool {
+	ue, ok := uperr.As(err)
+	if !ok || ue.Class != uperr.ClassAuth {
+		return false
+	}
+	return !edgeJitter401(err)
+}
+
+// growthCallOnce performs a single growth-domain attempt.
+func (d *Driver) growthCallOnce(ctx context.Context, creds *Creds, method, path string, body any, extraHeaders map[string]string) (json.RawMessage, error) {
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -171,6 +209,39 @@ func desktopFingerprint(creds *Creds) map[string]any {
 	}
 }
 
+// sendReport executes a report-style POST and classifies the response with the
+// shared taxonomy (so a 401 arrives as ClassAuth and can be self-healed) and
+// retries once on an edge-level HTML 401. The request is rebuilt per attempt
+// because the body reader is consumed.
+func (d *Driver) sendReport(ctx context.Context, label string, build func() (*http.Request, error)) error {
+	attempt := func() error {
+		req, err := build()
+		if err != nil {
+			return err
+		}
+		resp, err := d.rpc.Do(req)
+		if err != nil {
+			return uperr.New(uperr.ClassTransport, 0, "workbuddy %s: %v", label, err)
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if resp.StatusCode != http.StatusOK {
+			return classifyHTTP(resp.StatusCode, data, "")
+		}
+		return nil
+	}
+	err := attempt()
+	if err == nil || !edgeJitter401(err) {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return err
+	case <-time.After(300 * time.Millisecond):
+	}
+	return attempt()
+}
+
 // reportDesktopEvents posts a batch of desktop-fingerprint events.
 func (d *Driver) reportDesktopEvents(ctx context.Context, creds *Creds, events []desktopEvent) error {
 	if len(events) == 0 {
@@ -193,30 +264,23 @@ func (d *Driver) reportDesktopEvents(ctx context.Context, creds *Creds, events [
 		return err
 	}
 	base := d.chatBase(creds)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+reportPath, bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", base)
-	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(creds.UID, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
-	if creds.UID != "" {
-		req.Header.Set("X-User-Id", creds.UID)
-	}
-	resp, err := d.rpc.Do(req)
-	if err != nil {
-		return uperr.New(uperr.ClassTransport, 0, "workbuddy report: %v", err)
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return uperr.New(uperr.ClassInternal, resp.StatusCode, "workbuddy report: %s", truncate(data, 200))
-	}
-	return nil
+	return d.sendReport(ctx, "report", func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+reportPath, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Content-Type", "application/json;charset=UTF-8")
+		req.Header.Set("User-Agent", desktopUA)
+		req.Header.Set("X-Domain", base)
+		req.Header.Set("X-Product", "SaaS")
+		req.Header.Set("X-Request-ID", deriveID(creds.UID, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
+		if creds.UID != "" {
+			req.Header.Set("X-User-Id", creds.UID)
+		}
+		return req, nil
+	})
 }
 
 // reportWebEvent posts a single browser-fingerprint event (Library_read etc).
@@ -230,29 +294,22 @@ func (d *Driver) reportWebEvent(ctx context.Context, creds *Creds, eventCode, pa
 		"userNickname": creds.Nickname, "enterpriseId": creds.EnterpriseID,
 	}
 	raw, _ := json.Marshal([]map[string]any{ev})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.webBase()+"/v2/report", bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-client-platform", "web")
-	req.Header.Set("Origin", d.webBase())
-	req.Header.Set("Referer", pageURL)
-	req.Header.Set("User-Agent", ua)
-	if creds.UID != "" {
-		req.Header.Set("X-User-Id", creds.UID)
-	}
-	resp, err := d.rpc.Do(req)
-	if err != nil {
-		return uperr.New(uperr.ClassTransport, 0, "workbuddy web report: %v", err)
-	}
-	defer resp.Body.Close()
-	_, _ = io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return uperr.New(uperr.ClassInternal, resp.StatusCode, "workbuddy web report status %d", resp.StatusCode)
-	}
-	return nil
+	return d.sendReport(ctx, "web report", func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.webBase()+"/v2/report", bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("x-client-platform", "web")
+		req.Header.Set("Origin", d.webBase())
+		req.Header.Set("Referer", pageURL)
+		req.Header.Set("User-Agent", ua)
+		if creds.UID != "" {
+			req.Header.Set("X-User-Id", creds.UID)
+		}
+		return req, nil
+	})
 }
 
 // DesktopChatSequence builds the six-event "successful desktop chat" chain
@@ -603,13 +660,61 @@ func expertActualUseEvent(e MarketExpert, conversationID, requestID string, loca
 // --- growth API surface ---
 
 // GrowthTask is one growth-center task row.
+//
+// Field shapes drift upstream (verified 2026-10-18): `progress` is an OBJECT
+// {"current":N,"target":M} on the CN growth center, not a bare int — a plain
+// int field failed the whole list with "cannot unmarshal object into Go
+// struct field .tasks.progress of type int", so the night-owl task could never
+// read its own progress. `status` is also gone from the payload, which is why
+// completion is now derived from progress/accept_status (see GrowthTask.Done).
 type GrowthTask struct {
 	TaskCode     string `json:"task_code"`
 	TaskName     string `json:"task_name"`
-	Status       string `json:"status"`        // e.g. not_started / in_progress / completed
-	AcceptStatus string `json:"accept_status"` // not_accepted / accepted
-	Progress     int    `json:"progress"`
-	Target       int    `json:"target"`
+	Status       string `json:"status"`        // legacy; absent upstream since 2026-10
+	AcceptStatus string `json:"accept_status"` // not_accepted / accepted / claimed
+	Progress     int    `json:"-"`             // current progress, flattened from progress/target
+	Target       int    `json:"-"`             // target progress, flattened from progress/target
+}
+
+// Done reports whether the task's progress target has been reached. Upstream
+// dropped the `status` field, so "completed" must come from the numbers.
+func (t GrowthTask) Done() bool {
+	return t.Target > 0 && t.Progress >= t.Target
+}
+
+// Claimed reports whether the reward was already collected.
+func (t GrowthTask) Claimed() bool {
+	return strings.EqualFold(t.AcceptStatus, "claimed")
+}
+
+// parseGrowthTaskProgress flattens the two shapes upstream has used for a
+// task's progress: the nested object {"current":N,"target":M} and the older
+// flat current/target/progress numbers. Returns zeroes when neither is usable.
+func parseGrowthTaskProgress(raw json.RawMessage, flatCurrent, flatTarget int) (progress, target int) {
+	progress, target = flatCurrent, flatTarget
+	if len(raw) == 0 || string(raw) == "null" {
+		return progress, target
+	}
+	// Shape A: {"current":N,"target":M}
+	var obj struct {
+		Current *int `json:"current"`
+		Target  *int `json:"target"`
+	}
+	if err := json.Unmarshal(raw, &obj); err == nil && (obj.Current != nil || obj.Target != nil) {
+		if obj.Current != nil {
+			progress = *obj.Current
+		}
+		if obj.Target != nil {
+			target = *obj.Target
+		}
+		return progress, target
+	}
+	// Shape B: a bare number.
+	var n int
+	if err := json.Unmarshal(raw, &n); err == nil {
+		progress = n
+	}
+	return progress, target
 }
 
 // GrowthTasks lists growth tasks (parsed leniently across field variants).
@@ -624,14 +729,16 @@ func (d *Driver) GrowthTasks(ctx context.Context, acc *model.Account) ([]GrowthT
 	}
 	var resp struct {
 		Tasks []struct {
-			TaskCode     string `json:"task_code"`
-			Code         string `json:"code"`
-			TaskName     string `json:"task_name"`
-			Name         string `json:"name"`
-			Status       string `json:"status"`
-			AcceptStatus string `json:"accept_status"`
-			Progress     int    `json:"progress"`
-			Target       int    `json:"target"`
+			TaskCode     string          `json:"task_code"`
+			Code         string          `json:"code"`
+			TaskName     string          `json:"task_name"`
+			Title        string          `json:"title"`
+			Name         string          `json:"name"`
+			Status       string          `json:"status"`
+			AcceptStatus string          `json:"accept_status"`
+			Progress     json.RawMessage `json:"progress"`
+			Current      int             `json:"current"`
+			Target       int             `json:"target"`
 		} `json:"tasks"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
@@ -645,11 +752,15 @@ func (d *Driver) GrowthTasks(ctx context.Context, acc *model.Account) ([]GrowthT
 		}
 		name := t.TaskName
 		if name == "" {
+			name = t.Title
+		}
+		if name == "" {
 			name = t.Name
 		}
+		progress, target := parseGrowthTaskProgress(t.Progress, t.Current, t.Target)
 		out = append(out, GrowthTask{
 			TaskCode: code, TaskName: name, Status: t.Status,
-			AcceptStatus: t.AcceptStatus, Progress: t.Progress, Target: t.Target,
+			AcceptStatus: t.AcceptStatus, Progress: progress, Target: target,
 		})
 	}
 	return out, nil
@@ -889,28 +1000,21 @@ func (d *Driver) ReportChatActivity(ctx context.Context, acc *model.Account, con
 	}
 	raw, _ := json.Marshal([]map[string]any{ev})
 	base := d.chatBase(creds)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+reportPath, bytes.NewReader(raw))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", base)
-	req.Header.Set("X-Product", "SaaS")
-	if creds.UID != "" {
-		req.Header.Set("X-User-Id", creds.UID)
-	}
-	resp, err := d.rpc.Do(req)
-	if err != nil {
-		return uperr.New(uperr.ClassTransport, 0, "workbuddy activity report: %v", err)
-	}
-	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return uperr.New(uperr.ClassInternal, resp.StatusCode, "workbuddy activity report: %s", truncate(data, 200))
-	}
-	return nil
+	return d.sendReport(ctx, "activity report", func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+reportPath, bytes.NewReader(raw))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", desktopUA)
+		req.Header.Set("X-Domain", base)
+		req.Header.Set("X-Product", "SaaS")
+		if creds.UID != "" {
+			req.Header.Set("X-User-Id", creds.UID)
+		}
+		return req, nil
+	})
 }
 
 // SetAppearanceTheme applies an appearance theme (light/dark/theme-tkmwj).
@@ -1106,7 +1210,9 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	claimed := 0
 	claimNote := ""
 	for _, t := range tasks {
-		if !strings.EqualFold(t.Status, "completed") {
+		// Upstream no longer sends `status`; "completed" now comes from the
+		// progress numbers and "already collected" from accept_status=claimed.
+		if !t.Done() || t.Claimed() {
 			continue
 		}
 		if err := d.GrowthClaim(ctx, acc, t.TaskCode); err == nil {
@@ -1115,7 +1221,7 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 			claimNote = err.Error()
 		}
 	}
-	note := fmt.Sprintf("claimed %d completed tasks", claimed)
+	note := fmt.Sprintf("claimed %d reward(s)", claimed)
 	if claimNote != "" {
 		note += "; first claim error: " + claimNote
 	}

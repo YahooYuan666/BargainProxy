@@ -72,7 +72,7 @@ type ModelEntry struct {
 	InputImage    bool     `json:"input_image,omitempty"`
 	ReasoningVals []string `json:"reasoning_vals,omitempty"`
 	// Probe state (filled by the probe task; empty = never probed).
-	ProbeStatus string    `json:"probe_status,omitempty"` // ok | fail
+	ProbeStatus string    `json:"probe_status,omitempty"` // ok | limited | fail
 	ProbeError  string    `json:"probe_error,omitempty"`
 	ProbeMs     int64     `json:"probe_ms,omitempty"`
 	ProbedAt    time.Time `json:"probed_at,omitempty"`
@@ -582,6 +582,24 @@ func (c *Catalog) Candidates() []string {
 	return out
 }
 
+// Probe verdicts. "limited" exists because a probe failure often says nothing
+// about the model: the anonymous free lane answers 429 FreeUsageLimitError
+// whenever its shared quota is spent, and timeouts/cancellations are equally
+// untranslatable. Recording those as "fail" used to delete a working model
+// from the gateway routes and the ZCode picker until the next probe.
+const (
+	ProbeOK      = "ok"
+	ProbeLimited = "limited" // transient upstream condition; last verdict kept
+	ProbeFail    = "fail"    // definitive: this model cannot serve requests
+)
+
+// SeedForTest installs a snapshot without going through Sync. Test-only.
+func (c *Catalog) SeedForTest(models []ModelEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.snap = Snapshot{UpdatedAt: time.Now(), Models: models}
+}
+
 // RecordProbe folds one probe outcome back into the snapshot and persists.
 func (c *Catalog) RecordProbe(id string, ok bool, ms int64, errMsg string) {
 	c.mu.Lock()
@@ -591,12 +609,47 @@ func (c *Catalog) RecordProbe(id string, ok bool, ms int64, errMsg string) {
 			continue
 		}
 		if ok {
-			c.snap.Models[i].ProbeStatus = "ok"
+			c.snap.Models[i].ProbeStatus = ProbeOK
 			c.snap.Models[i].ProbeError = ""
 		} else {
-			c.snap.Models[i].ProbeStatus = "fail"
+			c.snap.Models[i].ProbeStatus = ProbeFail
 			c.snap.Models[i].ProbeError = errMsg
 		}
+		c.snap.Models[i].ProbeMs = ms
+		c.snap.Models[i].ProbedAt = time.Now()
+		break
+	}
+	c.persist()
+}
+
+// RecordProbeTransient records a probe that failed for a reason outside the
+// model: free-lane quota (429), timeout, cancellation, transport blip, or the
+// network-dependent free-tier gate (403). Only the diagnostic is refreshed —
+// the verdict stays usable, so a temporary upstream condition cannot pull the
+// route.
+//
+// A model whose last probe failed definitively (404 delisted, protocol
+// unsupported) stays failed. The one exception is a stored gate-403 failure:
+// that verdict was itself a transient condition misclassified before this
+// split existed, so a later transient probe clears it instead of leaving nine
+// healthy models reading "failed" forever.
+func (c *Catalog) RecordProbeTransient(id string, ms int64, errMsg string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.snap.Models {
+		if c.snap.Models[i].ID != id {
+			continue
+		}
+		if c.snap.Models[i].ProbeStatus == ProbeFail &&
+			!strings.Contains(c.snap.Models[i].ProbeError, "free-tier gate") {
+			// Keep the definitive reason on screen; only record that we tried
+			// again. A 429 must not overwrite "404 model endpoint gone".
+			c.snap.Models[i].ProbeMs = ms
+			c.snap.Models[i].ProbedAt = time.Now()
+			break
+		}
+		c.snap.Models[i].ProbeStatus = ProbeLimited
+		c.snap.Models[i].ProbeError = errMsg
 		c.snap.Models[i].ProbeMs = ms
 		c.snap.Models[i].ProbedAt = time.Now()
 		break

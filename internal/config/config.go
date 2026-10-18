@@ -48,6 +48,21 @@ type Config struct {
 	CostTTL      Duration `json:"cost_ttl"`       // cost observation TTL, default 6h
 	LogRetention Duration `json:"log_retention"`  // default 336h (14d)
 
+	// FirstByteWindow is the ceiling for the per-binding first-byte wait,
+	// applied to EVERY channel (BP-72). The wait is fallback_wait + 1s per
+	// 2k estimated prompt tokens, capped here. Before BP-72 the cap was a
+	// hard 30s for every channel except AutoClaw, so a WorkBuddy binding
+	// prefilling a 300k-token ZCode session died at 30s while the upstream
+	// was healthy and the request cascaded down the whole chain. 0 = the
+	// built-in 90s default. Requests that answer quickly are unaffected:
+	// the timer is cancelled by the first stream event.
+	FirstByteWindow Duration `json:"first_byte_window"`
+
+	// ChannelFirstByteWindows overrides FirstByteWindow per channel, e.g.
+	// {"workbuddy": "120s", "trae": "45s"}. Unknown channel names are
+	// ignored (they can never be a binding).
+	ChannelFirstByteWindows map[string]Duration `json:"channel_first_byte_windows"`
+
 	// Upstream watchdogs (ticket 27; applied at startup — restart to change):
 	//   RPCTimeout    total timeout for short billing/refresh/probe calls (default 120s);
 	//   HeaderTimeout time to first byte on chat streams (default 300s);
@@ -117,13 +132,10 @@ type AutoClawSettings struct {
 	UserAPIBase string `json:"userapi_base"` // default https://autoglm-acceleration-api.zhipuai.cn
 	MaxInFlight int    `json:"max_in_flight"`
 
-	// FirstByteWindow raises the first-byte wait ceiling for THIS channel
-	// only (BP-71). The global window is 8s + 1s per 8k prompt tokens capped
-	// at 30s; the sandbox relay routinely needs more prefill time on long
-	// ZCode conversations, so those requests were cascading to the next
-	// binding before AutoClaw produced its first byte. 0 = follow the global
-	// formula. Requests that answer quickly are unaffected — the timer is
-	// cancelled by the first event either way.
+	// FirstByteWindow is the legacy per-channel override (BP-71). It is
+	// honoured only when channel_first_byte_windows has no entry for
+	// AutoClaw; new configurations should use the generic global setting
+	// plus channel overrides (BP-72).
 	FirstByteWindow Duration `json:"first_byte_window"`
 
 	// AppSecret signs the userapi requests (X-Auth-Sign). It is a constant
@@ -246,15 +258,16 @@ func Default() *Config {
 				BaseURL: "https://opencode.ai/zen",
 			},
 		},
-		MaxQueueWait:  Duration(120 * time.Second),
-		FallbackWait:  Duration(8 * time.Second),
-		RPCTimeout:    Duration(120 * time.Second),
-		HeaderTimeout: Duration(300 * time.Second),
-		IdleTimeout:   Duration(300 * time.Second),
-		SessionTTL:    Duration(30 * time.Minute),
-		CostTTL:       Duration(6 * time.Hour),
-		LogRetention:  Duration(336 * time.Hour),
-		Sentinels:     []string{"DANGEROUS_ACTIVITY_BLOCKED"},
+		MaxQueueWait:    Duration(120 * time.Second),
+		FallbackWait:    Duration(8 * time.Second),
+		FirstByteWindow: Duration(90 * time.Second),
+		RPCTimeout:      Duration(120 * time.Second),
+		HeaderTimeout:   Duration(300 * time.Second),
+		IdleTimeout:     Duration(300 * time.Second),
+		SessionTTL:      Duration(30 * time.Minute),
+		CostTTL:         Duration(6 * time.Hour),
+		LogRetention:    Duration(336 * time.Hour),
+		Sentinels:       []string{"DANGEROUS_ACTIVITY_BLOCKED"},
 	}
 }
 

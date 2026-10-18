@@ -230,13 +230,13 @@ tr:last-child td{border-bottom:none}
           <button class="xs" onclick="zenProbe()">探测可用性</button></header>
         <div style="padding:14px 16px;display:grid;gap:12px">
           <div class="row">
-            <label class="chk">自动同步 <input id="zenAuto" type="checkbox" onchange="zenSaveSettings()"></label>
-            <label class="chk">间隔（分钟）<input id="zenMinutes" type="number" min="5" max="1440" style="max-width:90px" onchange="zenSaveSettings()"></label>
+            <label class="chk">自动同步目录 <input id="zenAuto" type="checkbox" onchange="zenSaveSettings()"></label>
+            <label class="chk">目录同步间隔（分钟）<input id="zenMinutes" type="number" min="5" max="1440" style="max-width:90px" onchange="zenSaveSettings()"></label>
           </div>
           <div class="row">
-            <label class="chk">加入网关路由 <input id="zenGateway" type="checkbox" onchange="zenSaveSettings()" title="勾选后这些模型出现在 /v1/models，任何客户端可用；下架/探测失败自动停用"></label>
+            <label class="chk">加入网关路由 <input id="zenGateway" type="checkbox" onchange="zenSaveSettings()" title="勾选后这些模型出现在 /v1/models，任何客户端可用；下架/确定性失败自动停用"></label>
           </div>
-          <div class="hint">免费通道是匿名直连 opencode.ai/zen：须流式 + 携带 bash/read 门禁工具 + CLI 伪装头（网关自动处理）。探测=真实发起一次最小对话；探测失败（403 门禁变化 / 429 端点忙）的模型不会加入网关路由，恢复后自动回来。</div>
+          <div class="hint">免费通道是匿名直连 opencode.ai/zen：须流式 + 携带 bash/read 门禁工具 + CLI 伪装头（网关自动处理）。探测=真实发起一次最小对话，只在<b>启动时自动跑一次</b>，之后靠上面的「探测可用性」手动触发（每次都会消耗免费额度）。限流（429/超时）不算失败，模型留在路由里；只有确定性失败（403 门禁变化、400 协议不支持、404 下架）才停用。</div>
         </div>
         <div class="tbl-wrap">
           <table id="zenModels"><thead><tr>
@@ -434,7 +434,7 @@ tr:last-child td{border-bottom:none}
           </label>
           <label class="chk"><input type="checkbox" id="tiersHideRetired" checked onchange="saveTiersFilter()"> 隐藏淘汰模型</label>
           <span class="note" id="tiersHiddenNote"></span>
-          <span class="note">扣分口径：WorkBuddy 按 token 倍率、上游回传实扣；Qoder 按量 credits；AutoClaw 按次点数（账号页「积分详情」逐笔可查）；Trae/ZCode 为套餐额度，无按次回传</span></header>
+          <span class="note">扣分口径：WorkBuddy 按 token 倍率（分）、Qoder 按量 credits、Trae 按积分倍率、AutoClaw 按次点数、ZCode 套餐额度。倍率只在同一渠道内可比——三个渠道的 1 分 / 1 credits / 1 积分购买力不同。错峰折扣：Qoder 22:00-08:00（Qwen3.8-Max 0.5→0.2、Qwen3.7-Plus 0.1→0.04）；Trae 空闲 22:00-08:00（DeepSeek 系 5 折，付费会员 DeepSeek-V4.1-Flash 全时段 5 折）</span></header>
         <div class="tbl-wrap">
           <table id="tiersDomestic"><thead><tr>
             <th>账号源</th><th>模型 ID</th><th>计费口径（上游倍率）</th><th>近 7 天实扣</th><th>上下文</th><th>最大输出</th><th>输入模态</th><th>推理档位</th><th>工具调用</th><th>结构化输出</th>
@@ -559,6 +559,10 @@ tr:last-child td{border-bottom:none}
           <div class="row">
             <label class="chk">软冷却基数（秒）<input id="setCooldownBase" type="number" min="1" style="max-width:100px"></label>
             <span class="hint">上游返回"请求太频繁"（429）时的起步冷却时长，连续撞限会翻倍、最长 1 小时。默认 600。</span>
+          </div>
+          <div class="row">
+            <label class="chk">首字窗口上限（秒）<input id="setFirstByteWindow" type="number" min="1" max="3600" style="max-width:100px"></label>
+            <span class="hint">所有号池通用：等待上游吐出第一个字的最长时间，超时才降级到下一渠道。实际等待 = 8 秒 + 每 2k 估算 token 加 1 秒，封顶这个值。默认 90。大上下文或上行带宽紧张时调大，可避免健康渠道被提前放弃。</span>
           </div>
           <div class="row">
             <label class="chk">每渠道单号并发 <input id="setMaxInflight" type="text" style="max-width:260px" placeholder='{"workbuddy":3,"zcode":2}'></label>
@@ -874,6 +878,7 @@ async function refresh(){
     const hs = st.settings || {};
     if (hs.greedy_floor_seconds) document.getElementById('setGreedyFloor').value = hs.greedy_floor_seconds;
     if (hs.cooldown_soft_base_seconds) document.getElementById('setCooldownBase').value = hs.cooldown_soft_base_seconds;
+    if (hs.first_byte_window_seconds) document.getElementById('setFirstByteWindow').value = hs.first_byte_window_seconds;
     if (hs.max_in_flight) document.getElementById('setMaxInflight').value = JSON.stringify(hs.max_in_flight);
     document.getElementById('setPromptReplace').checked = hs.prompt_replace_enabled !== false;
     document.getElementById('setIncludeDisabled').checked = hs.include_disabled_in_tasks === true;
@@ -920,8 +925,10 @@ async function loadZen(){
     const cands = all.filter(m => m.candidate);
     const hidden = all.length - cands.length;
     const okN = zenData.probe_ok || 0;
+    const limitedN = zenData.probe_limited || 0;
     document.getElementById('zenStatus').textContent =
-      '清单 ' + (snap.live_count || 0) + ' · 候选 ' + cands.length + ' · 探测可用 ' + okN +
+      '清单 ' + (snap.live_count || 0) + ' · 候选 ' + cands.length + ' · 可用 ' + okN +
+      (limitedN ? ' · 限流 ' + limitedN : '') +
       (hidden ? ' · 已隐藏 ' + hidden + ' 个非候选' : '') +
       (snap.updated_at ? ' · 目录 ' + fmtTime(snap.updated_at) : ' · 未同步') +
       (snap.metadata_error ? ' · ⚠ 元数据异常：' + snap.metadata_error : '');
@@ -934,10 +941,12 @@ async function loadZen(){
       const tr = document.createElement('tr');
       let dot, dotTxt;
       if (m.probe_status === 'ok') { dot = 'ok'; dotTxt = '可用'; }
+      else if (m.probe_status === 'limited') { dot = 'warn'; dotTxt = '限流中'; }
       else if (m.probe_status === 'fail') { dot = 'bad'; dotTxt = '失败'; }
       else { dot = 'muted'; dotTxt = '未探测'; }
       const verdict = m.probe_status === 'fail' ? zenFailReason(m.probe_error)
-        : (m.probe_status === 'ok' ? '免费候选' : '免费候选（未探测）');
+        : (m.probe_status === 'limited' ? '临时限流（路由保留）'
+        : (m.probe_status === 'ok' ? '免费候选' : '免费候选（未探测）'));
       const probeTitle = esc(m.probe_error || (m.probe_ms ? m.probe_ms + 'ms' : ''));
       /* 从未探测过的行 probed_at 是零值时间（0001-01-01），不能当成真实时间渲染 */
       const probedAt = (m.probed_at && !String(m.probed_at).startsWith('0001-')) ? fmtTime(m.probed_at) : '';
@@ -2131,8 +2140,10 @@ async function saveSettings(){
   const body = {};
   const gf = document.getElementById('setGreedyFloor').value;
   const cb = document.getElementById('setCooldownBase').value;
+  const fb = document.getElementById('setFirstByteWindow').value;
   if (gf) body.greedy_floor_seconds = parseInt(gf, 10);
   if (cb) body.cooldown_soft_base_seconds = parseInt(cb, 10);
+  if (fb) body.first_byte_window_seconds = parseInt(fb, 10);
   const mi = document.getElementById('setMaxInflight').value.trim();
   if (mi) { try { body.max_in_flight = JSON.parse(mi); } catch(e){ return toast('并发上限不是合法 JSON', true); } }
   body.prompt_replace_enabled = document.getElementById('setPromptReplace').checked;

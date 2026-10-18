@@ -189,6 +189,17 @@ func (p *Panel) hotSettingsView() map[string]any {
 			out["max_in_flight"] = m
 		}
 	}
+	// Global first-byte ceiling: show the persisted panel value, else the
+	// effective config default so the input is never blank (BP-72).
+	if v, ok, _ := p.store.GetSetting(KeyFirstByteWindowSecs); ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			out["first_byte_window_seconds"] = n
+		}
+	} else if p.cfg != nil {
+		if d := p.cfg.FirstByteWindow.D(); d > 0 {
+			out["first_byte_window_seconds"] = int(d.Seconds())
+		}
+	}
 	if v, ok, _ := p.store.GetSetting(KeyPromptReplace); ok {
 		out["prompt_replace_enabled"] = v != "false"
 	}
@@ -605,11 +616,14 @@ func (p *Panel) handleLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 type settingsRequest struct {
-	WorkBuddyGlobal         *bool          `json:"workbuddy_global,omitempty"`
-	GreedyFloorSeconds      *int           `json:"greedy_floor_seconds,omitempty"`
-	CooldownSoftBaseSeconds *int           `json:"cooldown_soft_base_seconds,omitempty"`
-	MaxInFlight             map[string]int `json:"max_in_flight,omitempty"`
-	PromptReplaceEnabled    *bool          `json:"prompt_replace_enabled,omitempty"`
+	WorkBuddyGlobal         *bool `json:"workbuddy_global,omitempty"`
+	GreedyFloorSeconds      *int  `json:"greedy_floor_seconds,omitempty"`
+	CooldownSoftBaseSeconds *int  `json:"cooldown_soft_base_seconds,omitempty"`
+	// FirstByteWindowSeconds: global first-byte ceiling for every channel
+	// (BP-72). 0 or absent = leave unchanged.
+	FirstByteWindowSeconds *int           `json:"first_byte_window_seconds,omitempty"`
+	MaxInFlight            map[string]int `json:"max_in_flight,omitempty"`
+	PromptReplaceEnabled   *bool          `json:"prompt_replace_enabled,omitempty"`
 	// IncludeDisabledInTasks: keep-alive tasks also run for disabled
 	// accounts (ticket 32; key matches tasks.KeyIncludeDisabledInTasks).
 	IncludeDisabledInTasks *bool `json:"include_disabled_in_tasks,omitempty"`
@@ -636,6 +650,10 @@ func (p *Panel) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CooldownSoftBaseSeconds != nil && *req.CooldownSoftBaseSeconds <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "cooldown_soft_base_seconds must be > 0"})
+		return
+	}
+	if req.FirstByteWindowSeconds != nil && (*req.FirstByteWindowSeconds <= 0 || *req.FirstByteWindowSeconds > 3600) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "first_byte_window_seconds must be between 1 and 3600"})
 		return
 	}
 	for ch, n := range req.MaxInFlight {
@@ -673,6 +691,13 @@ func (p *Panel) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.gw.SetSoftCooldownBase(time.Duration(*req.CooldownSoftBaseSeconds) * time.Second)
+	}
+	if req.FirstByteWindowSeconds != nil {
+		if err := p.store.SetSetting(KeyFirstByteWindowSecs, strconv.Itoa(*req.FirstByteWindowSeconds)); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+			return
+		}
+		p.gw.SetFirstByteWindow(time.Duration(*req.FirstByteWindowSeconds) * time.Second)
 	}
 	if req.MaxInFlight != nil {
 		b, _ := json.Marshal(req.MaxInFlight)
@@ -737,6 +762,12 @@ func RestoreHotSettings(gw *gateway.Gateway, st store.Store) []string {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			gw.SetSoftCooldownBase(time.Duration(n) * time.Second)
 			applied = append(applied, fmt.Sprintf("cooldown_soft_base=%ds", n))
+		}
+	}
+	if v, ok, _ := st.GetSetting(KeyFirstByteWindowSecs); ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			gw.SetFirstByteWindow(time.Duration(n) * time.Second)
+			applied = append(applied, fmt.Sprintf("first_byte_window=%ds", n))
 		}
 	}
 	if v, ok, _ := st.GetSetting(KeyMaxInFlight); ok {

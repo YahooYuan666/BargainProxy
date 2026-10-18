@@ -883,6 +883,8 @@ func TestSettingsHotUpdateValidationAndRestore(t *testing.T) {
 	for _, bad := range []string{
 		`{"greedy_floor_seconds":0}`,
 		`{"cooldown_soft_base_seconds":-5}`,
+		`{"first_byte_window_seconds":0}`,
+		`{"first_byte_window_seconds":4000}`,
 		`{"max_in_flight":{"bogus":2}}`,
 		`{"max_in_flight":{"workbuddy":0}}`,
 	} {
@@ -892,14 +894,14 @@ func TestSettingsHotUpdateValidationAndRestore(t *testing.T) {
 			t.Fatalf("invalid settings %s = %d, want 400", bad, resp.StatusCode)
 		}
 	}
-	for _, key := range []string{panel.KeyGreedyFloorSecs, panel.KeyCooldownBaseSecs, panel.KeyMaxInFlight} {
+	for _, key := range []string{panel.KeyGreedyFloorSecs, panel.KeyCooldownBaseSecs, panel.KeyFirstByteWindowSecs, panel.KeyMaxInFlight} {
 		if _, ok, _ := st.GetSetting(key); ok {
 			t.Fatalf("rejected settings must not persist %q", key)
 		}
 	}
 
 	// Valid values persist and are visible in the state view.
-	resp := post(`{"greedy_floor_seconds":30,"cooldown_soft_base_seconds":90,"max_in_flight":{"workbuddy":3},"prompt_replace_enabled":false}`)
+	resp := post(`{"greedy_floor_seconds":30,"cooldown_soft_base_seconds":90,"first_byte_window_seconds":120,"max_in_flight":{"workbuddy":3},"prompt_replace_enabled":false}`)
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("valid settings = %d", resp.StatusCode)
@@ -917,13 +919,14 @@ func TestSettingsHotUpdateValidationAndRestore(t *testing.T) {
 	_ = json.NewDecoder(stResp.Body).Decode(&state)
 	stResp.Body.Close()
 	if state.Settings["greedy_floor_seconds"].(float64) != 30 ||
+		state.Settings["first_byte_window_seconds"].(float64) != 120 ||
 		state.Settings["prompt_replace_enabled"] != false {
 		t.Fatalf("state settings = %+v", state.Settings)
 	}
 
 	// Restart recovery: the persisted values are re-applied to the gateway.
 	applied := strings.Join(panel.RestoreHotSettings(gw, st), ",")
-	for _, want := range []string{"greedy_floor=30s", "cooldown_soft_base=90s", "max_in_flight", "prompt_replace=false"} {
+	for _, want := range []string{"greedy_floor=30s", "cooldown_soft_base=90s", "first_byte_window=120s", "max_in_flight", "prompt_replace=false"} {
 		if !strings.Contains(applied, want) {
 			t.Fatalf("restore applied = %q, missing %q", applied, want)
 		}

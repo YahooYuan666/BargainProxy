@@ -41,8 +41,12 @@ const (
 	// Hot-schedulable settings (persisted; restored at startup).
 	KeyGreedyFloorSecs  = "greedy_floor_seconds"
 	KeyCooldownBaseSecs = "cooldown_soft_base_seconds"
-	KeyMaxInFlight      = "max_in_flight"          // JSON map: channel -> limit
-	KeyPromptReplace    = "prompt_replace_enabled" // "true" | "false"
+	// KeyFirstByteWindowSecs: global first-byte ceiling for every channel
+	// (BP-72). One number replaces the old AutoClaw-only knob; per-channel
+	// config overrides still win.
+	KeyFirstByteWindowSecs = "first_byte_window_seconds"
+	KeyMaxInFlight         = "max_in_flight"          // JSON map: channel -> limit
+	KeyPromptReplace       = "prompt_replace_enabled" // "true" | "false"
 	// KeyThoughtSigReplay: experimental real Gemini thought_signature capture
 	// + replay on the antigravity driver (BP-44). "true" | "false"; default off.
 	KeyThoughtSigReplay = "thought_signature_replay"

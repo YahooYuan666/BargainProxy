@@ -257,6 +257,17 @@ func main() {
 		}
 	}()
 
+	// OpenCode Zen: one availability pass per boot (BP-73). Probing costs a real
+	// chat call per model on the anonymous free lane, so it is not scheduled;
+	// the panel's "立即探测" covers everything after boot.
+	if zenCatalog != nil {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+			defer cancel()
+			pn.ZenBootProbe(ctx)
+		}()
+	}
+
 	// Graceful shutdown.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

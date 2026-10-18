@@ -948,24 +948,55 @@ func (d *Driver) billingCall(ctx context.Context, creds *Creds, path string, bod
 	return nil, lastErr
 }
 
+// refreshPath is the real token-refresh route. The previously hardcoded
+// "/v2/plugin/auth/refresh" does not exist upstream (verified 2026-10-18:
+// 404 Route Not Found), so a dead token could never be recovered in-place and
+// the account stayed broken until a manual re-login.
+const refreshPath = "/v2/plugin/auth/token/refresh"
+
 // Refresh refreshes the access token when the refresh token flow is
 // available. WorkBuddy issues long-lived tokens (60d) via the device flow;
 // this endpoint refreshes them ahead of expiry.
 func (d *Driver) Refresh(ctx context.Context, acc *model.Account) error {
+	return d.refresh(ctx, acc, false)
+}
+
+// RefreshNow forces a token refresh regardless of the local expiry clock.
+// Needed when upstream rejects a token that has not expired yet (revoked
+// elsewhere, or a session killed server-side): gating on ExpiresAt would skip
+// exactly those accounts.
+func (d *Driver) RefreshNow(ctx context.Context, acc *model.Account) error {
+	return d.refresh(ctx, acc, true)
+}
+
+func (d *Driver) refresh(ctx context.Context, acc *model.Account, force bool) error {
 	creds, err := ParseCreds(acc.CredsJSON)
 	if err != nil {
 		return err
 	}
-	if creds.ExpiresAt == 0 || time.Until(time.Unix(creds.ExpiresAt, 0)) > 10*time.Minute {
+	if !force && (creds.ExpiresAt == 0 || time.Until(time.Unix(creds.ExpiresAt, 0)) > 10*time.Minute) {
 		return nil
 	}
-	body := map[string]any{"refresh_token": creds.RefreshToken}
-	raw, _ := json.Marshal(body)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatBase(creds)+"/v2/plugin/auth/refresh", bytes.NewReader(raw))
+	if creds.RefreshToken == "" {
+		return uperr.New(uperr.ClassAuth, 401, "workbuddy refresh: no refresh token")
+	}
+	// The route takes the refresh token as a header and no body (verified
+	// 2026-10-18: empty body → 400 "refreshToken is empty" when the header is
+	// missing; a bad header value → 401 code 12153).
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatBase(creds)+refreshPath, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+	req.Header.Set("X-Refresh-Token", creds.RefreshToken)
+	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("X-Domain", d.chatBase(creds))
+	req.Header.Set("X-Product", "SaaS")
+	if creds.UID != "" {
+		req.Header.Set("X-User-Id", creds.UID)
+	}
 	resp, err := d.rpc.Do(req)
 	if err != nil {
 		return uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "workbuddy refresh: %v", err)
@@ -973,14 +1004,31 @@ func (d *Driver) Refresh(ctx context.Context, acc *model.Account) error {
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
+		// code 12153 = refresh token dead: only a re-login helps.
 		return uperr.New(uperr.ClassAuth, resp.StatusCode, "workbuddy refresh: %s", truncate(data, 200))
 	}
-	var tok struct {
+	var env struct {
+		Data struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresIn    int64  `json:"expiresIn"`
+		} `json:"data"`
 		AccessToken  string `json:"accessToken"`
 		RefreshToken string `json:"refreshToken"`
 		ExpiresIn    int64  `json:"expiresIn"`
 	}
-	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
+	if err := json.Unmarshal(data, &env); err != nil {
+		return uperr.New(uperr.ClassAuth, 0, "workbuddy refresh: bad response")
+	}
+	tok := env.Data
+	if tok.AccessToken == "" {
+		tok = struct {
+			AccessToken  string `json:"accessToken"`
+			RefreshToken string `json:"refreshToken"`
+			ExpiresIn    int64  `json:"expiresIn"`
+		}{env.AccessToken, env.RefreshToken, env.ExpiresIn}
+	}
+	if tok.AccessToken == "" {
 		return uperr.New(uperr.ClassAuth, 0, "workbuddy refresh: bad response")
 	}
 	creds.AccessToken = tok.AccessToken

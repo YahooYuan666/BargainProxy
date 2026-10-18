@@ -26,8 +26,9 @@ import (
 const AnonymousKey = "public"
 
 // openCodeClientVersion is the CLI version the disguise mimics. Upstream
-// tightens against old versions; bump here when it does.
-const openCodeClientVersion = "1.18.31"
+// tightens against old versions; bump here when it does (2026-10-18: the
+// free lane started answering 400 FreeTierError to 1.18.31).
+const openCodeClientVersion = "1.19.3"
 
 // gateToolNames are the two function tools the free lane requires on every
 // request (live 2026-10-16: a request without them answers 403

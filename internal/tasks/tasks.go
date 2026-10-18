@@ -77,11 +77,11 @@ type Scheduler struct {
 	taskEnabled map[string]bool      // task type -> timer trigger switch
 	lastProbeAt map[string]time.Time // accountID -> last automatic probe (channel cadence)
 
-	// OpenCode Zen automation (BP-54/55; zen.go).
+	// OpenCode Zen automation (BP-54/55; zen.go). Catalog sync only — probing
+	// is a one-shot at boot plus panel-driven, never scheduled.
 	zen            ZenRunner
 	zenSyncMinutes int
 	zenLastSync    time.Time
-	zenLastProbe   time.Time
 
 	// Panel-editable schedule (all guarded by mu).
 	checkinHours   []int
@@ -631,20 +631,20 @@ func (s *Scheduler) runDaily(taskType string, now time.Time) {
 func (s *Scheduler) RunTask(ctx context.Context, taskType, accountID string) (string, error) {
 	switch taskType {
 	case TaskCheckinWorkBuddy:
-		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.checkinWorkBuddy)
+		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.workBuddyWithAuthRetry(s.checkinWorkBuddy))
 	case TaskGrowthWorkBuddy:
-		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.growthWorkBuddy)
+		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.workBuddyWithAuthRetry(s.growthWorkBuddy))
 	case TaskActivityWorkBuddy:
-		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.activityWorkBuddy)
+		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.workBuddyWithAuthRetry(s.activityWorkBuddy))
 	case TaskTravelWorkBuddy:
-		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.travelWorkBuddy)
+		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.workBuddyWithAuthRetry(s.travelWorkBuddy))
 	case TaskBlackcatWorkBuddy:
 		// A daytime manual run must not write a daily "ok" ledger row: the
 		// (account, task, date) ledger would then skip the real 23:45 run.
 		if !inNightWindow(time.Now()) {
 			return "skipped (outside the 23:00-08:00 black_cat window)", nil
 		}
-		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.blackcatWorkBuddy)
+		return s.runPerAccount(ctx, taskType, accountID, model.ChannelWorkBuddy, s.workBuddyWithAuthRetry(s.blackcatWorkBuddy))
 	case TaskCheckinTrae:
 		return s.runPerAccount(ctx, taskType, accountID, model.ChannelTrae, s.checkinTrae)
 	case TaskCheckinAutoClaw:
@@ -813,6 +813,36 @@ func (s *Scheduler) checkinWorkBuddy(ctx context.Context, acc *model.Account) (s
 		}
 	}
 	return strings.Join(parts, ", "), nil
+}
+
+// workBuddyWithAuthRetry wraps a per-account WorkBuddy task with one forced
+// token refresh + retry when the first attempt died from a dead credential.
+//
+// WorkBuddy access tokens live 60 days, so a real 401 is almost always a
+// server-side revocation (signed in elsewhere, session killed) rather than
+// expiry — the scheduled refresher skips it precisely because the local clock
+// says the token is still valid. Without this, one revocation turns every
+// workbuddy task into a permanently failing row until a manual re-login.
+func (s *Scheduler) workBuddyWithAuthRetry(fn func(context.Context, *model.Account) (string, error)) func(context.Context, *model.Account) (string, error) {
+	return func(ctx context.Context, acc *model.Account) (string, error) {
+		note, err := fn(ctx, acc)
+		if err == nil || !workbuddy.IsAuthDead(err) {
+			return note, err
+		}
+		drv, ok := s.gw.Driver(model.ChannelWorkBuddy).(*workbuddy.Driver)
+		if !ok {
+			return note, err
+		}
+		if rerr := drv.RefreshNow(ctx, acc); rerr != nil {
+			return note, fmt.Errorf("%w (token refresh also failed: %v)", err, rerr)
+		}
+		if acc.CredsDirty {
+			_ = s.st.SaveAccount(acc)
+			acc.CredsDirty = false
+		}
+		s.log.Printf("task: %s 401 recovered by token refresh, retrying", label(acc))
+		return fn(ctx, acc)
+	}
 }
 
 // growthWorkBuddy runs the full growth pipeline and returns a step summary.

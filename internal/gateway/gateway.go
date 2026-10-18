@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"bargainproxy/internal/config"
@@ -28,6 +29,9 @@ type Gateway struct {
 	router  *router.Router
 	drivers map[string]driver.Driver
 	store   store.Store
+	// fbWindow is the panel-managed global first-byte ceiling (nanoseconds;
+	// 0 = fall back to config/default). Hot-updated, no restart needed.
+	fbWindow atomic.Int64
 }
 
 // New builds the gateway.
@@ -196,42 +200,18 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 			}
 		}
 		bctx := ctx
-		var cancel context.CancelFunc
 		// The sentinel guard is per-binding (its buffering state must not
-		// leak across attempts), and the first-byte window wrapper sits
-		// CLOSEST to the driver: any upstream output — including the first
-		// text chunk the sentinel guard is still buffering — proves the
-		// upstream started answering and must stop the window timer.
+		// leak across attempts). The first-byte window is passed INTO
+		// executeBinding and starts only once the pool hands out an account
+		// lease: it used to wrap the whole binding attempt, so a request queued
+		// behind a busy account (max_in_flight) burned its entire window
+		// waiting for a slot and cascaded without the upstream ever seeing it.
 		guardSeen := sentinelGuard(seen, g.cfg.Sentinels)
-		attemptEmit := guardSeen
-		if bi < len(bindings)-1 {
-			// First-byte window (ticket 28): bounds the wait for this binding
-			// to START answering — not the whole generation. Drivers aggregate
-			// the full stream inside the call, so a whole-attempt deadline
-			// used to clip every generation longer than the window (glm-5.3 /
-			// kimi-k3 lost each >8s response to the 8s fallback wait).
-			var wcancel context.CancelFunc
-			bctx, wcancel = context.WithCancel(ctx)
-			cancel = wcancel
-			timer := time.AfterFunc(win, wcancel)
-			attemptEmit = func(ev ir.StreamEvent) error {
-				timer.Stop()
-				return guardSeen(ev)
-			}
-		}
-		res, err := g.executeBinding(bctx, binding, req, attemptEmit, bi > 0, emitted, tr)
-		if cancel != nil {
-			cancel()
-		}
+		res, err := g.executeBinding(bctx, binding, req, guardSeen, win, bi > 0, emitted, tr)
 		if err == nil {
 			return res, nil
 		}
 		lastErr = err
-		if ue, ok := uperr.As(err); ok && bi < len(bindings)-1 {
-			if ue.Class == uperr.ClassCanceled || ue.Class == uperr.ClassUpstreamTimeout {
-				log.Printf("gateway: %s first-byte window expired (%s); cascading", binding.Channel, win)
-			}
-		}
 		if ctx.Err() != nil {
 			return nil, err // parent context done: client gone / shutdown
 		}
@@ -258,56 +238,92 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	return nil, lastErr
 }
 
-// estimatePromptTokens is a coarse size estimate (chars/3) used only to widen
-// the first-byte window; exact accounting stays with the upstream usage.
+// estimatePromptTokens is a coarse size estimate (chars/3 for text, a flat
+// per-image allowance, tool schema included) used only to widen the
+// first-byte window; exact accounting stays with the upstream usage. Tool
+// definitions were left out before BP-72: a ZCode session ships a large tool
+// schema, so the window stayed at the floor while the real prompt was already
+// tens of thousands of tokens.
 func estimatePromptTokens(req *ir.ChatRequest) int {
 	if req == nil {
 		return 0
 	}
 	chars := 0
+	images := 0
 	for _, m := range req.Messages {
 		for _, p := range m.Content {
-			if p.Kind == "text" {
+			switch p.Kind {
+			case "text":
 				chars += len(p.Text)
+			case "image":
+				// Prefill cost of an image is roughly fixed per tile; the
+				// base64 size is not a token count and must not be used.
+				images++
+			}
+		}
+		for _, th := range m.Thinking {
+			chars += len(th.Text)
+		}
+	}
+	toolChars := 0
+	for _, td := range req.Tools {
+		toolChars += len(td.Name) + len(td.Description)
+		if td.Parameters != nil {
+			toolChars += len(fmt.Sprint(td.Parameters))
+		}
+	}
+	return (chars+toolChars)/2 + images*1500
+}
+
+// fbWindowCeiling is the default first-byte window cap for every channel
+// (BP-72). AutoClaw used to be the only channel with a raised cap (90s);
+// the same prefill problem hits every pool on long ZCode sessions, and a
+// saturated uplink slows the first byte for all of them, so the generous
+// default is now global. Per-channel and global overrides live in config.
+const fbWindowCeiling = 90 * time.Second
+
+// fbCeiling returns the first-byte window ceiling for one channel, most
+// specific first: channel_first_byte_windows[channel] → legacy
+// channels.autoclaw.first_byte_window → global first_byte_window → 90s.
+func (g *Gateway) fbCeiling(channel string) time.Duration {
+	if g.cfg != nil {
+		if w := g.cfg.ChannelFirstByteWindows[channel].D(); w > 0 {
+			return w
+		}
+		if channel == model.ChannelAutoClaw {
+			if w := g.cfg.Channels.AutoClaw.FirstByteWindow.D(); w > 0 {
+				return w
 			}
 		}
 	}
-	if chars == 0 {
-		return 0
+	if n := g.fbWindow.Load(); n > 0 {
+		return time.Duration(n)
 	}
-	return chars / 3
-}
-
-// fbWindowCeiling is the global first-byte window cap: base plus 1s per 8k
-// estimated prompt tokens can never exceed this — unless a channel raises its
-// own ceiling via config (AutoClaw, BP-71).
-const fbWindowCeiling = 30 * time.Second
-
-// fbCeiling returns the first-byte window ceiling for one channel. AutoClaw's
-// sandbox relay prefill on 300k-token ZCode contexts exceeds the global 30s
-// cap (measured: cascades logged at exactly 30s on every long request while
-// the relay was healthy), so the AutoClaw binding defaults to a wider ceiling
-// and channels.autoclaw.first_byte_window can tune it (BP-71, user report
-// 2026-10-17). Every other channel keeps the original 30s cap.
-func (g *Gateway) fbCeiling(channel string) time.Duration {
-	if channel == model.ChannelAutoClaw {
-		if w := g.cfg.Channels.AutoClaw.FirstByteWindow.D(); w > 0 {
+	if g.cfg != nil {
+		if w := g.cfg.FirstByteWindow.D(); w > 0 {
 			return w
 		}
-		return defaultAutoClawFBWindow
 	}
 	return fbWindowCeiling
 }
 
-// defaultAutoClawFBWindow bounds how long the AutoClaw binding may take its
-// first byte before the cascade moves on. The relay answers small requests
-// in ~7s but needs long prefill on full ZCode sessions; the old global 30s
-// cap killed every such request before the first byte arrived.
-const defaultAutoClawFBWindow = 90 * time.Second
+// SetFirstByteWindow hot-updates the global first-byte ceiling (panel setting).
+// Per-channel overrides still win; 0 restores the config/default value.
+func (g *Gateway) SetFirstByteWindow(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	g.fbWindow.Store(int64(d))
+}
 
 // fbWaitFor returns the first-byte window for this request: base plus one
-// second per 8k estimated prompt tokens, capped at ceiling (global 30s unless
-// the binding's channel raises it).
+// second per 2k estimated prompt tokens, capped at ceiling (90s by default,
+// per-channel configurable). BP-72 narrowed the step twice (8k → 4k → 2k):
+// the 15:00 incident on a new 81k-token conversation gave AutoClaw only a 44s
+// window, its relay produced nothing, and Qoder absorbed the request after
+// 83s. 2k tokens/s is a realistic sandbox-relay prefill rate under a
+// congested uplink; requests that answer quickly never wait — the first
+// stream event stops the timer.
 func fbWaitFor(base time.Duration, req *ir.ChatRequest, ceiling time.Duration) time.Duration {
 	if ceiling <= 0 {
 		ceiling = fbWindowCeiling
@@ -319,7 +335,7 @@ func fbWaitFor(base time.Duration, req *ir.ChatRequest, ceiling time.Duration) t
 	if n <= 0 {
 		return base
 	}
-	w := base + time.Duration(n/8000)*time.Second
+	w := base + time.Duration(n/2000)*time.Second
 	if w > ceiling {
 		w = ceiling
 	}
@@ -340,7 +356,7 @@ func skipUnavailable(ok bool, earliest, now time.Time, window time.Duration) boo
 	return earliest.Sub(now) > window
 }
 
-func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, req *ir.ChatRequest, emit driver.Emit, degraded bool, emitted func() bool, tr *Trace) (*Result, error) {
+func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, req *ir.ChatRequest, emit driver.Emit, window time.Duration, degraded bool, emitted func() bool, tr *Trace) (*Result, error) {
 	drv, ok := g.drivers[binding.Channel]
 	if !ok {
 		return nil, uperr.New(uperr.ClassInternal, 0, "channel %q driver not installed", binding.Channel)
@@ -352,6 +368,13 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 	// do not inflate the number.
 	tr.note(binding.Channel)
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
+		// Queue wait is deliberately OUTSIDE the first-byte window: Acquire
+		// blocks while every account of the pool is at max_in_flight, and that
+		// wait says nothing about how slow the upstream's first byte is. The
+		// window starts below, right before the driver call, so a pooled
+		// request that waited 25s for a slot still gets the full prefill
+		// budget (2026-10-18 cascade: WorkBuddy/AutoClaw looked dead because
+		// their window expired while queued behind busy accounts).
 		lease, err := g.pool.Acquire(ctx, binding.Channel, req.Model, req.SessionKey)
 		if err != nil {
 			// Prefer the concrete failure from the previous attempt over the
@@ -361,12 +384,39 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			if lastErr != nil {
 				return nil, lastErr
 			}
-			return nil, g.classifyPoolError(err, binding.Channel, req.Model)
+			cerr := g.classifyPoolError(err, binding.Channel, req.Model)
+			// Pool-level failures never reach a driver, so they have no
+			// "leg failed" line — log them too, or a binding that was skipped
+			// for lack of capacity looks like it never existed.
+			if ue, ok := uperr.As(cerr); ok {
+				log.Printf("gateway: %s leg failed before dispatch: class=%s: %.160s",
+					binding.Channel, ue.Class, ue.Message)
+			}
+			return nil, cerr
 		}
 		call := driver.ChatCall{Account: lease.Account, UpstreamModel: binding.UpstreamModel, Request: req}
-		// The sentinel guard (and the first-byte window wrapper) are already
-		// composed by Execute — pass emit through unchanged.
-		resp, streamErr := drv.Stream(ctx, call, emit)
+		// First-byte window (ticket 28): bounds the wait for this attempt to
+		// START answering — not the whole generation. Timer starts HERE, after
+		// the lease, and is stopped by the first emitted event (the sentinel
+		// guard may still be buffering that event, so this wrapper stays
+		// outside it).
+		actx := ctx
+		var cancel context.CancelFunc
+		attemptEmit := emit
+		if window > 0 {
+			actx, cancel = context.WithCancel(ctx)
+			timer := time.AfterFunc(window, cancel)
+			attemptEmit = func(ev ir.StreamEvent) error {
+				timer.Stop()
+				return emit(ev)
+			}
+		}
+		started := time.Now()
+		resp, streamErr := drv.Stream(actx, call, attemptEmit)
+		elapsed := time.Since(started)
+		if cancel != nil {
+			cancel()
+		}
 		if streamErr == nil {
 			g.pool.ApplyResult(lease.Account, req.Model, nil)
 			// Record the model use so the cost observer can classify billing
@@ -386,6 +436,15 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		if !ok {
 			ue = uperr.New(uperr.ClassInternal, 0, "%v", streamErr)
 		}
+		// One line per failed leg: without it the log only shows the final
+		// channel's error, which is how "WorkBuddy died" rumors start. The
+		// window marker separates "our timer gave up" from an upstream error.
+		winNote := ""
+		if window > 0 && ue.Class == uperr.ClassCanceled && ctx.Err() == nil {
+			winNote = fmt.Sprintf(" first-byte window %s expired", window)
+		}
+		log.Printf("gateway: %s leg failed after %s: class=%s%s: %.160s",
+			binding.Channel, elapsed.Round(time.Millisecond), ue.Class, winNote, ue.Message)
 		g.pool.ApplyResult(lease.Account, req.Model, ue)
 		g.persistCreds(lease.Account)
 		lease.Release()
@@ -417,10 +476,12 @@ func (g *Gateway) classifyPoolError(err error, channel, modelName string) error 
 				modelName, channel, count)
 			ue.ResetAt = until
 			ue.Model = modelName
+			ue.Channel = channel
 			return ue
 		}
 		ue := uperr.New(uperr.ClassQuotaExhausted, 429, "no available account on channel %s", channel)
 		ue.ResetAt = nc.EarliestReset
+		ue.Channel = channel
 		return ue
 	}
 	return err
@@ -580,7 +641,13 @@ func DescribeError(err error) (status int, class string, message string) {
 	}
 	switch ue.Class {
 	case uperr.ClassQuotaExhausted:
+		// Name the pool: this is the LAST binding's error after the earlier
+		// bindings failed, and the old wording made one exhausted channel read
+		// as "every account in every pool is frozen" (2026-10-18 user report).
 		msg := "all accounts are cooling down or exhausted"
+		if ue.Channel != "" {
+			msg += " on " + ue.Channel
+		}
 		if !ue.ResetAt.IsZero() {
 			msg = fmt.Sprintf("%s; earliest reset at %s", msg, ue.ResetAt.Format(time.RFC3339))
 		}

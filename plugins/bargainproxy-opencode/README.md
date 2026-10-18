@@ -5,7 +5,7 @@
 
 | 模型族 | 来源 | 内容 |
 | --- | --- | --- |
-| OpenCode 免费 | `/panel/api/opencodezen` | 面板同口径的免费模型（候选 ∩ 探测通过） |
+| OpenCode 免费 | `/panel/api/opencodezen` | 面板同口径的免费模型（候选里没被判定失败；429/超时等临时限流仍保留） |
 | 国模 | `/v1/models` 中 `owned_by != antigravity` | GLM / DeepSeek / Qwen / Kimi 等 |
 | Gemini/Claude | `/v1/models` 中 `owned_by == antigravity` | gemini-3.8-flash 系与 claude 系 |
 
@@ -31,10 +31,15 @@
 ## 用户隐藏 / 关闭会被保留
 
 - **关闭或隐藏一个供应商**（ZCode 里的 enable / visibility）：同步时沿用原值，不会被重新打开。
-- **隐藏某个模型**：上一次同步写过、之后从该供应商模型清单里消失的模型，视为你主动隐藏；
-  后续同步不会把它加回来。你在 ZCode 里重新加回去，下一轮会自动解除隐藏。
-- 判据落盘在同目录的 `bargainproxy-opencode.state.json`（记录来源清单 / 已写清单 / 隐藏清单），
-  不写进 ZCode 配置，避免污染 schema。
+- **整组删掉一个供应商**：同步不会再把它自动重建；确实想加回来时，显式跑
+  `node scripts/session-start.mjs --readd`。
+- **隐藏某个模型**：按**每一条协议线**独立判断。上一次同步写过、之后从该条线的
+  模型清单里消失的模型，视为你在这条线上隐藏了它，后续同步不会加回来；
+  你在 ZCode 里重新加回去，下一轮自动解除。三条线互不影响。
+- **调整模型顺序**：你在 ZCode 里排好的顺序会保留，新模型只追加到末尾。
+- 判据落盘在同目录的 `bargainproxy-opencode.state.json`（v2：逐 provider 记录
+  已写清单 / 隐藏清单），不写进 ZCode 配置，避免污染 schema。
+- 从旧版 state（v1，按族记录）升级时，隐藏记录会自动迁移，不需要手工处理。
 
 ## 安装（ZCode 侧，一次性）
 

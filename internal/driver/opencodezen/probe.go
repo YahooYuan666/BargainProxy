@@ -16,6 +16,31 @@ import (
 	"bargainproxy/internal/uperr"
 )
 
+// transientProbeErr reports whether a probe failure carries no information
+// about the model itself. The free lane's 429 is the important one: it means
+// the shared anonymous quota is spent, not that nine models died. Timeouts,
+// cancellations, transport blips and edge blocks are equally untranslatable.
+//
+// The free-tier gate's 403 belongs here too (2026-10-18): it is answered
+// network-by-network and request-by-request — the official OpenCode client
+// itself draws it from some egresses while working from others — so treating
+// it as "this model is gone" would empty the route table over a condition the
+// model has nothing to do with (anomalyco/opencode#56334).
+func transientProbeErr(err error) bool {
+	ue, ok := uperr.As(err)
+	if !ok {
+		return false
+	}
+	switch ue.Class {
+	case uperr.ClassUpstreamBusy, uperr.ClassUpstreamTimeout,
+		uperr.ClassCanceled, uperr.ClassTransport, uperr.ClassWAF:
+		return true
+	case uperr.ClassBadRequest:
+		return strings.Contains(ue.Message, "free-tier gate rejected")
+	}
+	return false
+}
+
 // ProbeModel performs one minimal gated chat call against modelID and records
 // the outcome into the catalog. Any successful stream completion counts —
 // content is discarded.
@@ -51,6 +76,10 @@ func (c *Catalog) ProbeModel(ctx context.Context, d *Driver, modelID string) err
 		} else if err != nil {
 			msg = err.Error()
 		}
+		if transientProbeErr(err) {
+			c.RecordProbeTransient(modelID, ms, msg)
+			return err
+		}
 		c.RecordProbe(modelID, false, ms, msg)
 		return err
 	}
@@ -71,20 +100,24 @@ func (c *Catalog) ProbeModel(ctx context.Context, d *Driver, modelID string) err
 
 // ProbeCandidates probes every candidate model sequentially (the free lane
 // shares one anonymous quota; parallelism would just rate-limit ourselves).
-// Returns the number of OK probes.
-func (c *Catalog) ProbeCandidates(ctx context.Context, d *Driver, perCallTimeout time.Duration) (okCount, total int) {
+// Counts are split so a quota-limited pass does not read as "no models work":
+// ok = real success, limited = transient upstream condition (route kept).
+func (c *Catalog) ProbeCandidates(ctx context.Context, d *Driver, perCallTimeout time.Duration) (okCount, limitedCount, total int) {
 	for _, id := range c.Candidates() {
 		select {
 		case <-ctx.Done():
-			return okCount, total
+			return okCount, limitedCount, total
 		default:
 		}
 		total++
 		pctx, cancel := context.WithTimeout(ctx, perCallTimeout)
-		if err := c.ProbeModel(pctx, d, id); err == nil {
+		err := c.ProbeModel(pctx, d, id)
+		if err == nil {
 			okCount++
+		} else if transientProbeErr(err) {
+			limitedCount++
 		}
 		cancel()
 	}
-	return okCount, total
+	return okCount, limitedCount, total
 }

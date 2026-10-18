@@ -221,3 +221,118 @@ func TestLongGenerationSurvivesFirstByteWindow(t *testing.T) {
 		t.Fatalf("compat hits = %d, want 0 (generation must not be clipped into a fallback)", got)
 	}
 }
+
+// TestQueueWaitDoesNotConsumeFirstByteWindow: BP-72 regression. A request that
+// waits behind a busy account must get its full prefill budget once a slot
+// frees — the first-byte timer used to wrap the whole binding attempt, so a
+// request queued at max_in_flight burned its window waiting and cascaded to
+// the next channel without the upstream ever seeing it. That is how WorkBuddy
+// and AutoClaw "died" in the 2026-10-18 cascade while both were healthy.
+func TestQueueWaitDoesNotConsumeFirstByteWindow(t *testing.T) {
+	var wbHits atomic.Int64
+	wbHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := wbHits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl, _ := w.(http.Flusher)
+		if n == 1 {
+			// First byte immediately (window stops), then hold the only slot
+			// far past the window so request B has to queue.
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"wb-first"},"finish_reason":"stop"}]}`)
+			fl.Flush()
+			time.Sleep(800 * time.Millisecond)
+			fmt.Fprintln(w, `data: [DONE]`)
+			fl.Flush()
+			return
+		}
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"wb-second"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+		fl.Flush()
+	})
+	wbUp := httptest.NewServer(wbHandler)
+	t.Cleanup(wbUp.Close)
+	var compatHits atomic.Int64
+	compatUp := httptest.NewServer(healthyCompatHandler(&compatHits))
+	t.Cleanup(compatUp.Close)
+
+	cfg := config.Default()
+	cfg.Store = "memory"
+	cfg.DataDir = t.TempDir()
+	cfg.FallbackWait = config.Duration(150 * time.Millisecond)
+	cfg.Channels.WorkBuddy.ChatBaseCN = wbUp.URL
+	cfg.Channels.WorkBuddy.ChatBaseGL = wbUp.URL
+	cfg.Channels.OpenAICompat.Enabled = true
+	cfg.Channels.OpenAICompat.BaseURL = compatUp.URL + "/v1"
+	cfg.Channels.OpenAICompat.APIKey = testToken("compat")
+	cfg.Models = []config.ModelBinding{
+		{Canonical: "glm-5.3", Channel: model.ChannelWorkBuddy, UpstreamModel: "glm-5.3", Priority: 0},
+		{Canonical: "glm-5.3", Channel: model.ChannelOpenAICompat, UpstreamModel: "glm-5.3", Priority: 1},
+	}
+	st := store.NewMemory()
+	p := pool.New(pool.Params{MaxQueueWait: 3 * time.Second}, map[string]int{
+		model.ChannelWorkBuddy:    1, // one slot: the second request must queue
+		model.ChannelOpenAICompat: 4,
+	}, nil)
+	wbCreds, _ := json.Marshal(map[string]any{"access_token": testToken("wb"), "uid": "u-wb"})
+	p.Upsert(&model.Account{ID: "wb-1", Channel: model.ChannelWorkBuddy, CredsJSON: wbCreds})
+	compatCreds, _ := json.Marshal(map[string]any{"api_key": testToken("compat")})
+	p.Upsert(&model.Account{ID: "compat-default", Channel: model.ChannelOpenAICompat, CredsJSON: compatCreds})
+	drivers := map[string]driver.Driver{
+		model.ChannelWorkBuddy:    workbuddy.New(cfg.Channels.WorkBuddy, nil),
+		model.ChannelOpenAICompat: openaicompat.New(cfg.Channels.OpenAICompat, nil),
+	}
+	gw := gateway.New(cfg, p, router.New(cfg), drivers, st)
+	srv := httptest.NewServer(server.New(cfg, gw).Handler())
+	t.Cleanup(srv.Close)
+
+	body := `{"model":"glm-5.3","messages":[{"role":"user","content":"ping"}]}`
+	post := func() (string, error) {
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+		var out struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return "", err
+		}
+		if len(out.Choices) == 0 {
+			return "", fmt.Errorf("no choices (status %d)", resp.StatusCode)
+		}
+		return out.Choices[0].Message.Content, nil
+	}
+
+	first := make(chan string, 1)
+	go func() {
+		c, err := post()
+		if err != nil {
+			first <- "ERR: " + err.Error()
+			return
+		}
+		first <- c
+	}()
+	time.Sleep(100 * time.Millisecond) // A holds the slot by now
+	second, err := post()
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+	a := <-first
+	if a != "wb-first" {
+		t.Fatalf("first request content = %q, want wb-first", a)
+	}
+	if second != "wb-second" {
+		t.Fatalf("queued request content = %q, want wb-second (window must start after the lease)", second)
+	}
+	if got := wbHits.Load(); got != 2 {
+		t.Fatalf("workbuddy hits = %d, want 2", got)
+	}
+	if got := compatHits.Load(); got != 0 {
+		t.Fatalf("compat hits = %d, want 0 (queue wait must not cascade)", got)
+	}
+	assertWorkbuddyUnpenalized(t, p)
+}

@@ -7,6 +7,8 @@
   "log_keep_days": 14,
   "max_queue_wait": "120s",
   "fallback_wait": "8s",
+  "first_byte_window": "90s",
+  "channel_first_byte_windows": {},
   "session_ttl": "30m",
   "cost_ttl": "6h",
   "log_retention": "336h",
@@ -37,7 +39,6 @@
     "autoclaw": {
       "enabled": true,
       "max_in_flight": 2,
-      "first_byte_window": "90s",
       "app_secret": ""
     },
     "qoder": {
