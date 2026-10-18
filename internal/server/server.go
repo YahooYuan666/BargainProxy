@@ -218,14 +218,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		result, err = s.bufferedChat(w, r, req, reqID, start, logRow)
 	}
 	if err != nil {
-		status, class, msg := gateway.DescribeError(err)
+		status, class, _ := gateway.DescribeError(err)
 		logRow.Status = status
 		logRow.ErrorClass = class
 		logRow.DurationMs = int(time.Since(start).Milliseconds())
 		s.gw.LogRequest(logRow)
 		if !headersSent(w) {
 			withRetryAfter(w, status, err)
-			writeJSON(w, status, openai.RenderError(msg, "upstream_error", class))
+			writeJSON(w, status, openAIError(err))
 		}
 		return
 	}
@@ -239,6 +239,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		logRow.OutputTokens = result.Response.Usage.OutputTokens
 		logRow.Credit = result.Response.Usage.Credit
 		logRow.CreditKnown = result.Response.Usage.CreditKnown
+		logRow.CachedTokens = result.Response.Usage.CachedInputTokens
+		logRow.CacheKnown = result.Response.Usage.CacheKnown
 	}
 	if result.Degraded != "" {
 		logRow.Degraded = result.Degraded
@@ -374,8 +376,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 		// Headers already sent: terminate the stream with a trailing error
 		// chunk and [DONE] so clients don't hang.
 		if headersSent(w) {
-			_, _, msg := gateway.DescribeError(err)
-			_ = send(openai.RenderChunk(reqID, req.Model, created, &openai.RespDelta{Content: "\n[stream error: " + msg + "]"}, nil))
+			_ = send(openAIError(err))
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 			if fl != nil {
 				fl.Flush()

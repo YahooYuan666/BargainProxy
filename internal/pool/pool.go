@@ -85,16 +85,19 @@ type Params struct {
 
 // Pool is the account pool.
 type Pool struct {
-	mu       sync.Mutex
-	params   Params
-	accounts map[string]*model.Account // by ID
-	byChan   map[string][]string       // channel -> account IDs (stable order)
-	sessions map[string]sessionBinding // "channel|sessionKey" -> binding
-	inflight map[string]int
-	waiters  map[string]chan struct{} // channel -> broadcast on release
-	seq      uint64                   // monotonic pick sequence
-	limits   map[string]int           // channel -> per-account in-flight limit
-	onChange func(*model.Account)     // persistence callback (debounced by caller)
+	mu          sync.Mutex
+	params      Params
+	accounts    map[string]*model.Account // by ID
+	byChan      map[string][]string       // channel -> account IDs (stable order)
+	sessions    map[string]sessionBinding // "channel|sessionKey" -> binding
+	inflight    map[string]int
+	waiters     map[string]chan struct{} // channel -> broadcast on release
+	seq         uint64                   // monotonic pick sequence
+	limits      map[string]int           // channel -> per-account in-flight limit
+	onChange    func(*model.Account)     // serial state-only snapshots outside the pool lock
+	pending     map[string]*model.Account
+	persistWake chan struct{}
+	persistDone chan struct{}
 	// uses accumulates model usage per account since the last cost-snapshot
 	// drain (the cost observer task classifies tiers from balance deltas).
 	uses map[string][]string
@@ -142,7 +145,7 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 	if params.ModelRateHoldCap <= 0 {
 		params.ModelRateHoldCap = 2 * time.Hour
 	}
-	return &Pool{
+	p := &Pool{
 		params:      params,
 		accounts:    map[string]*model.Account{},
 		byChan:      map[string][]string{},
@@ -154,7 +157,14 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 		uses:        map[string][]string{},
 		lastExplore: map[string]time.Time{},
 		busyUntil:   map[string]time.Time{},
+		pending:     map[string]*model.Account{},
+		persistWake: make(chan struct{}, 1),
+		persistDone: make(chan struct{}),
 	}
+	if onChange != nil {
+		go p.persistLoop()
+	}
+	return p
 }
 
 // Upsert installs or replaces one account (used at boot and by the panel).
@@ -177,6 +187,7 @@ func (p *Pool) Remove(id string) {
 		return
 	}
 	delete(p.accounts, id)
+	delete(p.pending, id)
 	ids := p.byChan[acc.Channel]
 	for i, v := range ids {
 		if v == id {
@@ -498,9 +509,7 @@ func (p *Pool) leaseLocked(a *model.Account, now time.Time) *Lease {
 	p.seq++
 	a.LastPickSeq = p.seq
 	a.LastUsedAt = now
-	if p.onChange != nil {
-		p.onChange(a)
-	}
+	p.changedLocked(a)
 	return &Lease{Account: a, pool: p}
 }
 
@@ -619,9 +628,7 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		a.ConsecutiveFails = 0
 		a.BreakerFails = 0
 		a.UpdatedAt = now
-		if p.onChange != nil {
-			p.onChange(a)
-		}
+		p.changedLocked(a)
 		return
 	}
 	switch upstreamErr.Class {
@@ -687,9 +694,7 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		a.ConsecutiveFails++
 	}
 	a.UpdatedAt = now
-	if p.onChange != nil {
-		p.onChange(a)
-	}
+	p.changedLocked(a)
 }
 
 // RecordWindows updates quota windows from an upstream usage report.
@@ -706,9 +711,7 @@ func (p *Pool) RecordWindows(a *model.Account, windows map[string]model.Window) 
 		a.Windows[k] = w
 	}
 	a.UpdatedAt = p.params.Now()
-	if p.onChange != nil {
-		p.onChange(a)
-	}
+	p.changedLocked(a)
 }
 
 // NoteModelUse records that an account served the given model. The cost
@@ -747,9 +750,7 @@ func (p *Pool) RecordCredits(a *model.Account, c model.Credits) {
 	}
 	a.Credits = c
 	a.UpdatedAt = p.params.Now()
-	if p.onChange != nil {
-		p.onChange(a)
-	}
+	p.changedLocked(a)
 }
 
 // RecordCostTier records an observed billing tier for (account, model):
@@ -761,9 +762,7 @@ func (p *Pool) RecordCostTier(a *model.Account, modelName string, tier int) {
 		a.CostTiers = map[string]model.CostObservation{}
 	}
 	a.CostTiers[modelName] = model.CostObservation{Tier: tier, ObservedAt: p.params.Now()}
-	if p.onChange != nil {
-		p.onChange(a)
-	}
+	p.changedLocked(a)
 }
 
 // CostTier returns the effective tier for (account, model) with TTL expiry.
@@ -957,9 +956,7 @@ func (p *Pool) SetDisabled(id string, disabled bool) {
 			a.Paused = false
 		}
 		a.UpdatedAt = p.params.Now()
-		if p.onChange != nil {
-			p.onChange(a)
-		}
+		p.changedLocked(a)
 	}
 }
 
@@ -977,9 +974,7 @@ func (p *Pool) SetPaused(id string, paused bool) bool {
 	}
 	a.Paused = paused
 	a.UpdatedAt = p.params.Now()
-	if p.onChange != nil {
-		p.onChange(a)
-	}
+	p.changedLocked(a)
 	return true
 }
 

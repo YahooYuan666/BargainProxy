@@ -109,8 +109,13 @@ type Scheduler struct {
 	// Persisted in settings so a restart inside the same slot does not re-run
 	// a slot that already fired; a missed slot (sleep, delayed tick) still
 	// runs late exactly once.
-	fired map[string]string
-	stop  chan struct{}
+	fired     map[string]string
+	stop      chan struct{}
+	startOnce sync.Once
+	stopOnce  sync.Once
+	loopWG    sync.WaitGroup
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 // New builds the scheduler.
@@ -118,7 +123,8 @@ func New(gw *gateway.Gateway, st store.Store, pl *pool.Pool, logger *log.Logger)
 	if logger == nil {
 		logger = log.Default()
 	}
-	s := &Scheduler{
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Scheduler{ctx: ctx, cancel: cancel,
 		gw: gw, st: st, pl: pl, log: logger,
 		logRetention: 14 * 24 * time.Hour,
 		running:      map[string]bool{},
@@ -422,11 +428,11 @@ func (s *Scheduler) hourIn(hours []int, h int) bool {
 // (default 09:05/21:05 Asia/Shanghai), probes every probe_minutes, token
 // refresh every refresh_minutes — all panel-editable and hot-applied.
 func (s *Scheduler) Start() {
-	go s.loop()
+	s.startOnce.Do(func() { s.loopWG.Add(1); go func() { defer s.loopWG.Done(); s.loop() }() })
 }
 
 // Stop terminates the loop.
-func (s *Scheduler) Stop() { close(s.stop) }
+func (s *Scheduler) Stop() { s.stopOnce.Do(func() { s.cancel(); close(s.stop) }); s.loopWG.Wait() }
 
 func (s *Scheduler) loop() {
 	ticker := time.NewTicker(1 * time.Minute)
@@ -616,7 +622,7 @@ func (s *Scheduler) runScheduled(taskType string, now time.Time) bool {
 
 // runDaily executes a daily task once, guarded by the run ledger.
 func (s *Scheduler) runDaily(taskType string, now time.Time) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Minute)
 	defer cancel()
 	detail, err := s.RunTask(ctx, taskType, "")
 	if err != nil {
@@ -694,7 +700,7 @@ func (s *Scheduler) runPerAccount(
 		// Idempotency: skip if this daily task already succeeded today
 		// (account-scoped runs bypass the ledger so the panel can re-run).
 		if accountID == "" {
-			if run, err := s.st.TaskRunFor(acc.ID, taskType, today); err == nil && run.Status == "ok" {
+			if run, err := s.st.TaskRunFor(acc.ID, taskType, today); err == nil && run.Status == "ok" && (taskType != TaskTravelWorkBuddy || strings.Contains(run.Detail, "adoption locked") || strings.Contains(run.Detail, "adopt skipped")) {
 				continue
 			}
 		}
@@ -836,9 +842,12 @@ func (s *Scheduler) workBuddyWithAuthRetry(fn func(context.Context, *model.Accou
 		if rerr := drv.RefreshNow(ctx, acc); rerr != nil {
 			return note, fmt.Errorf("%w (token refresh also failed: %v)", err, rerr)
 		}
-		if acc.CredsDirty {
-			_ = s.st.SaveAccount(acc)
-			acc.CredsDirty = false
+		if acc.CredentialsDirty() {
+			raw := acc.Credentials()
+			if err := s.st.SaveAccount(acc); err != nil {
+				return note, err
+			}
+			acc.CredentialsPersisted(raw)
 		}
 		s.log.Printf("task: %s 401 recovered by token refresh, retrying", label(acc))
 		return fn(ctx, acc)
@@ -854,9 +863,9 @@ func (s *Scheduler) growthWorkBuddy(ctx context.Context, acc *model.Account) (st
 	if !ok {
 		return "", fmt.Errorf("workbuddy driver not installed")
 	}
-	results, err := drv.RunGrowthPipeline(ctx, acc)
-	if err != nil {
-		return err.Error(), err
+	results, pipelineErr := drv.RunGrowthPipeline(ctx, acc)
+	if pipelineErr != nil && len(results) == 0 {
+		return pipelineErr.Error(), pipelineErr
 	}
 	var okSteps, failed []string
 	for _, r := range results {
@@ -876,6 +885,12 @@ func (s *Scheduler) growthWorkBuddy(ctx context.Context, acc *model.Account) (st
 			s.gw.ApplyProbe(acc, res)
 			_ = s.st.SaveAccount(acc)
 		}
+	}
+	if pipelineErr != nil {
+		return detail, pipelineErr
+	}
+	if len(failed) > 0 {
+		return detail, fmt.Errorf("growth steps failed or incomplete: %s", strings.Join(failed, ","))
 	}
 	return detail, nil
 }
@@ -1010,6 +1025,13 @@ func (s *Scheduler) travelWorkBuddy(ctx context.Context, acc *model.Account) (st
 	drv, ok := s.gw.Driver(model.ChannelWorkBuddy).(*workbuddy.Driver)
 	if !ok {
 		return "", fmt.Errorf("workbuddy driver not installed")
+	}
+	today := time.Now().In(Shanghai).Format("2006-01-02")
+	s.mu.Lock()
+	skipped := s.adoptSkipped[acc.ID] == today
+	s.mu.Unlock()
+	if skipped {
+		return "adopt skipped earlier today (conversation threshold)", nil
 	}
 	hasBuddy, err := drv.HasBuddy(ctx, acc)
 	if err != nil {
@@ -1220,9 +1242,16 @@ func (s *Scheduler) refreshTokens(ctx context.Context) (string, error) {
 				}
 				continue
 			}
-			if acc.CredsDirty {
-				_ = s.st.SaveAccount(acc)
-				acc.CredsDirty = false
+			if acc.CredentialsDirty() {
+				raw := acc.Credentials()
+				if err := s.st.SaveAccount(acc); err != nil {
+					failed++
+					if firstErr == nil {
+						firstErr = err
+					}
+					continue
+				}
+				acc.CredentialsPersisted(raw)
 				refreshed++
 			}
 		}

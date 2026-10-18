@@ -299,14 +299,15 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
-		usage     ir.Usage
-		stop      ir.StopReason
-		gotUsage  bool
-		toolAcc   = map[int]*ir.ToolCall{}
-		toolOrder []int
-		started   = map[int]bool{}
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		usage      ir.Usage
+		stop       ir.StopReason
+		gotUsage   bool
+		terminated bool
+		toolAcc    = map[int]*ir.ToolCall{}
+		toolOrder  []int
+		started    = map[int]bool{}
 	)
 	// Empty-completion forensics: keep the first frames and log them only when
 	// nothing came out of the stream — a silent empty answer is otherwise a
@@ -351,6 +352,7 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				}
 			}
 			if ch.FinishReason != "" {
+				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}
 		}
@@ -465,6 +467,7 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			gotUsage = true
 			return nil
 		case "done":
+			terminated = true
 			var d struct {
 				FinishReason string `json:"finish_reason"`
 			}
@@ -517,6 +520,7 @@ scan:
 		trimmed := strings.TrimSpace(line)
 		switch {
 		case trimmed == "[DONE]":
+			terminated = true
 			break scan
 		case line == "":
 			if err := flush(); err != nil {
@@ -529,6 +533,7 @@ scan:
 			if evName == "" {
 				// Bare data line: a complete legacy event on its own.
 				if payload == "[DONE]" {
+					terminated = true
 					break scan
 				}
 				noteFrame("|" + payload)
@@ -564,6 +569,12 @@ scan:
 	// A final event without its trailing blank line still counts.
 	if err := flush(); err != nil {
 		return nil, err
+	}
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "trae: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "trae: stream ended without terminal signal")
 	}
 	if stop == "" {
 		stop = ir.StopEnd

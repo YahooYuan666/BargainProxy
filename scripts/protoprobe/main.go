@@ -651,6 +651,12 @@ func parseChatStream(raw []byte) (*callOut, error) {
 			done = true
 			continue
 		}
+		var streamError struct {
+			Error json.RawMessage `json:"error"`
+		}
+		if json.Unmarshal([]byte(payload), &streamError) == nil && len(streamError.Error) > 0 && string(streamError.Error) != "null" {
+			return nil, fmt.Errorf("stream reported an error: %s", payload)
+		}
 		var chunk struct {
 			Choices []struct {
 				Delta struct {
@@ -664,6 +670,9 @@ func parseChatStream(raw []byte) (*callOut, error) {
 		for _, ch := range chunk.Choices {
 			text.WriteString(ch.Delta.Content)
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
 	}
 	if !done {
 		return nil, fmt.Errorf("stream ended without [DONE]")
@@ -781,6 +790,8 @@ func parseAnthropicStream(raw []byte) (*callOut, error) {
 			continue
 		}
 		switch ev.Type {
+		case "error":
+			return nil, fmt.Errorf("stream reported an error: %s", payload)
 		case "content_block_delta":
 			text.WriteString(ev.Delta.Text)
 		case "content_block_start":
@@ -790,6 +801,9 @@ func parseAnthropicStream(raw []byte) (*callOut, error) {
 		case "message_stop":
 			sawStop = true
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
 	}
 	if !sawStop {
 		return nil, fmt.Errorf("stream ended without message_stop")
@@ -909,6 +923,8 @@ func parseResponsesStream(raw []byte) (*callOut, error) {
 			continue
 		}
 		switch ev.Type {
+		case "error", "response.failed":
+			return nil, fmt.Errorf("stream reported an error: %s", payload)
 		case "response.output_text.delta":
 			text.WriteString(ev.Delta)
 		case "response.completed", "response.incomplete":
@@ -917,6 +933,9 @@ func parseResponsesStream(raw []byte) (*callOut, error) {
 				out.stop = ev.Response.Status
 			}
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
 	}
 	if !sawDone {
 		return nil, fmt.Errorf("stream ended without response.completed")

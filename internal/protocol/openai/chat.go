@@ -409,6 +409,7 @@ type ErrorBody struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
 		Code    any    `json:"code,omitempty"`
+		Param   string `json:"param,omitempty"`
 	} `json:"error"`
 }
 

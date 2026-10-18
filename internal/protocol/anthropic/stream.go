@@ -296,7 +296,7 @@ func (s *StreamWriter) finish(stop string) error {
 }
 
 // FinishWithError closes the stream after an upstream failure mid-stream:
-// append a text note (clients render it) and stop.
+// Emit an error event without inventing a successful message_stop.
 func (s *StreamWriter) FinishWithError(msg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -309,17 +309,11 @@ func (s *StreamWriter) FinishWithError(msg string) error {
 		}
 		s.started = true
 	}
-	if err := s.openText(); err != nil {
-		return err
-	}
-	if err := s.event("content_block_delta", map[string]any{
-		"type": "content_block_delta", "index": s.blockIdx,
-		"delta": map[string]any{"type": "text_delta", "text": "\n[stream error: " + msg + "]"},
-	}); err != nil {
-		return err
-	}
-	// A failed turn must not emit half-buffered tool calls.
 	s.toolStates = map[int]*toolBlock{}
 	s.toolOrder = nil
-	return s.finish(string(ir.StopEnd))
+	if err := s.event("error", RenderError("api_error", msg)); err != nil {
+		return err
+	}
+	s.closed = true
+	return nil
 }

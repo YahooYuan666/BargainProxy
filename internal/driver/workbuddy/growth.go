@@ -719,7 +719,7 @@ func parseGrowthTaskProgress(raw json.RawMessage, flatCurrent, flatTarget int) (
 
 // GrowthTasks lists growth tasks (parsed leniently across field variants).
 func (d *Driver) GrowthTasks(ctx context.Context, acc *model.Account) ([]GrowthTask, error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -771,7 +771,7 @@ func (d *Driver) GrowthAccept(ctx context.Context, acc *model.Account, codes []s
 	if len(codes) == 0 {
 		return nil
 	}
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -781,7 +781,7 @@ func (d *Driver) GrowthAccept(ctx context.Context, acc *model.Account, codes []s
 
 // GrowthClaim claims the reward of one completed+accepted task (web domain).
 func (d *Driver) GrowthClaim(ctx context.Context, acc *model.Account, taskCode string) error {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -812,7 +812,7 @@ func (d *Driver) GrowthClaim(ctx context.Context, acc *model.Account, taskCode s
 
 // StreakStatus returns the current consecutive-login days.
 func (d *Driver) StreakStatus(ctx context.Context, acc *model.Account) (int, error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return 0, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -833,7 +833,7 @@ func (d *Driver) StreakStatus(ctx context.Context, acc *model.Account) (int, err
 
 // RedeemTier redeems a streak tier ("7d" | "14d" | "28d").
 func (d *Driver) RedeemTier(ctx context.Context, acc *model.Account, tier string) error {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -844,7 +844,7 @@ func (d *Driver) RedeemTier(ctx context.Context, acc *model.Account, tier string
 
 // LotteryChances returns the remaining lottery draws.
 func (d *Driver) LotteryChances(ctx context.Context, acc *model.Account) (int, error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return 0, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -863,7 +863,7 @@ func (d *Driver) LotteryChances(ctx context.Context, acc *model.Account) (int, e
 
 // LotteryDraw draws once.
 func (d *Driver) LotteryDraw(ctx context.Context, acc *model.Account) error {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -875,7 +875,7 @@ func (d *Driver) LotteryDraw(ctx context.Context, acc *model.Account) error {
 // HasBuddy reports whether the account has adopted a cat (agentpoints
 // BuddyInfo: data.buddy null / missing / empty object → no buddy).
 func (d *Driver) HasBuddy(ctx context.Context, acc *model.Account) (bool, error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return false, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -897,7 +897,7 @@ func (d *Driver) HasBuddy(ctx context.Context, acc *model.Account) (bool, error)
 // return 400 "first_buddy task not completed yet" (expected before the
 // unlock); callers treat that as a skip.
 func (d *Driver) BuddyAdopt(ctx context.Context, acc *model.Account) (adopted bool, note string, err error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return false, "", uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -916,7 +916,7 @@ func (d *Driver) BuddyAdopt(ctx context.Context, acc *model.Account) (adopted bo
 // TravelButler runs the cat travel loop: claim arrived rewards, depart if
 // idle and not yet departed today.
 func (d *Driver) TravelButler(ctx context.Context, acc *model.Account) (note string, err error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return "", uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -944,6 +944,8 @@ func (d *Driver) TravelButler(ctx context.Context, acc *model.Account) (note str
 				_ = json.Unmarshal(data, &resp)
 			}
 			claimed = resp.RewardCredit
+		} else {
+			return "", err
 		}
 	}
 	departed := false
@@ -953,6 +955,8 @@ func (d *Driver) TravelButler(ctx context.Context, acc *model.Account) (note str
 			return err
 		}(); err == nil {
 			departed = true
+		} else {
+			return "", err
 		}
 	}
 	switch {
@@ -970,7 +974,7 @@ func (d *Driver) TravelButler(ctx context.Context, acc *model.Account) (note str
 // ReportChatActivity posts one chat-activity report (lights chat_5 and the
 // streak check).
 func (d *Driver) ReportChatActivity(ctx context.Context, acc *model.Account, conversationID, requestID, modelID, modelName string) error {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -1019,7 +1023,7 @@ func (d *Driver) ReportChatActivity(ctx context.Context, acc *model.Account, con
 
 // SetAppearanceTheme applies an appearance theme (light/dark/theme-tkmwj).
 func (d *Driver) SetAppearanceTheme(ctx context.Context, acc *model.Account, resourceKey string) error {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -1042,7 +1046,11 @@ type growthStepResult struct {
 // first_buddy, adoption feeds the travel reward chain).
 func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]growthStepResult, error) {
 	var results []growthStepResult
+	var firstErr error
 	record := func(step string, err error, note string) {
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
 		results = append(results, growthStepResult{Step: step, OK: err == nil, Note: note})
 	}
 
@@ -1192,7 +1200,7 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	tasks, err := d.GrowthTasks(ctx, acc)
 	if err != nil {
 		record("claim_pass", err, "")
-		return results, nil
+		return results, err
 	}
 	var toAccept []string
 	for _, t := range tasks {
@@ -1209,6 +1217,7 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 	claimed := 0
 	claimNote := ""
+	var claimErr error
 	for _, t := range tasks {
 		// Upstream no longer sends `status`; "completed" now comes from the
 		// progress numbers and "already collected" from accept_status=claimed.
@@ -1219,19 +1228,20 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 			claimed++
 		} else if claimNote == "" {
 			claimNote = err.Error()
+			claimErr = err
 		}
 	}
 	note := fmt.Sprintf("claimed %d reward(s)", claimed)
 	if claimNote != "" {
 		note += "; first claim error: " + claimNote
 	}
-	record("claim_pass", nil, note)
+	record("claim_pass", claimErr, note)
 
-	return results, nil
+	return results, firstErr
 }
 
 func (d *Driver) runExpertUse(ctx context.Context, acc *model.Account, e MarketExpert, local bool) bool {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return false
 	}
@@ -1246,7 +1256,7 @@ func (d *Driver) runExpertUse(ctx context.Context, acc *model.Account, e MarketE
 }
 
 func mustCreds(acc *model.Account) *Creds {
-	creds, _ := ParseCreds(acc.CredsJSON)
+	creds, _ := ParseCreds(acc.Credentials())
 	if creds == nil {
 		creds = &Creds{}
 	}

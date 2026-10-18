@@ -490,11 +490,12 @@ func (g *Gateway) classifyPoolError(err error, channel, modelName string) error 
 // persistCreds saves refreshed credentials through the store (best effort —
 // a persistence hiccup must not fail a successful request).
 func (g *Gateway) persistCreds(acc *model.Account) {
-	if acc == nil || !acc.CredsDirty || g.store == nil {
+	if acc == nil || !acc.CredentialsDirty() || g.store == nil {
 		return
 	}
+	raw := acc.Credentials()
 	if err := g.store.SaveAccount(acc); err == nil {
-		acc.CredsDirty = false
+		acc.CredentialsPersisted(raw)
 	}
 }
 

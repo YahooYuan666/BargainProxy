@@ -19,6 +19,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -67,6 +68,8 @@ type Driver struct {
 	// promptReplace is the hot-switchable system-prompt replacement (panel
 	// setting; default on). Off falls back to StripSystem like passthrough.
 	promptReplace atomic.Bool
+	refreshMu     sync.Mutex
+	refreshes     map[string]*refreshFlight
 }
 
 // New builds the driver.
@@ -143,7 +146,7 @@ func (d *Driver) chatBase(c *Creds) string {
 // Stream implements driver.Driver. Upstream is forced to stream:true; the
 // gateway aggregates for non-streaming clients.
 func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	creds, err := ParseCreds(call.Account.CredsJSON)
+	creds, err := ParseCreds(call.Account.Credentials())
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -366,13 +369,14 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 		Message:   ir.Message{Role: ir.RoleAssistant},
 	}
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
-		toolAcc   = map[int]*ir.ToolCall{}
-		toolOrder []int
-		usage     ir.Usage
-		stop      ir.StopReason
-		gotUsage  bool
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		toolAcc    = map[int]*ir.ToolCall{}
+		toolOrder  []int
+		usage      ir.Usage
+		stop       ir.StopReason
+		gotUsage   bool
+		terminated bool
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -393,6 +397,7 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			terminated = true
 			break
 		}
 		// Business-error frames arrive as HTTP 200 with an error body.
@@ -460,6 +465,7 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 				}
 			}
 			if ch.FinishReason != "" {
+				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}
 		}
@@ -492,6 +498,13 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 		}
 		return nil, uperr.New(uperr.ClassTransport, 0, "workbuddy: stream read: %v", err)
 	}
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "workbuddy: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "workbuddy: stream ended without terminal signal")
+	}
+
 	for _, idx := range toolOrder {
 		out.Message.ToolCalls = append(out.Message.ToolCalls, *toolAcc[idx])
 	}
@@ -783,7 +796,7 @@ func parsePackageEnd(p billingPackage) time.Time {
 
 // Probe implements driver.Prober: fetch credit balance with expiry buckets.
 func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeResult, error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -807,7 +820,7 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 // CreditPackages lists the account's credit packs with per-pack expiry
 // (panel 国模积分情况 page; same billing endpoint as Probe).
 func (d *Driver) CreditPackages(ctx context.Context, acc *model.Account) ([]driver.Package, error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -885,7 +898,7 @@ func IsAlreadyCheckin(err error) bool {
 
 // Checkin performs the daily checkin (idempotent upstream-side).
 func (d *Driver) Checkin(ctx context.Context, acc *model.Account) error {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -895,7 +908,7 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) error {
 
 // ReportEvent posts a telemetry event to the upstream report endpoint.
 func (d *Driver) ReportEvent(ctx context.Context, acc *model.Account, event map[string]any) error {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -969,23 +982,13 @@ func (d *Driver) RefreshNow(ctx context.Context, acc *model.Account) error {
 	return d.refresh(ctx, acc, true)
 }
 
-func (d *Driver) refresh(ctx context.Context, acc *model.Account, force bool) error {
-	creds, err := ParseCreds(acc.CredsJSON)
-	if err != nil {
-		return err
-	}
-	if !force && (creds.ExpiresAt == 0 || time.Until(time.Unix(creds.ExpiresAt, 0)) > 10*time.Minute) {
-		return nil
-	}
-	if creds.RefreshToken == "" {
-		return uperr.New(uperr.ClassAuth, 401, "workbuddy refresh: no refresh token")
-	}
+func (d *Driver) refreshOnce(ctx context.Context, creds *Creds) ([]byte, error) {
 	// The route takes the refresh token as a header and no body (verified
 	// 2026-10-18: empty body → 400 "refreshToken is empty" when the header is
 	// missing; a bad header value → 401 code 12153).
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatBase(creds)+refreshPath, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -999,13 +1002,13 @@ func (d *Driver) refresh(ctx context.Context, acc *model.Account, force bool) er
 	}
 	resp, err := d.rpc.Do(req)
 	if err != nil {
-		return uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "workbuddy refresh: %v", err)
+		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "workbuddy refresh: %v", err)
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
 		// code 12153 = refresh token dead: only a re-login helps.
-		return uperr.New(uperr.ClassAuth, resp.StatusCode, "workbuddy refresh: %s", truncate(data, 200))
+		return nil, uperr.New(uperr.ClassAuth, resp.StatusCode, "workbuddy refresh: %s", truncate(data, 200))
 	}
 	var env struct {
 		Data struct {
@@ -1018,7 +1021,7 @@ func (d *Driver) refresh(ctx context.Context, acc *model.Account, force bool) er
 		ExpiresIn    int64  `json:"expiresIn"`
 	}
 	if err := json.Unmarshal(data, &env); err != nil {
-		return uperr.New(uperr.ClassAuth, 0, "workbuddy refresh: bad response")
+		return nil, uperr.New(uperr.ClassAuth, 0, "workbuddy refresh: bad response")
 	}
 	tok := env.Data
 	if tok.AccessToken == "" {
@@ -1029,7 +1032,7 @@ func (d *Driver) refresh(ctx context.Context, acc *model.Account, force bool) er
 		}{env.AccessToken, env.RefreshToken, env.ExpiresIn}
 	}
 	if tok.AccessToken == "" {
-		return uperr.New(uperr.ClassAuth, 0, "workbuddy refresh: bad response")
+		return nil, uperr.New(uperr.ClassAuth, 0, "workbuddy refresh: bad response")
 	}
 	creds.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
@@ -1040,11 +1043,9 @@ func (d *Driver) refresh(ctx context.Context, acc *model.Account, force bool) er
 	}
 	updated, err := json.Marshal(creds)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	acc.CredsJSON = updated
-	acc.CredsDirty = true
-	return nil
+	return updated, nil
 }
 
 // Models returns the curated model list (dynamic discovery happens via

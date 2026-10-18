@@ -453,14 +453,15 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
-		usage     ir.Usage
-		stop      ir.StopReason
-		gotUsage  bool
-		toolAcc   = map[int]*ir.ToolCall{}
-		toolOrder []int
-		gateOnly  = true // no real (non-gate) tool seen yet
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		usage      ir.Usage
+		stop       ir.StopReason
+		gotUsage   bool
+		terminated bool
+		toolAcc    = map[int]*ir.ToolCall{}
+		toolOrder  []int
+		gateOnly   = true // no real (non-gate) tool seen yet
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -472,7 +473,11 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 			continue
 		}
 		payload = strings.TrimSpace(payload)
-		if payload == "" || payload == "[DONE]" {
+		if payload == "[DONE]" {
+			terminated = true
+			break
+		}
+		if payload == "" {
 			continue
 		}
 		var chunk struct {
@@ -544,6 +549,7 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 				}
 			}
 			if ch.FinishReason != "" {
+				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}
 		}
@@ -567,6 +573,13 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 		return nil, uperr.New(uperr.ClassTransport, 0, "opencodezen: stream read: %v", err)
 	}
 	_ = gateOnly
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "opencodezen: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "opencodezen: stream ended without terminal signal")
+	}
+
 	for _, idx := range toolOrder {
 		out.Message.ToolCalls = append(out.Message.ToolCalls, *toolAcc[idx])
 	}
@@ -835,13 +848,14 @@ func parseResponsesSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
-		usage     ir.Usage
-		gotUsage  bool
-		stop      ir.StopReason
-		toolAcc   = map[int]*ir.ToolCall{}
-		toolOrder []int
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		usage      ir.Usage
+		gotUsage   bool
+		terminated bool
+		stop       ir.StopReason
+		toolAcc    = map[int]*ir.ToolCall{}
+		toolOrder  []int
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -899,6 +913,7 @@ func parseResponsesSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.
 				}
 			}
 		case "response.completed", "response.incomplete":
+			terminated = true
 			if ev.Response != nil {
 				if ev.Response.Status == "incomplete" {
 					// Reasoning-heavy models can spend the whole output budget
@@ -952,6 +967,13 @@ func parseResponsesSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.
 		}
 		return nil, uperr.New(uperr.ClassTransport, 0, "opencodezen: stream read: %v", err)
 	}
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "opencodezen: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "opencodezen: responses stream ended without terminal signal")
+	}
+
 	for _, idx := range toolOrder {
 		out.Message.ToolCalls = append(out.Message.ToolCalls, *toolAcc[idx])
 	}

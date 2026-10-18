@@ -187,6 +187,7 @@ func TestAnthropicUsageFoldsCacheIntoTotal(t *testing.T) {
 		fmt.Fprintln(w, `event: message_delta`)
 		fmt.Fprintln(w, `data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}`)
 		fmt.Fprintln(w, `event: message_stop`)
+		fmt.Fprintln(w, `data: {"type":"message_stop"}`)
 	}))
 	defer upstream.Close()
 

@@ -47,12 +47,14 @@ type Blob struct {
 
 // FunctionCall is a model-issued function call.
 type FunctionCall struct {
+	ID   string         `json:"id,omitempty"`
 	Name string         `json:"name"`
 	Args map[string]any `json:"args"`
 }
 
 // FunctionResult is a function response.
 type FunctionResult struct {
+	ID       string         `json:"id,omitempty"`
 	Name     string         `json:"name"`
 	Response map[string]any `json:"response"`
 }
@@ -103,31 +105,50 @@ func ParseRequest(body []byte, sessionKey string) (*ir.ChatRequest, error) {
 			req.Messages = append(req.Messages, ir.Message{Role: ir.RoleSystem, Content: []ir.ContentPart{{Kind: "text", Text: text}}})
 		}
 	}
-	for _, c := range w.Contents {
+	type pendingCall struct {
+		id, name string
+		used     bool
+	}
+	var pending []pendingCall
+	for ci, c := range w.Contents {
 		var msg ir.Message
-		switch c.Role {
-		case "model":
+		if c.Role == "model" {
 			msg.Role = ir.RoleAssistant
-		case "function":
-			msg.Role = ir.RoleTool
-		default:
+		} else {
 			msg.Role = ir.RoleUser
 		}
-		for _, p := range c.Parts {
+		var results []ir.Message
+		for pi, p := range c.Parts {
 			switch {
 			case p.Text != "":
 				msg.Content = append(msg.Content, ir.ContentPart{Kind: "text", Text: p.Text})
 			case p.InlineData != nil:
 				msg.Content = append(msg.Content, ir.ContentPart{Kind: "image", ImageMIME: p.InlineData.MIMEType, ImageB64: p.InlineData.Data})
 			case p.FunctionCall != nil:
+				id := p.FunctionCall.ID
+				if id == "" {
+					id = fmt.Sprintf("gemini_call_%d_%d", ci, pi)
+				}
 				args, _ := json.Marshal(p.FunctionCall.Args)
-				msg.ToolCalls = append(msg.ToolCalls, ir.ToolCall{ID: "call_" + p.FunctionCall.Name, Name: p.FunctionCall.Name, Arguments: string(args)})
+				msg.ToolCalls = append(msg.ToolCalls, ir.ToolCall{ID: id, Name: p.FunctionCall.Name, Arguments: string(args)})
+				pending = append(pending, pendingCall{id: id, name: p.FunctionCall.Name})
 			case p.FunctionResp != nil:
+				id := p.FunctionResp.ID
+				for i := range pending {
+					if !pending[i].used && ((id != "" && pending[i].id == id) || (id == "" && pending[i].name == p.FunctionResp.Name)) {
+						id = pending[i].id
+						pending[i].used = true
+						break
+					}
+				}
 				payload, _ := json.Marshal(p.FunctionResp.Response)
-				msg = ir.Message{Role: ir.RoleTool, ToolName: p.FunctionResp.Name, Content: []ir.ContentPart{{Kind: "text", Text: string(payload)}}}
+				results = append(results, ir.Message{Role: ir.RoleTool, ToolCallID: id, ToolName: p.FunctionResp.Name, Content: []ir.ContentPart{{Kind: "text", Text: string(payload)}}})
 			}
 		}
-		req.Messages = append(req.Messages, msg)
+		req.Messages = append(req.Messages, results...)
+		if len(msg.Content) > 0 || len(msg.ToolCalls) > 0 || len(results) == 0 {
+			req.Messages = append(req.Messages, msg)
+		}
 	}
 	for _, tg := range w.Tools {
 		for _, fd := range tg.FunctionDeclarations {
@@ -210,7 +231,7 @@ func Render(model string, resp *ir.ChatResponse, includeThoughts bool) *Response
 		if args == nil {
 			args = map[string]any{}
 		}
-		parts = append(parts, Part{FunctionCall: &FunctionCall{Name: tc.Name, Args: args}})
+		parts = append(parts, Part{FunctionCall: &FunctionCall{ID: tc.ID, Name: tc.Name, Args: args}})
 	}
 	return &Response{
 		ModelVersion: model,
@@ -267,12 +288,19 @@ type StreamWriter struct {
 	// parts; without it thinking deltas are dropped as before (BP-41).
 	includeThoughts bool
 
-	mu      sync.Mutex
-	sent    bool
-	textBuf strings.Builder
-	usage   *UsageMetadata
-	finish  string
-	done    bool
+	mu        sync.Mutex
+	sent      bool
+	textBuf   strings.Builder
+	usage     *UsageMetadata
+	finish    string
+	done      bool
+	tools     map[int]*geminiToolState
+	toolOrder []int
+}
+
+type geminiToolState struct {
+	id, name string
+	args     strings.Builder
 }
 
 // NewStreamWriter builds a Gemini stream writer. includeThoughts comes from
@@ -328,13 +356,20 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 		}
 		return s.frame([]Part{{Text: ev.Delta, Thought: true}}, "", nil)
 	case ir.EvToolStart:
-		s.sent = true
-		return s.frame([]Part{{FunctionCall: &FunctionCall{Name: ev.ToolCall.Name, Args: map[string]any{}}}}, "", nil)
+		if s.tools == nil {
+			s.tools = map[int]*geminiToolState{}
+		}
+		if _, ok := s.tools[ev.ToolIndex]; !ok {
+			s.toolOrder = append(s.toolOrder, ev.ToolIndex)
+		}
+		st := &geminiToolState{id: ev.ToolCall.ID, name: ev.ToolCall.Name}
+		st.args.WriteString(ev.ToolCall.Arguments)
+		s.tools[ev.ToolIndex] = st
+		return nil
 	case ir.EvToolArgs:
-		// Args arrive complete in the start frame for Gemini upstreams; for
-		// OpenAI-variant upstreams the accumulated args are unknown here, so
-		// the completing frame is emitted at EvDone with full text. Skipping
-		// intermediate arg deltas keeps the stream valid for SDKs.
+		if st := s.tools[ev.ToolIndex]; st != nil {
+			st.args.WriteString(ev.Delta)
+		}
 		return nil
 	case ir.EvUsage:
 		s.usage = &UsageMetadata{
@@ -351,6 +386,26 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 }
 
 func (s *StreamWriter) finalize() error {
+	var parts []Part
+	for _, idx := range s.toolOrder {
+		st := s.tools[idx]
+		raw := st.args.String()
+		if raw == "" {
+			raw = "{}"
+		}
+		var args map[string]any
+		if err := json.Unmarshal([]byte(raw), &args); err != nil || args == nil {
+			return fmt.Errorf("gemini: incomplete arguments for tool %s", st.name)
+		}
+		parts = append(parts, Part{FunctionCall: &FunctionCall{ID: st.id, Name: st.name, Args: args}})
+	}
+	if len(parts) > 0 {
+		if err := s.frame(parts, "", nil); err != nil {
+			return err
+		}
+		s.sent = true
+	}
+
 	// Ensure at least one frame is sent so clients receive finishReason.
 	if !s.sent {
 		if err := s.frame([]Part{{Text: ""}}, s.finish, nil); err != nil {
@@ -363,15 +418,22 @@ func (s *StreamWriter) finalize() error {
 	return nil
 }
 
-// FinishWithError ends the stream with a SAFETY-free note frame.
+// FinishWithError emits a Google RPC error instead of model-generated text.
 func (s *StreamWriter) FinishWithError(msg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.done {
 		return nil
 	}
-	if err := s.frame([]Part{{Text: "\n[stream error: " + msg + "]"}}, "STOP", nil); err != nil {
+	raw, err := json.Marshal(RenderError(502, "UNAVAILABLE", msg))
+	if err != nil {
 		return err
+	}
+	if _, err := fmt.Fprintf(s.w, "data: %s\n\n", raw); err != nil {
+		return err
+	}
+	if s.flusher != nil {
+		s.flusher.Flush()
 	}
 	s.done = true
 	return nil

@@ -772,13 +772,14 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
-		tools     = map[int]*ir.ToolCall{}
-		toolOrder []int
-		usage     ir.Usage
-		stop      ir.StopReason
-		gotUsage  bool
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		tools      = map[int]*ir.ToolCall{}
+		toolOrder  []int
+		usage      ir.Usage
+		stop       ir.StopReason
+		gotUsage   bool
+		terminated bool
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -790,6 +791,7 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			terminated = true
 			break
 		}
 		if fe := detectFrameError(payload); fe != nil {
@@ -853,6 +855,7 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				}
 			}
 			if ch.FinishReason != "" {
+				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}
 		}
@@ -874,6 +877,13 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 		}
 		return nil, uperr.New(uperr.ClassTransport, 0, "autoclaw: stream read: %v", err)
 	}
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "autoclaw: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "autoclaw: stream ended without terminal signal")
+	}
+
 	for _, idx := range toolOrder {
 		out.Message.ToolCalls = append(out.Message.ToolCalls, *tools[idx])
 	}

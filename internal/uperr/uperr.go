@@ -53,7 +53,10 @@ type Error struct {
 	Sentinel string    // matched sentinel text for ClassSentinel
 	// Code is the upstream business code when the body carried one (e.g.
 	// workbuddy "6004"); the panel shows it as the rate-limit label (BP-49).
-	Code string
+	Code          string
+	UpstreamType  string
+	UpstreamCode  any
+	UpstreamParam string
 	// HoldUntil is the gateway's own routing hold end, annotated by
 	// pool.ApplyResult when the failure was folded into a cooldown — it can be
 	// earlier than ResetAt (the hold is capped so a later request re-probes).

@@ -24,6 +24,7 @@ type Store interface {
 	// Accounts
 	LoadAccounts() ([]*model.Account, error)
 	SaveAccount(acc *model.Account) error
+	SaveAccountState(acc *model.Account) error
 	DeleteAccount(id string) error
 
 	// Request audit log (metadata only)

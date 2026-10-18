@@ -105,7 +105,9 @@ func main() {
 	onChange := func(acc *model.Account) {
 		// Persist scheduling-state changes; ignore errors here (a failed
 		// write degrades to memory-only state, never blocks a request).
-		_ = st.SaveAccount(acc)
+		if err := st.SaveAccountState(acc); err != nil {
+			log.Printf("pool state persistence failed (account=%s): %v", acc.ID, err)
+		}
 	}
 	p = pool.New(pool.Params{
 		MaxQueueWait: cfg.MaxQueueWait.D(),
@@ -160,11 +162,14 @@ func main() {
 		drivers[model.ChannelOpenAICompat] = openaicompat.New(cfg.Channels.OpenAICompat, nil)
 		// The compat channel is configured, not account-based: register a
 		// single synthetic pool account so it participates in scheduling.
-		if _, ok := findAccount(accounts, "openaicompat-default"); !ok {
-			creds, _ := json.Marshal(map[string]string{"api_key": cfg.Channels.OpenAICompat.APIKey})
-			def := &model.Account{ID: "openaicompat-default", Channel: model.ChannelOpenAICompat, Nickname: "compat default", CredsJSON: creds}
-			p.Upsert(def)
-			_ = st.SaveAccount(def)
+		def, ok := findAccount(accounts, "openaicompat-default")
+		if !ok {
+			def = &model.Account{ID: "openaicompat-default", Channel: model.ChannelOpenAICompat, Nickname: "compat default"}
+		}
+		def.CredsJSON, _ = json.Marshal(map[string]string{"api_key": cfg.Channels.OpenAICompat.APIKey})
+		p.Upsert(def)
+		if err := st.SaveAccount(def); err != nil {
+			log.Printf("compat default reconciliation failed: %v", err)
 		}
 	}
 
@@ -276,6 +281,8 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
+	sched.Stop()
+	p.Close()
 	if err := st.Close(); err != nil {
 		log.Printf("store close: %v", err)
 	}

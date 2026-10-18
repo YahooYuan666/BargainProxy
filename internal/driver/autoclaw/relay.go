@@ -502,8 +502,11 @@ func (d *Driver) convertRelay(ctx context.Context, r io.Reader, runID, sessionKe
 	if streamErr != nil {
 		return nil, streamErr
 	}
-	if err := finish(); err != nil {
-		return nil, err
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "autoclaw relay: canceled: %v", ctx.Err())
+	}
+	if !done {
+		return nil, uperr.New(uperr.ClassTransport, 0, "autoclaw relay: stream ended without terminal signal")
 	}
 	return out, nil
 }

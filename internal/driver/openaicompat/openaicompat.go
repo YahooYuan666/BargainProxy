@@ -59,10 +59,10 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	// API key resolution: account credential first (per-account overrides),
-	// then the channel-level config key.
+	// User-imported accounts override the channel key; the synthetic default
+	// always follows current configuration.
 	apiKey := d.cfg.APIKey
-	if call.Account != nil && len(call.Account.CredsJSON) > 0 {
+	if call.Account != nil && call.Account.ID != "openaicompat-default" && len(call.Account.CredsJSON) > 0 {
 		var creds struct {
 			APIKey string `json:"api_key"`
 		}
@@ -165,13 +165,14 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
-		tools     = map[int]*ir.ToolCall{}
-		toolOrder []int
-		usage     ir.Usage
-		stop      ir.StopReason
-		gotUsage  bool
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		tools      = map[int]*ir.ToolCall{}
+		toolOrder  []int
+		usage      ir.Usage
+		stop       ir.StopReason
+		gotUsage   bool
+		terminated bool
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -183,6 +184,7 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			terminated = true
 			break
 		}
 		// Mid-stream error frame on a 200 stream (ticket 36): count it as a
@@ -245,6 +247,7 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				}
 			}
 			if ch.FinishReason != "" {
+				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}
 		}
@@ -263,6 +266,13 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 		}
 		return nil, uperr.New(uperr.ClassTransport, 0, "openaicompat: stream read: %v", err)
 	}
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "openaicompat: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "openaicompat: stream ended without terminal signal")
+	}
+
 	for _, idx := range toolOrder {
 		out.Message.ToolCalls = append(out.Message.ToolCalls, *tools[idx])
 	}
@@ -356,19 +366,19 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	lower := strings.ToLower(text)
 	switch {
 	case status == 401:
-		return uperr.New(uperr.ClassAuth, status, "openaicompat: %s", truncate(body, 300))
+		return uperr.WithFields(uperr.New(uperr.ClassAuth, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 429:
-		return uperr.New(uperr.ClassSoftRate, status, "openaicompat: %s", truncate(body, 300))
+		return uperr.WithFields(uperr.New(uperr.ClassSoftRate, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 402 || strings.Contains(lower, "insufficient") || strings.Contains(text, "余额"):
-		return uperr.New(uperr.ClassHardCredit, status, "openaicompat: %s", truncate(body, 300))
+		return uperr.WithFields(uperr.New(uperr.ClassHardCredit, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 403:
-		return uperr.New(uperr.ClassWAF, status, "openaicompat: %s", truncate(body, 300))
+		return uperr.WithFields(uperr.New(uperr.ClassWAF, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 400 || status == 404:
-		return uperr.New(uperr.ClassBadRequest, status, "openaicompat: %s", truncate(body, 300))
+		return uperr.WithFields(uperr.New(uperr.ClassBadRequest, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status >= 500:
-		return uperr.New(uperr.ClassTransport, status, "openaicompat: %s", truncate(body, 300))
+		return uperr.WithFields(uperr.New(uperr.ClassTransport, status, "openaicompat: %s", truncate(body, 300)), body)
 	default:
-		return uperr.New(uperr.ClassInternal, status, "openaicompat: %s", truncate(body, 300))
+		return uperr.WithFields(uperr.New(uperr.ClassInternal, status, "openaicompat: %s", truncate(body, 300)), body)
 	}
 }
 

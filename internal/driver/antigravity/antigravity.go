@@ -338,13 +338,14 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 		Message:   ir.Message{Role: ir.RoleAssistant},
 	}
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
-		toolCalls []ir.ToolCall
-		usage     ir.Usage
-		stop      ir.StopReason
-		gotUsage  bool
-		lastSig   string // newest thought_signature seen in this turn (BP-44)
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		toolCalls  []ir.ToolCall
+		usage      ir.Usage
+		stop       ir.StopReason
+		gotUsage   bool
+		terminated bool
+		lastSig    string // newest thought_signature seen in this turn (BP-44)
 	)
 
 	for sc.Scan() {
@@ -360,6 +361,7 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			terminated = true
 			break
 		}
 		// Mid-stream error frame on a 200 stream (ticket 36): Gemini opens the
@@ -438,6 +440,7 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 				}
 			}
 			if cand.FinishReason != "" {
+				terminated = true
 				stop = mapFinish(cand.FinishReason)
 			}
 		}
@@ -464,6 +467,13 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 			return nil, uperr.New(uperr.ClassCanceled, 0, "antigravity: stream canceled: %v", ctx.Err())
 		}
 		return nil, uperr.New(uperr.ClassTransport, 0, "antigravity: stream read: %v", err)
+	}
+
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "antigravity: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "antigravity: stream ended without terminal signal")
 	}
 
 	if len(toolCalls) > 0 && (stop == "" || stop == ir.StopEnd) {

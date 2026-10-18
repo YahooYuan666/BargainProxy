@@ -217,11 +217,11 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}, logRow)
 	if err != nil {
-		status, class, msg := gateway.DescribeError(err)
+		status, class, _ := gateway.DescribeError(err)
 		logRow.Status, logRow.ErrorClass, logRow.DurationMs = status, class, int(time.Since(start).Milliseconds())
 		s.gw.LogRequest(logRow)
 		withRetryAfter(w, status, err)
-		writeJSON(w, status, responses.RenderError(kindForClass(class), msg))
+		writeJSON(w, status, openAIError(err))
 		return
 	}
 	logRow.TTFBMs = ttfb

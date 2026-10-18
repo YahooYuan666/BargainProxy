@@ -29,8 +29,7 @@ func NewMemory() *Memory {
 }
 
 func copyAccount(a *model.Account) *model.Account {
-	c := *a
-	c.CredsJSON = append([]byte(nil), a.CredsJSON...)
+	c := *a.CopyWithCredentials()
 	if a.ModelCooldowns != nil {
 		c.ModelCooldowns = make(map[string]model.ModelCooldown, len(a.ModelCooldowns))
 		for k, v := range a.ModelCooldowns {

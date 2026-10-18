@@ -471,14 +471,15 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
-		thinkSig  string
-		tools     = map[int]*ir.ToolCall{}
-		toolOrder []int
-		usage     ir.Usage
-		stop      ir.StopReason
-		gotUsage  bool
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
+		thinkSig   string
+		tools      = map[int]*ir.ToolCall{}
+		toolOrder  []int
+		usage      ir.Usage
+		stop       ir.StopReason
+		gotUsage   bool
+		terminated bool
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -604,6 +605,7 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 				gotUsage = true
 			}
 		case "message_stop":
+			terminated = true
 			stop = ir.StopEnd
 		case "error":
 			// error events carry the same business codes.
@@ -621,6 +623,12 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 			return nil, uperr.New(uperr.ClassCanceled, 0, "zcode: stream canceled: %v", ctx.Err())
 		}
 		return nil, uperr.New(uperr.ClassTransport, 0, "zcode: stream read: %v", err)
+	}
+	if ctx.Err() != nil {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "zcode: stream canceled: %v", ctx.Err())
+	}
+	if !terminated {
+		return nil, uperr.New(uperr.ClassTransport, 0, "zcode: stream ended without message_stop")
 	}
 	// An exhausted plan / rejected model can end the SSE stream with no text,
 	// no tool call and no usage. Treat that as a failure so the gateway moves

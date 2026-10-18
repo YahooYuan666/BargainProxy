@@ -115,6 +115,7 @@ func OpenPostgres(ctx context.Context, dsn string, box *cryptox.Box) (*Postgres,
 
 // stateBlob is the JSONB column shape: everything except creds + identity.
 type stateBlob struct {
+	UpdatedAt            time.Time                        `json:"updated_at,omitempty"`
 	Paused               bool                             `json:"paused,omitempty"`
 	AccountCooldownUntil time.Time                        `json:"account_cooldown_until,omitempty"`
 	ModelCooldowns       map[string]model.ModelCooldown   `json:"model_cooldowns,omitempty"`
@@ -164,6 +165,7 @@ func (p *Postgres) LoadAccounts() ([]*model.Account, error) {
 			a.ConsecutiveFails = sb.ConsecutiveFails
 			a.BreakerFails = sb.BreakerFails
 			a.LastUsedAt = sb.LastUsedAt
+			a.UpdatedAt = sb.UpdatedAt
 		}
 		out = append(out, &a)
 	}
@@ -173,11 +175,12 @@ func (p *Postgres) LoadAccounts() ([]*model.Account, error) {
 func (p *Postgres) SaveAccount(acc *model.Account) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	sealed, err := p.box.Seal(acc.CredsJSON)
+	sealed, err := p.box.Seal(acc.Credentials())
 	if err != nil {
 		return fmt.Errorf("store: encrypt account %s: %w", acc.ID, err)
 	}
 	sb := stateBlob{
+		UpdatedAt:            acc.UpdatedAt,
 		Paused:               acc.Paused,
 		AccountCooldownUntil: acc.AccountCooldownUntil,
 		ModelCooldowns:       acc.ModelCooldowns,
