@@ -88,16 +88,92 @@ rules:
 2. **关掉实验性 QUIC（HTTP/3）**：跨国 UDP 443 常被限速/丢包，握手阶段就会卡住。
    Edge：`edge://flags/#enable-quic` → `Disabled`。
 
-## 6. 验证流程（改完必做）
+## 7. 调优四：BBR2 兜不住时换协议（Hysteria 2 / UDP QUIC）
+
+BBR2 只改变**拥塞判定方式**，不能凭空创造带宽：当链路持续丢包（实测在 0%–45% 间波动）时，
+BBR2 仍会掉到 0.5 Mbps 级别——13% 丢包时 2 MB 上传只有 0.5 Mbps、5 MB 直接 90 秒超时。
+
+这时要换的是**传输协议**，不是继续调内核参数。实测有效的做法：
+
+- **协议**：Hysteria 2（基于 QUIC/UDP 的 Brutal 拥塞控制，不按丢包退让，按声明带宽发送）。
+- **进程形态**：在同一 mihomo 进程内加一个 `hysteria2` listener，**不要另起进程**——
+  省约 20 MB 常驻内存，也少一个故障域。
+- **端口**：UDP 一个高位端口（与服务端 VLESS/TCP 443 共存互不冲突）。
+- **证书**：无域名时用自签 EC P-256 证书，客户端用 SHA256 指纹固定。
+- **带宽参数**：服务端按链路实测上限保守写（如 20 Mbps），客户端从 8 Mbps 起调；
+  写 500 Mbps 在 1C1G / 十几 Mbps 的链路上只会持续丢包。
+
+服务端在既有 `listeners:` 里追加（其余配置不动）：
+
+```yaml
+listeners:
+  - name: vless-in          # 原有 TCP 443 入口，完全不动
+    # ...
+
+  - name: hy2-in
+    type: hysteria2
+    port: 8443
+    listen: 0.0.0.0
+    users:
+      <user>: "<PASSWORD>"
+    up: 20
+    down: 20
+    ignore-client-bandwidth: false
+    obfs: salamander
+    obfs-password: "<OBFS_PASSWORD>"
+    certificate: /etc/mihomo/hy2.crt
+    private-key: /etc/mihomo/hy2.key
+    alpn: [h3]
+```
+
+客户端节点（顺序放在原有节点**之前**，保留原节点做手动回退）：
+
+```yaml
+proxies:
+  - name: hy2
+    type: hysteria2
+    server: <VPS_IP>
+    port: 8443
+    password: "<PASSWORD>"
+    sni: <SNI_HOST>
+    alpn: [h3]
+    obfs: salamander
+    obfs-password: "<OBFS_PASSWORD>"
+    fingerprint: "<SHA256_FINGERPRINT>"
+    skip-cert-verify: false
+    up: "8 Mbps"
+    down: "20 Mbps"
+```
+
+实测对照（Windows → 海外 VPS，同一线路）：
+
+| 指标 | Hysteria 2 | 同线路 VLESS（13% 丢包） |
+|---|---|---|
+| 2 MB 上传 | 4.9–5.9s / 2.8–3.4 Mbps | 29–36s / 0.5 Mbps |
+| 5 MB 上传 | 14.7s / 2.84 Mbps | 90s 超时 |
+| 20 MB 上传 | 59.3s / 2.83 Mbps，无超时 | 会超时 |
+| 小请求延迟 | 0.33s | 0.68–0.96s |
+
+要点：
+
+1. Brutal 生效后，2/5/20 MB 三档速率几乎一致（约 2.8–3.4 Mbps），大上下文不再随时间恶化。
+2. 实际没跑满声明的 8 Mbps——瓶颈多半是本地上行或测试端点，**先别急着往上抬 `up`**。
+3. 下行不受 `down: 20` 限制（实测可到 190+ Mbps），限的是上行方向。
+4. 改 VPS 配置前先备份并 `mihomo -t -d /etc/mihomo` 校验；有带外链路才安全重启。
+
+## 8. 验证流程（改完必做）
 
 1. 先测上行：用同一代理口传一个 2 MB 文件，记录耗时；开 BBR2 前后对比应在 3~6 倍差距。
+   若 BBR2 后仍 < 1 Mbps，直接用第 7 节的 Hysteria 2 复测同一文件。
 2. 再看网关：请求日志页筛渠道 = `Google（Antigravity）` / `OpenCode 免费通道`，
    看 TTFB 与总耗时是否恢复正常量级（洋模首字 > 30s 基本就是出口问题）。
 3. 最后看国模：如果国模也慢，问题不在出口，去任务中心看是否全池冷却、账号是否过期。
 
-## 7. 边界与备选
+## 9. 边界与备选
 
 - BBR2 只解决「本机 → VPS」的上行；VPS → 上游（Google/OpenCode）那段由 VPS 的 BBR 负责。
-- 若晚高峰丢包长期 > 10%，可评估 Hysteria 2（UDP/QUIC，Brutal 拥塞控制）作为同机备用端口；
-  但部分运营商对境外 UDP 有 QoS，需实测，不要替代主链路前就全量切换。
-- 本攻略只讨论网络调优，不涉及任何账号凭据；代理配置请自行保管，**不要提交到仓库**。
+- Hysteria 2 依赖 UDP：部分运营商对境外 UDP 有 QoS 甚至阻断，**必须实测再决定是否主用**，
+  原 VLESS 节点保留为回退。
+- 服务端 mihomo 常驻内存约 17.5 MB（进程内 listener 不额外起进程）。
+- 本攻略只讨论网络调优，不涉及任何账号凭据；真实的 VPS 地址、UUID、REALITY 密钥、
+  密码一律用占位符，**不要提交到仓库**。

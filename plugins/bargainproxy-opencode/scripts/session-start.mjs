@@ -465,10 +465,16 @@ function buildDoc(existing, base, apiKey, plan, metaFor, prevState, opts = {}) {
   const keptProviderRules = providerRules.filter((r) => !writtenIds.has(r?.providerId));
   const keptModelRules = existingModelRules.filter((r) => !writtenIds.has(r?.providerId));
   const keptManualRules = asArray(modelRules.manualProviderModelRules).filter((r) => !writtenIds.has(r?.providerId));
-  const keptOrder = asArray(cfg.providerOrder).filter((v) => !(typeof v === "string" && writtenIds.has(v)));
 
   doc.schemaVersion = 1;
-  cfg.providerOrder = [...keptOrder, ...ourProviderRules.map((r) => r.providerId)];
+  // Provider ORDER is the user's: they drag the groups around in ZCode's picker.
+  // Only append the ids that were never ordered before (fresh install), so a
+  // re-sync never yanks our groups to the bottom of the list.
+  cfg.providerOrder = mergeModelOrder(
+    asArray(cfg.providerOrder),
+    [...keptProviderRules.map((r) => r?.providerId), ...ourProviderRules.map((r) => r.providerId)]
+      .filter((id) => typeof id === "string" && id.length > 0),
+  );
   cfg.providerConfigRules = { ...(cfg.providerConfigRules ?? {}), providerRules: [...keptProviderRules, ...ourProviderRules] };
   modelRules.providerModelRules = [...keptModelRules, ...ourModelRules];
   modelRules.manualProviderModelRules = [...keptManualRules];
