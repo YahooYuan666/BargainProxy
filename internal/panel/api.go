@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -743,6 +744,14 @@ func (p *Panel) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p.gw.SetThoughtSignatureReplay(*req.ThoughtSignatureReplay)
+	}
+	// Re-apply every persisted hot setting, model_routes included: an operator
+	// (or a routemerge run while the gateway is up) can change the stored
+	// routes behind this panel's back, and the old table kept serving from
+	// memory until the next restart (2026-10-21 field report: the cleaned
+	// duplicate autoclaw row reappeared in the panel's route page).
+	for _, line := range RestoreHotSettings(p.gw, p.store) {
+		log.Printf("panel: re-applied %s", line)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

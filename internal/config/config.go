@@ -48,6 +48,20 @@ type Config struct {
 	CostTTL      Duration `json:"cost_ttl"`       // cost observation TTL, default 6h
 	LogRetention Duration `json:"log_retention"`  // default 336h (14d)
 
+	// SingleActivePerChannel: at most one account of a channel may interact at
+	// a time (default true, 2026-10-20). A second request does not wait and is
+	// not sent to another account of the same pool — it walks to the next
+	// binding; when no pool is free the request fails with 并行数量超发. Using
+	// several accounts of one pool simultaneously is the pattern upstream risk
+	// control reads as abnormal activity.
+	SingleActivePerChannel bool `json:"single_active_per_channel"`
+
+	// TaskAccountGap is the pause between accounts inside one scheduled task
+	// run (probe / check-in / activity). Upstream task traffic for several
+	// accounts in a burst is a risk-control signal; the reference projects use
+	// ~0.8s between accounts and 1.05s between report chunks. 0 disables.
+	TaskAccountGap Duration `json:"task_account_gap"`
+
 	// FirstByteWindow is the ceiling for the per-binding first-byte wait,
 	// applied to EVERY channel (BP-72). The wait is fallback_wait + 1s per
 	// 2k estimated prompt tokens, capped here. Before BP-72 the cap was a
@@ -109,6 +123,11 @@ type WorkBuddySettings struct {
 	WebBaseCN   string `json:"web_base_cn"`   // default https://www.workbuddy.cn (growth claim / web events)
 	MaxInFlight int    `json:"max_in_flight"` // default 2
 	PromptMode  string `json:"prompt_mode"`   // "custom" | "passthrough"
+	// DisableClientFingerprint turns off the official-client header family on
+	// chat requests. Default false: the edge applies channel/risk-control
+	// checks, and bare requests are what upstream later flags as abnormal
+	// activity (2026-10-20 field finding). Set true only for A/B diagnosis.
+	DisableClientFingerprint bool `json:"disable_client_fingerprint"`
 }
 
 // TraeSettings configures the Trae CN channel.
@@ -153,6 +172,10 @@ type QoderSettings struct {
 	GatewayBase string `json:"gateway_base"`  // default https://gateway.qoder.com.cn
 	OpenBase    string `json:"open_base"`     // default https://openapi.qoder.com.cn
 	MaxInFlight int    `json:"max_in_flight"` // upstream allows 1 concurrent request per PAT
+	// DataDir hosts the device-fingerprint salt (qoder-device-salt). Empty
+	// falls back to the top-level data_dir. The salt must never change once
+	// generated: it seeds every account's virtual device identity.
+	DataDir string `json:"data_dir"`
 }
 
 // OpenAICompatSettings configures the generic fallback channel.
@@ -261,6 +284,11 @@ func Default() *Config {
 		MaxQueueWait:    Duration(120 * time.Second),
 		FallbackWait:    Duration(8 * time.Second),
 		FirstByteWindow: Duration(90 * time.Second),
+		// One account per pool at a time: the anti-risk-control default
+		// (2026-10-20). Explicitly setting false restores multi-account
+		// concurrency within a pool.
+		SingleActivePerChannel: true,
+		TaskAccountGap:         Duration(800 * time.Millisecond),
 		RPCTimeout:      Duration(120 * time.Second),
 		HeaderTimeout:   Duration(300 * time.Second),
 		IdleTimeout:     Duration(300 * time.Second),
@@ -391,6 +419,9 @@ func applyDefaults(cfg *Config) {
 	}
 	if ch.Qoder.MaxInFlight <= 0 {
 		ch.Qoder.MaxInFlight = 1 // upstream: one in-flight request per PAT
+	}
+	if ch.Qoder.DataDir == "" {
+		ch.Qoder.DataDir = cfg.DataDir // device salt lives beside the master key
 	}
 	if cfg.MaxQueueWait <= 0 {
 		cfg.MaxQueueWait = d.MaxQueueWait

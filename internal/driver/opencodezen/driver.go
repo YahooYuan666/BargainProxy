@@ -640,7 +640,9 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	case status == 429:
 		return uperr.New(uperr.ClassUpstreamBusy, status, "opencodezen: %s", truncate(body, 300))
 	case status == 404:
-		return uperr.New(uperr.ClassModelRate, status, "opencodezen: model endpoint gone: %s", truncate(body, 300))
+		return uperr.New(uperr.ClassNotFound, status, "opencodezen: model endpoint gone: %s", truncate(body, 300))
+	case status == 413:
+		return uperr.New(uperr.ClassBadRequest, status, "opencodezen: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "opencodezen: %s", truncate(body, 300))
 	case status >= 500:

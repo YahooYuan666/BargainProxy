@@ -33,7 +33,11 @@ func transientProbeErr(err error) bool {
 	}
 	switch ue.Class {
 	case uperr.ClassUpstreamBusy, uperr.ClassUpstreamTimeout,
-		uperr.ClassCanceled, uperr.ClassTransport, uperr.ClassWAF:
+		uperr.ClassCanceled, uperr.ClassTransport, uperr.ClassWAF,
+		uperr.ClassNotFound:
+		// A 404 means the probe path is gone (edge or route change). That
+		// says nothing about whether the model still exists, so it must not
+		// be recorded as "model dead" (same reasoning as the free-tier gate).
 		return true
 	case uperr.ClassBadRequest:
 		return strings.Contains(ue.Message, "free-tier gate rejected")

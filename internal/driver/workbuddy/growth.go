@@ -28,7 +28,14 @@ import (
 )
 
 const (
-	desktopUA             = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+	// desktopUAGlobal is the international package's UA. The second brand
+	// segment differs by distribution: CN keeps the camel-case product name,
+	// the international build rewrites it to the lowercase slug (misakano
+	// upstream's packet capture, 2026-10-21). Sending the CN brand to the
+	// global edge looks like a foreign client and risks 403 11140.
+	desktopUAGlobal       = "WorkBuddy/5.5.6 workbuddy-ai/5.5.6 CLI/2.137.1"
+	clientVersion         = "5.5.6"
 	reportPath            = "/v2/report"
 	appearanceSetPath     = "/v2/user-asset/appearance/set"
 	growthTasksPath       = "/v2/activity/growth/tasks"

@@ -99,13 +99,14 @@ func sanitizeMap(m map[string]any) {
 // InjectPromptCacheKey sets a stable prompt_cache_key derived from the
 // account uid and the conversation id (panel parity: isolates upstream
 // prefix caching per account, which is a significant cost reduction).
+//
+// No conversation identity means NO cache key: falling back to the bare uid
+// gives every unrelated conversation one shared prefix slot, which is exactly
+// the cross-conversation contamination seen on 2026-10-20. Omitting the field
+// only costs cache hits; claiming a shared slot costs correctness.
 func InjectPromptCacheKey(body map[string]any, uid, conversationID string) {
-	if uid == "" {
+	if uid == "" || conversationID == "" {
 		return
 	}
-	key := uid
-	if conversationID != "" {
-		key = uid + ":" + conversationID
-	}
-	body["prompt_cache_key"] = key
+	body["prompt_cache_key"] = uid + ":" + conversationID
 }

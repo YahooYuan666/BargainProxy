@@ -38,8 +38,36 @@ const (
 	// may still cascade to another channel.
 	ClassModelUnavailable = "model_unavailable"
 	ClassUpstreamBusy     = "upstream_busy" // upstream at capacity (queue full, e.g. CodeBuddy 6021): neither the account nor the payload is at fault
-	ClassSentinel         = "sentinel"      // HTTP 200 body is a known rejection sentinel
-	ClassInternal         = "internal"      // gateway bug or unclassified
+	// ClassNotFound: the upstream answered 404 — the path or model does not
+	// exist there. This is NOT "this account is rate limited for this model":
+	// classifying it as model_rate used to cool the account for up to
+	// ModelRateHoldCap (2h). One routing break then silently removed healthy
+	// accounts, and a channel-wide batch of 404s turned every account
+	// unavailable ("switch models" — the wrong advice; the channel is broken).
+	// Zero account penalty. The pool pauses the channel+model pair for a short
+	// fixed hold so a request storm does not hammer a dead path; the binding
+	// loop may still cascade to another channel (2026-10-19; misakano7545
+	// parity: ErrNotFound = fixed 60s soft cooldown, no failure count).
+	ClassNotFound = "not_found"
+	// ClassAccountRestricted: upstream has restricted the ACCOUNT itself —
+	// workbuddy answers 403 with `code=11140, msg="request illegal"` and
+	// displayMsg "账号存在异常行为，已被限制使用". Refresh/retry cannot fix it;
+	// the account must leave routing so the pool rotates to a healthy one.
+	// Before this class existed the error fell into the generic internal
+	// bucket, so a restricted account stayed selectable and sticky
+	// conversations kept binding to it — the whole pool looked broken while
+	// one account was still healthy (2026-10-20, field diagnosis).
+	ClassAccountRestricted = "account_restricted"
+	// ClassConcurrencyExceeded: every routable pool for the model is already
+	// serving another request. Single-active-per-channel mode allows one
+	// account interaction per pool at a time (multi-account concurrency in one
+	// pool is exactly the pattern upstream risk control flags as unusual
+	// activity); a new request walks to the next pool, and when none is free
+	// this is the honest answer instead of queueing silently (2026-10-20,
+	// user requirement: "并行数量超发").
+	ClassConcurrencyExceeded = "concurrency_exceeded"
+	ClassSentinel          = "sentinel" // HTTP 200 body is a known rejection sentinel
+	ClassInternal          = "internal" // gateway bug or unclassified
 )
 
 // Error is the normalized upstream failure.
@@ -94,10 +122,15 @@ func New(class string, status int, format string, args ...any) *Error {
 // the same reason (same slow upstream / the attempt was aborted by us); the
 // binding loop still cascades to a *different channel* when nothing has been
 // sent to the client yet (tickets 27/28).
+// 404 is not rotatable either: a missing path/model is a property of the
+// binding, so the next account of the SAME channel answers 404 too. Rotating
+// would walk the whole pool and penalize nothing while spending every
+// account's request budget on a dead route; the binding loop still cascades to
+// another channel, which is where a working route may live.
 func Rotatable(class string) bool {
 	switch class {
 	case ClassBadRequest, ClassContentBlocked, ClassSentinel, ClassUpstreamBusy,
-		ClassUpstreamTimeout, ClassCanceled:
+		ClassUpstreamTimeout, ClassCanceled, ClassNotFound:
 		return false
 	default:
 		return true

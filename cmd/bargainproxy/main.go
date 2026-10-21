@@ -66,6 +66,11 @@ func main() {
 			log.Fatalf("store: postgres selected but database dsn is empty")
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		// First run on a fresh PostgreSQL: create the app database here so the
+		// launcher needs neither Go nor client tools (boot autostart).
+		if eerr := store.EnsureDatabase(ctx, cfg.Database); eerr != nil {
+			log.Printf("store: ensure database: %v", eerr)
+		}
 		pg, err := store.OpenPostgres(ctx, cfg.Database, box)
 		cancel()
 		if err != nil {
@@ -110,9 +115,10 @@ func main() {
 		}
 	}
 	p = pool.New(pool.Params{
-		MaxQueueWait: cfg.MaxQueueWait.D(),
-		SessionTTL:   cfg.SessionTTL.D(),
-		CostTTL:      cfg.CostTTL.D(),
+		MaxQueueWait:           cfg.MaxQueueWait.D(),
+		SessionTTL:             cfg.SessionTTL.D(),
+		CostTTL:                cfg.CostTTL.D(),
+		SingleActivePerChannel: cfg.SingleActivePerChannel,
 	}, limits, onChange)
 
 	// Load accounts from the store (in-flight counters are volatile; they
@@ -148,7 +154,13 @@ func main() {
 		drivers[model.ChannelAutoClaw] = autoclaw.New(cfg.Channels.AutoClaw, nil)
 	}
 	if cfg.Channels.Qoder.Enabled {
-		drivers[model.ChannelQoder] = qoder.New(cfg.Channels.Qoder, nil)
+		qcfg := cfg.Channels.Qoder
+		if qcfg.DataDir == "" {
+			// The device-fingerprint salt lives with the rest of the runtime
+			// data so it survives restarts (see qoder.machineSalt).
+			qcfg.DataDir = cfg.DataDir
+		}
+		drivers[model.ChannelQoder] = qoder.New(qcfg, nil)
 	}
 	if cfg.Channels.OpenCodeZen.Enabled {
 		drivers[model.ChannelOpenCodeZen] = opencodezen.New(cfg.Channels.OpenCodeZen, nil)
@@ -229,6 +241,7 @@ func main() {
 	// Task center: background scheduler + panel wiring.
 	sched := tasks.New(gw, st, p, log.Default())
 	sched.SetLogRetention(cfg.LogRetention.D())
+	sched.SetAccountGap(cfg.TaskAccountGap.D())
 	sched.LoadSettings()
 	pn.SetTaskRunner(sched)
 	// OpenCode Zen automation: the panel drives sync/probe on the scheduler's

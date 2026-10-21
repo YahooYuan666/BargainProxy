@@ -76,6 +76,11 @@ type Scheduler struct {
 	running     map[string]bool      // "task|account" in-flight guard
 	taskEnabled map[string]bool      // task type -> timer trigger switch
 	lastProbeAt map[string]time.Time // accountID -> last automatic probe (channel cadence)
+	// accountGap is the pause between accounts inside one task run. Several
+	// accounts hitting the task RPCs back-to-back is a risk-control signal
+	// (the reference projects use ~0.8s between accounts and 1.05s between
+	// report chunks); 0 disables (2026-10-20).
+	accountGap time.Duration
 
 	// OpenCode Zen automation (BP-54/55; zen.go). Catalog sync only — probing
 	// is a one-shot at boot plus panel-driven, never scheduled.
@@ -130,6 +135,7 @@ func New(gw *gateway.Gateway, st store.Store, pl *pool.Pool, logger *log.Logger)
 		running:      map[string]bool{},
 		taskEnabled:  map[string]bool{},
 		lastProbeAt:  map[string]time.Time{},
+		accountGap:   800 * time.Millisecond,
 		checkinHours: []int{9, 21},
 		growthHours:  []int{9},
 		// agentpoints activity_hours default 10, travel_hours default 9,21.
@@ -152,6 +158,29 @@ func New(gw *gateway.Gateway, st store.Store, pl *pool.Pool, logger *log.Logger)
 func (s *Scheduler) SetLogRetention(d time.Duration) {
 	if d > 0 {
 		s.logRetention = d
+	}
+}
+
+// SetAccountGap sets the pause between accounts inside one task run
+// (config task_account_gap). 0 disables the pause.
+func (s *Scheduler) SetAccountGap(d time.Duration) {
+	s.mu.Lock()
+	s.accountGap = d
+	s.mu.Unlock()
+}
+
+// accountPause sleeps the configured inter-account gap. Call between accounts
+// of the same run, never after the last one.
+func (s *Scheduler) accountPause(ctx context.Context) {
+	s.mu.Lock()
+	d := s.accountGap
+	s.mu.Unlock()
+	if d <= 0 {
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
 	}
 }
 
@@ -693,7 +722,10 @@ func (s *Scheduler) runPerAccount(
 	today := time.Now().In(Shanghai).Format("2006-01-02")
 	var notes []string
 	var firstErr error
-	for _, acc := range accounts {
+	for i, acc := range accounts {
+		if i > 0 {
+			s.accountPause(ctx)
+		}
 		if acc.Disabled && !s.disabledKeepAliveEligible(taskType) {
 			continue
 		}
@@ -1175,7 +1207,10 @@ func (s *Scheduler) probeAll(ctx context.Context, accountID string) (string, err
 		if !ok {
 			continue
 		}
-		for _, acc := range s.accountsOf(ch) {
+		for i, acc := range s.accountsOf(ch) {
+			if i > 0 {
+				s.accountPause(ctx)
+			}
 			if (acc.Disabled && !s.includeDisabledNow()) || (accountID != "" && acc.ID != accountID) {
 				continue
 			}
@@ -1231,7 +1266,10 @@ func (s *Scheduler) refreshTokens(ctx context.Context) (string, error) {
 		if !ok {
 			continue
 		}
-		for _, acc := range s.accountsOf(ch) {
+		for i, acc := range s.accountsOf(ch) {
+			if i > 0 {
+				s.accountPause(ctx)
+			}
 			if acc.Disabled && !s.includeDisabledNow() {
 				continue
 			}

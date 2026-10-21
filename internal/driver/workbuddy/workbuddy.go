@@ -13,6 +13,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,6 +61,16 @@ const (
 	codeBadParams   = 11101 // invalid params: do not penalize the account
 	codeSessionDead = 12153 // session dead: needs re-login
 	codeQueueFull   = 6021  // inference cluster queue full ("queue.full.title"): upstream capacity event, NOT an account problem — rotating accounts at request pace miskilled a whole pool in seconds in the field (2026-10-15); the right response is wait, not switch
+	// codePromptTooLong: the prompt exceeds the model's context window. The
+	// same body fails on every account, so this is request-level: no rotation,
+	// no account penalty (2026-10-19).
+	codePromptTooLong = 11115
+	// codeAccountRestricted: upstream restricted the ACCOUNT ("request
+	// illegal" + displayMsg "账号存在异常行为，已被限制使用"). Refreshing cannot
+	// fix it; the account must leave routing. The same code also carries a
+	// model-level rate-limit message, which must stay soft_rate — so the
+	// wording decides, never the code alone (2026-10-20).
+	codeAccountRestricted = 11140
 )
 
 // Driver implements driver.Driver for the workbuddy channel.
@@ -170,6 +183,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if creds.DeviceToken != "" {
 		req.Header.Set("X-Device-Token", creds.DeviceToken)
 	}
+	d.applyClientFingerprint(req, creds, call)
 	resp, err := d.http.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "workbuddy: %v", err)
@@ -304,8 +318,15 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds) ([]byte, error) {
 	}
 	if req.RequestedEffort != "" {
 		// upstream effort gears: minimal|low|medium|high (invalid values are
-		// downgraded upstream-side to the model default).
-		body["reasoning_effort"] = req.RequestedEffort
+		// downgraded upstream-side to the model default). The international
+		// (realm=global) deployment only accepts "high": sending low/max there
+		// is rejected upstream, so it is pinned (misakano upstream parity,
+		// 2026-10-21).
+		effort := req.RequestedEffort
+		if creds.RealmOrDefault() == "global" {
+			effort = "high"
+		}
+		body["reasoning_effort"] = effort
 	}
 	// prompt_cache_key injection (per-account stable key, panel parity).
 	prompt.InjectPromptCacheKey(body, creds.UID, sessionFromReq(req))
@@ -344,17 +365,10 @@ func sessionFromReq(req *ir.ChatRequest) string {
 	if req.SessionKey != "" {
 		return req.SessionKey
 	}
-	// Fall back to the last user message text hash surrogate: keep it cheap
-	// and stable per turn. This mirrors the panel's turn key behavior.
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if req.Messages[i].Role == ir.RoleUser {
-			for _, p := range req.Messages[i].Content {
-				if p.Kind == "text" && p.Text != "" {
-					return fmt.Sprintf("t%d", len(p.Text))
-				}
-			}
-		}
-	}
+	// Deliberately no surrogate. The old fallback returned "t<len(text)>",
+	// i.e. the message LENGTH — unrelated conversations with equal-length
+	// prompts shared one upstream cache slot (2026-10-20 cross-conversation
+	// contamination). No stable identity means no cache key at all.
 	return ""
 }
 
@@ -619,13 +633,33 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		return e
 	case codeBadParams:
 		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: %s", msg)
+	case codeAccountRestricted:
+		// Same code carries two meanings; the wording decides (see the
+		// constant's comment). Rate-limit wording keeps the account usable.
+		lowerMsg := strings.ToLower(msg)
+		if strings.Contains(lowerMsg, "rate") || strings.Contains(lowerMsg, "limit") {
+			e := uperr.New(uperr.ClassSoftRate, 429, "workbuddy: %s", msg)
+			e.ResetAt = parseResetWallClock(msg)
+			return e
+		}
+		// "request illegal" / "account restricted": the account is banned
+		// upstream. Rotate away and stop selecting it.
+		return uperr.New(uperr.ClassAccountRestricted, 403, "workbuddy: account restricted by upstream: %s", msg)
 	case codeSessionDead:
 		return uperr.New(uperr.ClassAuth, 401, "workbuddy: %s", msg)
 	default:
-		if strings.Contains(msg, "积分") || strings.Contains(strings.ToLower(msg), "credit") {
+		// Business-code branch runs before the status fallbacks, so a
+		// request-level rejection must be recognized HERE too — otherwise
+		// code 11115 ("prompt is too long") lands in the generic internal
+		// bucket and the status branch never sees it.
+		lowerMsg := strings.ToLower(msg)
+		if code == codePromptTooLong || isPromptTooLong(lowerMsg) {
+			return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: prompt too long: %s", msg)
+		}
+		if strings.Contains(msg, "积分") || strings.Contains(lowerMsg, "credit") {
 			return uperr.New(uperr.ClassHardCredit, 402, "workbuddy: %s", msg)
 		}
-		if strings.Contains(msg, "拦截") || strings.Contains(msg, "blocked") || strings.Contains(msg, "审核") {
+		if strings.Contains(msg, "拦截") || strings.Contains(lowerMsg, "blocked") || strings.Contains(msg, "审核") {
 			return uperr.New(uperr.ClassContentBlocked, 400, "workbuddy: %s", msg)
 		}
 		return uperr.New(uperr.ClassInternal, 200, "workbuddy: code=%d %s", code, msg)
@@ -647,6 +681,110 @@ func parseResetWallClock(msg string) time.Time {
 	return time.Time{}
 }
 
+// isPromptTooLong reports the upstream's over-context marker: business code
+// 11115 or the literal wording. The caller passes a lowercased body. Both the
+// JSON-envelope shape and the plain-text shape are covered because the edge
+// sometimes answers with a bare message instead of an envelope.
+func isPromptTooLong(lowerBody string) bool {
+	if strings.Contains(lowerBody, "11115") {
+		return true
+	}
+	return strings.Contains(lowerBody, "prompt is too long") ||
+		strings.Contains(lowerBody, "context length exceeded") ||
+		strings.Contains(lowerBody, "context_too_long")
+}
+
+// applyClientFingerprint sends the official WorkBuddy desktop client's header
+// family on chat requests.
+//
+// Why: the chat edge classifies traffic. Requests carrying only the four
+// transport headers (content-type/auth/Accept/device) look like a script, and
+// upstream later marks the ACCOUNT as "unusual activity" (403 code=11140
+// "request illegal", displayMsg 账号存在异常行为，已被限制使用 — field
+// diagnosis 2026-10-20). The reference projects send the same family on every
+// call for that reason.
+//
+// Values are stable derivations from the account uid/session key, never random
+// per request: the official client reuses one machine id and one conversation
+// id per conversation, so rotating them would look *more* suspicious.
+//
+// Set channels.workbuddy.disable_client_fingerprint to turn this off.
+func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call driver.ChatCall) {
+	if d.cfg.DisableClientFingerprint {
+		return
+	}
+	global := creds.RealmOrDefault() == "global"
+	origin, lang := "https://www.codebuddy.cn", "zh-CN"
+	if global {
+		origin, lang = "https://www.workbuddy.ai", "en-US"
+	}
+	ua := desktopUA
+	if global {
+		ua = desktopUAGlobal
+	}
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Referer", origin+"/")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("X-CodeBuddy-Request", "1")
+	req.Header.Set("Accept-Language", lang)
+	req.Header.Set("X-Product", "WorkBuddy")
+	req.Header.Set("X-Agent-Purpose", "conversation")
+	req.Header.Set("X-IDE-Name", "WorkBuddy")
+	req.Header.Set("X-IDE-Type", "WorkBuddy")
+	req.Header.Set("X-IDE-Version", clientVersion)
+	req.Header.Set("X-No-Enterprise-Id", "1")
+	req.Header.Set("X-Domain", strings.TrimPrefix(origin, "https://"))
+	if creds.UID != "" {
+		req.Header.Set("X-User-Id", creds.UID)
+	}
+	seed := creds.UID
+	if seed == "" {
+		seed = call.Account.ID
+	}
+	machine := stableHex(seed + "|machine")
+	req.Header.Set("X-Machine-ID", machine)
+	req.Header.Set("X-Session-ID", machine)
+	conv := ""
+	if sk := call.Request.SessionKey; sk != "" {
+		conv = stableHex(seed + "|" + sk)
+	} else {
+		// No stable conversation identity: mint a per-request id. A constant
+		// fallback told upstream that every unrelated conversation was the
+		// same one — the 2026-10-20 field bug where two ZCode sessions shared
+		// a conversation id and the model's answers/images crossed over.
+		conv = randomHex()
+	}
+	msg := stableHex(conv + "|message")
+	req.Header.Set("X-Conversation-ID", conv)
+	req.Header.Set("X-Conversation-Request-ID", conv)
+	req.Header.Set("X-Conversation-Message-ID", msg)
+	req.Header.Set("X-Request-ID", msg)
+	req.Header.Set("X-Root-Request-ID", conv)
+	req.Header.Set("X-Trace-ID", conv)
+	req.Header.Set("X-B3-TraceId", conv)
+	req.Header.Set("X-B3-SpanId", msg[:16])
+	req.Header.Set("X-B3-Sampled", "1")
+}
+
+// stableHex derives a 32-hex id from a seed (deterministic per account/session,
+// never per request).
+func stableHex(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:16])
+}
+
+// randomHex returns a fresh 32-hex id for requests that carry no stable
+// conversation identity.
+func randomHex() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+		return hex.EncodeToString(sum[:16])
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // classifyHTTP maps HTTP status + body to the taxonomy.
 func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	if code, msg, ok := detectBusinessError(body); ok {
@@ -654,13 +792,37 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	}
 	text := string(body)
 	lower := strings.ToLower(text)
+	// Account restriction without a JSON envelope: the edge sometimes answers
+	// bare text. This must be judged before the generic 403 → WAF branch,
+	// because a restricted account has to leave routing (2026-10-20).
+	if status == 403 && (strings.Contains(lower, "request illegal") ||
+		strings.Contains(lower, "11140") ||
+		strings.Contains(lower, "account restricted") ||
+		strings.Contains(text, "异常行为")) {
+		return uperr.New(uperr.ClassAccountRestricted, status, "workbuddy: account restricted by upstream: %s", truncate(body, 300))
+	}
+	// Prompt-too-long (11115) is request-level and is judged before the
+	// status fallbacks: upstream may express it with 400, 404 or 413, and on
+	// 404 the generic branch would otherwise file it as a dead route.
+	// Rotating accounts cannot shorten a prompt.
+	if status == 400 || status == 404 || status == 413 {
+		if isPromptTooLong(lower) {
+			return uperr.New(uperr.ClassBadRequest, status, "workbuddy: prompt too long: %s", truncate(body, 300))
+		}
+	}
 	switch {
 	case status == 401:
 		return uperr.New(uperr.ClassAuth, status, "workbuddy: %s", truncate(body, 300))
 	case status == 402:
 		return uperr.New(uperr.ClassHardCredit, status, "workbuddy: %s", truncate(body, 300))
 	case status == 404:
-		return uperr.New(uperr.ClassModelRate, status, "workbuddy: %s", truncate(body, 300))
+		// The path/model does not exist upstream: a property of the binding,
+		// identical for every account of this channel. Not a rate limit, so
+		// the pool applies no account penalty (2026-10-19).
+		return uperr.New(uperr.ClassNotFound, status, "workbuddy: %s", truncate(body, 300))
+	case status == 413:
+		// Payload too large is a request problem no account can fix.
+		return uperr.New(uperr.ClassBadRequest, status, "workbuddy: %s", truncate(body, 300))
 	case status == 429 || strings.Contains(lower, "rate") || strings.Contains(lower, "limit"):
 		e := uperr.New(uperr.ClassSoftRate, status, "workbuddy: %s", truncate(body, 300))
 		e.ResetAt = parseResetWallClock(text)

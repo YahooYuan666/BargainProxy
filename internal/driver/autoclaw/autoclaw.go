@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -281,6 +282,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	}
 	resp, err := d.chatProxy(ctx, cr, body, modelID)
 	if err != nil {
+		log.Printf("autoclaw: proxy path unavailable: %v", err)
 		var serr error
 		resp, serr = d.chatSandbox(ctx, call.Account, cr, body, modelID)
 		if serr != nil {
@@ -288,6 +290,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 			// the sandbox OpenAI endpoint is not enabled (404). The sandbox
 			// relay is the practical path; auth/credit/rate failures are
 			// terminal and must not be retried through it.
+			log.Printf("autoclaw: sandbox chat path unavailable: %v", serr)
 			if relayFallbackAllowed(serr) {
 				return d.chatRelay(ctx, call, cr, emit)
 			}

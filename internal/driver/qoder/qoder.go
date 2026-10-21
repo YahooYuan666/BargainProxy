@@ -14,12 +14,17 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,6 +41,20 @@ import (
 
 const (
 	busyCode = "10605"
+
+	// Queue-wait contract (2026-10-21, qoder2api-hub #38/#57 parity): a 403 +
+	// {"code":"10605","isQueued":true,"retryAfterSeconds":N} answer is the
+	// upstream's QUEUEING PROTOCOL, not a rate limit — the official client
+	// sleeps N seconds and retries the same request, with a total budget up to
+	// an hour. Our previous handling (fixed 2s, one retry) turned every queue
+	// round into a client-visible failure, which is why the
+	// deepseek-v4.1-flash p1 binding kept failing. Defaults are the
+	// reference's conservative budget: 3 rounds, 180s per round, 600s total,
+	// plus 0–2s jitter so simultaneous wakeups do not stampede the queue.
+	queueMaxRounds   = 3
+	queueWaitMax     = 180 * time.Second
+	queueWaitBudget  = 600 * time.Second
+	defaultQueueWait = 30 * time.Second
 
 	pathJobExchange = "/api/v1/jobToken/exchange"
 	pathCheckStatus = "/sash/api/v1/me/daily-check-in/status"
@@ -119,6 +138,11 @@ type Driver struct {
 	catMu sync.Mutex
 	cat   *ModelCatalog
 	catAt time.Time
+
+	// Device-fingerprint salt (see machineSalt): generated once, persisted in
+	// the driver's data dir, never changed afterwards.
+	saltOnce sync.Once
+	saltVal  string
 }
 
 // New builds the driver.
@@ -164,7 +188,15 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		return nil, uperr.New(uperr.ClassAuth, 0, "qoder: %v", err)
 	}
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	// 10605 is the upstream's QUEUEING PROTOCOL, not a rate limit: the answer
+	// carries retryAfterSeconds and the official client sleeps exactly that
+	// long before retrying the same request. Bounded here by queueMaxRounds
+	// and queueWaitBudget so a gateway request never parks for an hour
+	// (2026-10-21, qoder2api-hub #38/#57 parity — a fixed 2s single retry is
+	// what kept the deepseek-v4.1-flash binding failing).
+	queueRounds := 0
+	var queueSpent time.Duration
+	for attempt := 0; attempt < 1+queueMaxRounds; attempt++ {
 		if err := d.ensureFreshSession(ctx, rt); err != nil {
 			return nil, qoderError(err)
 		}
@@ -182,11 +214,26 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 			if d.forceRefresh(ctx, rt) == nil {
 				continue
 			}
-		case ue.Class == uperr.ClassSoftRate && attempt == 0 && strings.Contains(ue.Message, busyCode):
+		case ue.Class == uperr.ClassSoftRate && strings.Contains(ue.Message, busyCode):
+			wait := queueWaitSeconds(ue.Message)
+			if wait <= 0 {
+				return nil, err
+			}
+			if queueRounds >= queueMaxRounds || queueSpent+wait > queueWaitBudget {
+				// Budget exhausted: surface the honest queue error instead of
+				// holding the request open forever.
+				return nil, err
+			}
+			queueRounds++
+			queueSpent += wait
+			jitter := time.Duration(randIntN(2000)) * time.Millisecond
+			log.Printf("qoder: upstream queued (%s) — waiting %s (round %d/%d, spent %s)",
+				clip(ue.Message, 60), wait.Round(time.Second), queueRounds, queueMaxRounds,
+				queueSpent.Round(time.Second))
 			select {
 			case <-ctx.Done():
 				return nil, qoderError(ctx.Err())
-			case <-time.After(2 * time.Second):
+			case <-time.After(wait + jitter):
 			}
 			continue
 		}
@@ -405,6 +452,53 @@ func mapStop(reason string) ir.StopReason {
 	}
 }
 
+// queueWaitSeconds parses the upstream queue answer's retryAfterSeconds.
+// Returns 0 when the body is not a queue signal; a missing/invalid field
+// falls back to defaultQueueWait (conservative 30s, reference parity).
+func queueWaitSeconds(body string) time.Duration {
+	low := strings.ToLower(body)
+	if !strings.Contains(body, busyCode) && !strings.Contains(low, "isqueued") && !strings.Contains(low, "queue") {
+		return 0
+	}
+	var env struct {
+		RetryAfterSeconds any `json:"retryAfterSeconds"`
+	}
+	if err := json.Unmarshal([]byte(extractJSONObject(body)), &env); err == nil {
+		switch v := env.RetryAfterSeconds.(type) {
+		case float64:
+			if v >= 1 {
+				return clampQueueWait(time.Duration(v) * time.Second)
+			}
+		case string:
+			if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+				return clampQueueWait(time.Duration(n) * time.Second)
+			}
+		}
+	}
+	return defaultQueueWait
+}
+
+// clampQueueWait caps one round at queueWaitMax.
+func clampQueueWait(d time.Duration) time.Duration {
+	if d <= 0 {
+		return time.Second
+	}
+	if d > queueWaitMax {
+		return queueWaitMax
+	}
+	return d
+}
+
+// extractJSONObject returns the first {...} span of a body that may embed JSON
+// inside an error envelope string.
+func extractJSONObject(body string) string {
+	start := strings.Index(body, "{")
+	if start < 0 {
+		return ""
+	}
+	return body[start:]
+}
+
 // streamLineError surfaces in-stream gateway errors (statusCodeValue >= 400 or
 // {"success":false} bodies), including the 10605 queue-full signal.
 func (d *Driver) streamLineError(line string) error {
@@ -599,7 +693,19 @@ func (d *Driver) runtimeFor(acc *model.Account) (*runtime, error) {
 	}
 	changed := false
 	if c.MachineID == "" || c.MachineToken == "" || c.MachineType == "" {
-		c.MachineID, c.MachineToken, c.MachineType = newMachineIDs()
+		// Derived device identity (2026-10-21): the machine code must be a
+		// stable virtual device per ACCOUNT, not a random UUID. Random ids were
+		// stable only while the stored credential lived, so every re-login
+		// looked like a new device to upstream risk control. The seed is the
+		// account's own identity plus this install's salt (see
+		// deriveMachineIDs), so unrelated accounts never share a device and the
+		// same account keeps one.
+		seed := c.PAT
+		if seed == "" {
+			seed = acc.ID
+		}
+		m := deriveMachineIDs(patFingerprint(seed), d.machineSalt())
+		c.MachineID, c.MachineToken, c.MachineType = m.machineID, m.machineToken, m.machineType
 		changed = true
 	}
 	if changed {
@@ -1112,8 +1218,10 @@ func (d *Driver) LoginPAT(ctx context.Context, pat, label string) (*model.Accoun
 	if !strings.HasPrefix(pat, "pt-") {
 		return nil, fmt.Errorf("PAT 必须以 pt- 开头")
 	}
-	mid, mtok, mtype := newMachineIDs()
-	c := &Creds{PAT: pat, Name: label, MachineID: mid, MachineToken: mtok, MachineType: mtype}
+	// The PAT's own identity seeds the device: onboarding the same PAT twice
+	// yields the same virtual device instead of a fresh random one.
+	m := deriveMachineIDs(patFingerprint(pat), d.machineSalt())
+	c := &Creds{PAT: pat, Name: label, MachineID: m.machineID, MachineToken: m.machineToken, MachineType: m.machineType}
 	jt, err := d.exchangeJobToken(ctx, c)
 	if err != nil {
 		return nil, err
@@ -1189,6 +1297,85 @@ func newUUID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// machineIDs is one derived virtual device (2026-10-21; qoder2api-hub /
+// Zhengyuuuui Go port parity). The formulas are byte-identical to the
+// reference's qoder_fingerprint.py for the same seed:
+//
+//	machineID     md5("machine:{seed}")              → 32 hex
+//	machineType   md5("machinetype:{seed}")[:18]     → 18 hex
+//	machineToken  sha512("machinetoken:{seed}")[:43] → 43 base64url
+//
+// Deriving from the account UID (+ an optional install salt) instead of
+// minting random UUIDs gives one stable virtual device per account — the
+// upstream never sees machine-code drift across re-logins — and unrelated
+// accounts never share a device. Changing the salt changes every fingerprint
+// at once, which is equivalent to moving the whole install to a new machine:
+// generate it once, then never change it.
+type machineIDs struct {
+	machineID    string
+	machineToken string
+	machineType  string
+}
+
+func deriveMachineIDs(uid, salt string) machineIDs {
+	if uid == "" {
+		panic("qoder: deriveMachineIDs requires a non-empty seed (uid)")
+	}
+	seed := uid
+	if salt != "" {
+		seed = seed + "|salt:" + salt
+	}
+	id := md5Hex("machine:" + seed)
+	typ := md5Hex("machinetype:" + seed)[:18]
+	sum := sha512.Sum512([]byte("machinetoken:" + seed))
+	tok := base64.RawURLEncoding.EncodeToString(sum[:])[:43]
+	return machineIDs{machineID: id, machineToken: tok, machineType: typ}
+}
+
+// machineSalt returns this install's device-fingerprint salt, persisted under
+// the data directory so it survives restarts. It must be generated once and
+// then never change: editing it rotates every account's virtual device, which
+// upstream reads as "the same user suddenly appeared on a new machine".
+//
+// A fresh random salt per process would be worse than useless — every restart
+// would mint new device credentials for accounts that need them regenerated,
+// so the salt is written to disk on first use. Empty dir (tests, library use)
+// falls back to a stable in-process constant.
+func (d *Driver) machineSalt() string {
+	d.saltOnce.Do(func() {
+		if d.cfg.DataDir == "" {
+			d.saltVal = "qoder-default-salt"
+			return
+		}
+		path := filepath.Join(d.cfg.DataDir, "qoder-device-salt")
+		if raw, err := os.ReadFile(path); err == nil {
+			if s := strings.TrimSpace(string(raw)); s != "" {
+				d.saltVal = s
+				return
+			}
+		}
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			d.saltVal = "qoder-fallback-salt"
+			return
+		}
+		s := hex.EncodeToString(b)
+		if err := os.WriteFile(path, []byte(s+"\n"), 0o600); err != nil {
+			log.Printf("qoder: could not persist device salt (%v); using in-memory value", err)
+		}
+		d.saltVal = s
+	})
+	return d.saltVal
+}
+
+// patFingerprint derives the seed for a PAT-based onboarding: the same PAT
+// always maps to the same virtual device, without storing the PAT itself in
+// the seed.
+func patFingerprint(pat string) string {
+	sum := sha512.Sum512([]byte("pat:" + strings.TrimSpace(pat)))
+	return hex.EncodeToString(sum[:])[:32]
+}
+
 func newMachineIDs() (id, token, typ string) {
 	return newUUID(), newUUID() + newUUID(), newUUID()[:18]
 }
@@ -1207,6 +1394,24 @@ func marshalCompact(v any) string {
 		return fmt.Sprintf("%v", v)
 	}
 	return truncateRunes(string(raw), 160)
+}
+
+// randIntN returns a pseudo-random int in [0,n) for queue-wait jitter. The
+// jitter desynchronises clients that were queued on the same model, so they do
+// not wake up and stampede the queue together.
+func randIntN(n int) int {
+	if n <= 0 {
+		return 0
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return 0
+	}
+	v := int(b[0])<<24 | int(b[1])<<16 | int(b[2])<<8 | int(b[3])
+	if v < 0 {
+		v = -v
+	}
+	return v % n
 }
 
 func clip(s string, n int) string {

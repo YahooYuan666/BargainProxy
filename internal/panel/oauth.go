@@ -62,6 +62,20 @@ type authFlow struct {
 	created     time.Time
 	persistedAt time.Time    // last sealed write (throttles poll-driven re-persist)
 	server      *http.Server // google loopback listener (closed on finish/expiry)
+	// wbState is the WorkBuddy upstream state (device flow). Kept separate from
+	// state (the Google nonce) because the account lookup needs it on every poll.
+	wbState string
+	// tok is the device-flow token once the upstream has issued it. The token
+	// is single-issue: it must survive across polls (2026-10-21 field bug).
+	tok *wbToken
+}
+
+// wbToken is the WorkBuddy device-flow token triplet.
+type wbToken struct {
+	access    string
+	refresh   string
+	expiresIn int64
+	domain    string
 }
 
 func (p *Panel) putFlow(key string, f *authFlow) {
@@ -422,6 +436,7 @@ func (p *Panel) handleWBStart(w http.ResponseWriter, r *http.Request) {
 	key := "w:" + st.State
 	p.putFlow(key, &authFlow{
 		channel: model.ChannelWorkBuddy, realm: realm, status: "pending",
+		wbState:   st.State,
 		expiresAt: time.Now().Add(oauthFlowTTL),
 	})
 	time.AfterFunc(oauthFlowTTL, func() { p.expireFlow(key) })
@@ -463,6 +478,14 @@ func (p *Panel) handleWBPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A previous poll may already hold the single-issue token (e.g. its account
+	// lookup timed out). Finish with it rather than asking the token endpoint
+	// again — upstream answers 11217 forever once the token has been issued.
+	if f.tok != nil {
+		p.finishWBAuth(w, key, f, *f.tok)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 	base := p.wbRealmBase(f.realm)
@@ -489,22 +512,52 @@ func (p *Panel) handleWBPoll(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "pending"})
 		return
 	}
+	// The device-flow token is issued ONCE: after this GET the upstream answers
+	// "11217 login ing..." forever, so a poll that fails between here and the
+	// account lookup used to lose the login outright (field report 2026-10-21:
+	// browser said 登录成功, the panel polled until 等待授权超时 and nothing was
+	// stored). Park the token on the flow first, then finish from it.
+	p.flowMu.Lock()
+	if live := p.flows[key]; live != nil {
+		live.tok = &wbToken{
+			access: tok.AccessToken, refresh: tok.RefreshToken,
+			expiresIn: tok.ExpiresIn, domain: tok.Domain,
+		}
+	}
+	p.flowMu.Unlock()
+	p.finishWBAuth(w, key, f, wbToken{
+		access: tok.AccessToken, refresh: tok.RefreshToken,
+		expiresIn: tok.ExpiresIn, domain: tok.Domain,
+	})
+}
+
+// finishWBAuth completes a WorkBuddy login with an already-issued token: it
+// fetches the account identity and stores the credential. The token may come
+// from this poll or from the flow (a previous poll that lost the identity
+// lookup) — the device-flow token cannot be fetched twice.
+func (p *Panel) finishWBAuth(w http.ResponseWriter, key string, f authFlow, tok wbToken) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	base := p.wbRealmBase(f.realm)
+	origin := wbRealmOrigin(f.realm)
 	var acct struct {
 		UID          string `json:"uid"`
 		EnterpriseID string `json:"enterpriseId"`
 		Nickname     string `json:"nickname"`
 	}
-	if acctData, aerr := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/login/account?state="+url.QueryEscape(req.State), origin, nil, tok.AccessToken); aerr == nil {
+	if acctData, aerr := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/login/account?state="+url.QueryEscape(f.wbState), origin, nil, tok.access); aerr == nil {
 		_ = json.Unmarshal(acctData, &acct)
 	}
 	if acct.UID == "" {
-		// uid is the stable identity; retry on the next poll until the TTL.
+		// uid is the stable identity and the token is already ours; keep the
+		// flow pending so the next poll retries the identity call with the
+		// parked token instead of throwing the login away.
 		writeJSON(w, http.StatusOK, map[string]any{"status": "pending"})
 		return
 	}
 	creds := map[string]any{
-		"access_token":  tok.AccessToken,
-		"refresh_token": tok.RefreshToken,
+		"access_token":  tok.access,
+		"refresh_token": tok.refresh,
 		"uid":           acct.UID,
 		"nickname":      acct.Nickname,
 		"realm":         f.realm,
@@ -512,8 +565,8 @@ func (p *Panel) handleWBPoll(w http.ResponseWriter, r *http.Request) {
 	if acct.EnterpriseID != "" {
 		creds["enterprise_id"] = acct.EnterpriseID
 	}
-	if tok.ExpiresIn > 0 {
-		creds["expires_at"] = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	if tok.expiresIn > 0 {
+		creds["expires_at"] = time.Now().Add(time.Duration(tok.expiresIn) * time.Second).Unix()
 	}
 	raw, _ := json.Marshal(creds)
 	acc, err := normalizeImport(model.ChannelWorkBuddy, raw, "")
@@ -563,11 +616,13 @@ func (p *Panel) wbCall(ctx context.Context, method, fullURL, origin string, body
 	}
 	resp, err := p.hc.Do(req)
 	if err != nil {
+		log.Printf("panel: workbuddy %s %s: transport: %v", method, fullURL, err)
 		return nil, fmt.Errorf("transport: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("panel: workbuddy %s %s: upstream %d body=%.120s", method, fullURL, resp.StatusCode, raw)
 		return nil, fmt.Errorf("upstream %d", resp.StatusCode)
 	}
 	if rerr != nil {

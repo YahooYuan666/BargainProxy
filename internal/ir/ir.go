@@ -38,6 +38,22 @@ func TextOf(parts []ContentPart) string {
 	return b.String()
 }
 
+// HasImages reports whether any message carries image data. Channels that are
+// text-only (the AutoClaw sandbox relay sends one text message and drops
+// everything else) must be skipped for these requests instead of silently
+// removing the image — a model that never received the image still answers,
+// which reads as "it saw a different picture" (2026-10-20).
+func HasImages(msgs []Message) bool {
+	for _, m := range msgs {
+		for _, p := range m.Content {
+			if p.Kind == "image" && (p.ImageB64 != "" || p.ImageMIME != "") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ToolCall is an assistant-issued function call. Arguments is a JSON string
 // (possibly partial during streaming).
 type ToolCall struct {

@@ -573,7 +573,7 @@ tr:last-child td{border-bottom:none}
             <span class="hint">开启后发往 CodeBuddy 的系统提示词替换为官方 CLI 指纹，降低风控暴露面。</span>
           </div>
           <div class="row">
-            <label class="chk"><input type="checkbox" id="setWbGlobal" style="width:auto" onchange="setGlobal(this.checked)"> WorkBuddy 国际版账号参与调度</label>
+            <label class="chk"><input type="checkbox" id="setWbGlobal" style="width:auto"> WorkBuddy 国际版账号参与调度</label>
             <span class="hint">默认关：国际版（Global）账号导入后不参与选号，打开才会入池。</span>
           </div>
           <div class="row">
@@ -2149,6 +2149,7 @@ async function saveSettings(){
   body.prompt_replace_enabled = document.getElementById('setPromptReplace').checked;
   body.include_disabled_in_tasks = document.getElementById('setIncludeDisabled').checked;
   body.thought_signature_replay = document.getElementById('setThoughtSigReplay').checked;
+  body.workbuddy_global = document.getElementById('setWbGlobal').checked;
   try { await api('settings', {method:'POST', body: JSON.stringify(body)}); toast('调度参数已保存（立即生效）'); refresh(); }
   catch(e){ toast('保存失败：' + e.message, true); }
 }

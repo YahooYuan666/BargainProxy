@@ -56,11 +56,41 @@ func (e *ErrNoCapacity) Error() string {
 	return fmt.Sprintf("pool: %s no available account (earliest reset %s)", e.Channel, e.EarliestReset.Format(time.RFC3339))
 }
 
+// ErrChannelBusy reports that the channel already has an account interacting
+// and single-active mode forbids starting a second one. It is deliberately
+// distinct from ErrNoCapacity: the pool is healthy and NOT waiting — the
+// caller should route to the next binding immediately. When every binding
+// answers this, the request fails as "parallel capacity exceeded" instead of
+// queueing (2026-10-20).
+type ErrChannelBusy struct {
+	Channel string
+	Account string // account currently interacting (label for the message)
+}
+
+func (e *ErrChannelBusy) Error() string {
+	if e.Account != "" {
+		return fmt.Sprintf("pool: %s is interacting as %s (one account per pool at a time)", e.Channel, e.Account)
+	}
+	return fmt.Sprintf("pool: %s is interacting (one account per pool at a time)", e.Channel)
+}
+
 // Params tunes pool behaviour.
 type Params struct {
 	MaxQueueWait time.Duration // max wait for a slot when all busy (sticky queue)
 	SessionTTL   time.Duration // sticky binding TTL
 	CostTTL      time.Duration // cost observation validity
+	// GlobalMaxInFlight caps how many tasks one WorkBuddy international
+	// (realm=global) account may run at once. That edge's risk control is
+	// tighter, so a global account runs below the CN ceiling even when the
+	// channel limit is higher. 0 disables the override. Default 2.
+	GlobalMaxInFlight int
+	// SingleActivePerChannel allows at most one account of a channel to be
+	// interacting at any time (2026-10-20). A second request does NOT wait and
+	// is not routed to a second account: it walks to the next binding. Using
+	// several accounts of one pool simultaneously is the pattern upstream risk
+	// control reads as unusual activity, and it is what got two accounts
+	// restricted in the field. Default true.
+	SingleActivePerChannel bool
 	// GreedyFloor clamps the seconds-to-reset divisor in the greedy burn-rate
 	// score (hot-settable; default 600s).
 	GreedyFloor time.Duration
@@ -74,6 +104,14 @@ type Params struct {
 	// machines are untouched. 0 disables the pause (still no rotation, still
 	// no account penalty). Default 45s.
 	UpstreamBusyCooldown time.Duration
+	// NotFoundPause is the channel+model shared pause applied when the upstream
+	// answers 404 (the path or model does not exist there). It is NOT an
+	// account state change: no cooldown, no failure count — the same request
+	// would 404 on every account of that channel. The pause only stops a
+	// request storm from hammering a dead route while the binding loop
+	// cascades to another channel. 0 disables the pause (still no penalty).
+	// Default 60s, matching the reference implementation's notFoundCooldown.
+	NotFoundPause time.Duration
 	// ModelRateHoldCap bounds a model-scoped rate-limit hold: the routing
 	// barrier ends at min(upstream reset, now+cap), so a request arriving
 	// after the cap probes upstream again instead of waiting out the full
@@ -127,6 +165,9 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 	if params.MaxQueueWait <= 0 {
 		params.MaxQueueWait = 120 * time.Second
 	}
+	if params.GlobalMaxInFlight <= 0 {
+		params.GlobalMaxInFlight = 2
+	}
 	if params.SessionTTL <= 0 {
 		params.SessionTTL = 30 * time.Minute
 	}
@@ -141,6 +182,9 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 	}
 	if params.UpstreamBusyCooldown <= 0 {
 		params.UpstreamBusyCooldown = 45 * time.Second
+	}
+	if params.NotFoundPause <= 0 {
+		params.NotFoundPause = 60 * time.Second
 	}
 	if params.ModelRateHoldCap <= 0 {
 		params.ModelRateHoldCap = 2 * time.Hour
@@ -247,6 +291,18 @@ func (p *Pool) limitFor(channel string) int {
 	return 2
 }
 
+// limitForAccount is limitFor with the per-realm override applied: WorkBuddy
+// international accounts run at a lower ceiling than CN ones because that
+// edge's risk control is tighter (misakano upstream keeps
+// pool.max_in_flight_global=2 for exactly this reason, 2026-10-21).
+func (p *Pool) limitForAccount(a *model.Account) int {
+	limit := p.limitFor(a.Channel)
+	if a.Realm == "global" && limit > p.params.GlobalMaxInFlight && p.params.GlobalMaxInFlight > 0 {
+		return p.params.GlobalMaxInFlight
+	}
+	return limit
+}
+
 // usableForModel reports whether the account can serve the model at all
 // right now (not disabled, realm-visible, not cooling). In-flight load is
 // deliberately excluded: a healthy-but-full account is waited for by its
@@ -317,6 +373,15 @@ func (p *Pool) NextAvailable(channel, modelName string) (bool, time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := p.params.Now()
+	// Channel+model pause (6021 queue-full, 404 dead route): the pre-flight
+	// gate must see it too. Acquire already fails fast on it, but this
+	// function is what the binding loop consults to decide whether to try the
+	// binding at all — reporting "available" here made the gateway commit to
+	// a paused route and only then discover the pause, which reads as a bogus
+	// no-capacity failure instead of a short wait.
+	if until, ok := p.channelBusyUntilLocked(channel, modelName, now); ok {
+		return false, until
+	}
 	var earliest time.Time
 	for _, id := range p.byChan[channel] {
 		a := p.accounts[id]
@@ -398,6 +463,18 @@ func (p *Pool) markChannelBusyLocked(channel, modelName string, until time.Time)
 	p.busyUntil[key] = until
 }
 
+// poolHolderNickname returns the nickname of the account currently
+// interacting on this channel (for the busy-refusal message). Callers must
+// hold the lock; "-" when unknown.
+func (p *Pool) poolHolderNickname(channel string) string {
+	for _, id := range p.byChan[channel] {
+		if a := p.accounts[id]; a != nil && p.inflight[id] > 0 {
+			return a.Nickname
+		}
+	}
+	return "-"
+}
+
 func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -406,6 +483,15 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 
 	if len(p.byChan[channel]) == 0 {
 		return nil, &ErrNoCapacity{Channel: channel}, false
+	}
+
+	// Single-active mode (2026-10-20): one account per pool may interact at a
+	// time. A second request is NOT queued on this pool and NOT sent to another
+	// account of the same pool — the caller routes to the next binding. This is
+	// the guard against the multi-account-at-once pattern upstream risk control
+	// treats as unusual activity.
+	if a, busy := p.activeAccountLocked(channel); busy {
+		return nil, &ErrChannelBusy{Channel: channel, Account: a.Nickname}, false
 	}
 
 	// Upstream capacity pause: while the channel+model pair is paused after a
@@ -428,7 +514,7 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 			a := p.accounts[b.accountID]
 			if a == nil || !p.usableForModel(a, modelName, now) || p.floorBlockedLocked(a, modelName, now) {
 				delete(p.sessions, key) // broken for this model: fall through and reselect
-			} else if p.inflight[a.ID] < p.limitFor(a.Channel) {
+			} else if p.inflight[a.ID] < p.limitForAccount(a) {
 				b.lastUsed = now
 				p.sessions[key] = b
 				return p.leaseLocked(a, now), nil, false
@@ -442,7 +528,18 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		}
 	}
 
-	// 2. Candidate selection by channel strategy.
+	// 2. Candidate selection by channel strategy. Single-active mode allows
+	// the account already interacting to take MORE work (up to max_in_flight)
+	// but forbids STARTING a second account — the "one account, 2-3 tasks"
+	// principle (2026-10-21). A candidate with zero in-flight would be a
+	// second account: exclude it while a holder exists.
+	holderActive := false
+	for _, id := range p.byChan[channel] {
+		if p.inflight[id] > 0 && p.accounts[id] != nil {
+			holderActive = true
+			break
+		}
+	}
 	var candidates []*model.Account
 	for _, id := range p.byChan[channel] {
 		a := p.accounts[id]
@@ -458,12 +555,21 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		if mc, ok := a.ModelCooldowns[modelName]; ok && now.Before(mc.Until) {
 			continue
 		}
-		if p.inflight[a.ID] >= p.limitFor(a.Channel) {
+		if p.inflight[a.ID] >= p.limitForAccount(a) {
 			continue // busy but healthy
+		}
+		if holderActive && p.params.SingleActivePerChannel && p.inflight[a.ID] == 0 {
+			continue // idle account = a SECOND account on this pool: forbidden
 		}
 		candidates = append(candidates, a)
 	}
 	if len(candidates) == 0 {
+		if holderActive && p.params.SingleActivePerChannel {
+			// The holder exists but has no free slot (or is unusable for this
+			// model). Refuse instead of queueing: the gateway walks to the
+			// next pool, and only a full walk ends as 并行数量超发.
+			return nil, &ErrChannelBusy{Channel: channel, Account: p.poolHolderNickname(channel)}, false
+		}
 		if p.hasHealthyButBusy(channel, modelName, now) {
 			return nil, nil, true // bounded wait for a slot
 		}
@@ -495,7 +601,7 @@ func (p *Pool) hasHealthyButBusy(channel, modelName string, now time.Time) bool 
 		if mc, ok := a.ModelCooldowns[modelName]; ok && now.Before(mc.Until) {
 			continue
 		}
-		if p.inflight[a.ID] >= p.limitFor(a.Channel) {
+		if p.inflight[a.ID] >= p.limitForAccount(a) {
 			return true
 		}
 	}
@@ -538,6 +644,53 @@ func (p *Pool) InFlight(id string) int {
 // InFlightLocked is InFlight for callers already holding the pool lock.
 func (p *Pool) InFlightLocked(id string) int {
 	return p.inflight[id]
+}
+
+// activeAccountLocked reports whether single-active mode currently forbids
+// starting work on this channel. The rule (2026-10-20 user principle, clarified
+// 2026-10-21) is: ONE account may interact per pool at a time, and THAT
+// ACCOUNT may run 2-3 tasks concurrently (max_in_flight still bounds it) —
+// a SECOND ACCOUNT is what is forbidden, because multi-account concurrency in
+// one pool is the pattern upstream risk control reads as unusual activity.
+// Callers must hold the lock.
+func (p *Pool) activeAccountLocked(channel string) (*model.Account, bool) {
+	if !p.params.SingleActivePerChannel {
+		return nil, false
+	}
+	// The account that holds the pool: anyone already interacting.
+	var holder *model.Account
+	for _, id := range p.byChan[channel] {
+		if p.inflight[id] > 0 {
+			if a := p.accounts[id]; a != nil {
+				holder = a
+				break
+			}
+		}
+	}
+	if holder == nil {
+		return nil, false
+	}
+	// The pool is open while the holder has spare in-flight slots: the next
+	// request (and its sticky session) may run ON THE SAME ACCOUNT. Only a
+	// request that cannot be served by the holder is refused, so it walks to
+	// the next pool instead of starting a second account here.
+	if p.inflight[holder.ID] < p.limitForAccount(holder) {
+		return nil, false
+	}
+	return holder, true
+}
+
+// ChannelBusy reports whether single-active mode currently forbids another
+// request on this channel, and names the account that holds it. The gateway
+// consults it before committing to a binding so a busy pool is skipped
+// immediately instead of turning into a no-capacity wait (2026-10-20).
+func (p *Pool) ChannelBusy(channel string) (bool, string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if a, ok := p.activeAccountLocked(channel); ok {
+		return true, a.Nickname
+	}
+	return false, ""
 }
 
 // SetGlobalEnabled toggles workbuddy international accounts. When off
@@ -665,6 +818,22 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// Grace self-heal: short stop instead of permanent disable; the
 		// refresh task will either fix it or the panel surfaces it.
 		a.AccountCooldownUntil = later(a.AccountCooldownUntil, now.Add(10*time.Minute))
+	case uperr.ClassAccountRestricted:
+		// The upstream has restricted this account (workbuddy 403 code=11140
+		// "request illegal" / "账号存在异常行为，已被限制使用"). No refresh can
+		// fix it, so the account leaves routing entirely: keeping it selectable
+		// is what made a pool of 3 accounts look dead while 1 was healthy
+		// (sticky conversations stayed bound to the banned ones). Disabled is
+		// the honest terminal state — the panel shows it and a human decides
+		// whether to re-login. Rotatable stays true, so this request retries
+		// another account of the same channel immediately.
+		a.Disabled = true
+		a.Paused = false
+		a.ConsecutiveFails = 0
+		a.BreakerFails = 0
+		if a.ModelCooldowns != nil {
+			delete(a.ModelCooldowns, model)
+		}
 	case uperr.ClassWAF:
 		a.AccountCooldownUntil = later(a.AccountCooldownUntil, now.Add(60*time.Second))
 	case uperr.ClassTransport:
@@ -672,6 +841,17 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		a.AccountCooldownUntil = later(a.AccountCooldownUntil, now.Add(backoffTransport(a.ConsecutiveFails)))
 	case uperr.ClassBadRequest, uperr.ClassContentBlocked, uperr.ClassSentinel:
 		// No account penalty: the account is fine, the payload was not.
+		return
+	case uperr.ClassNotFound:
+		// The path/model does not exist upstream. Not an account problem, so
+		// zero account penalty (previously this class did not exist and a 404
+		// became model_rate: the account lost that model for up to 2h). Pause
+		// the channel+model pair briefly so a storm of retries does not walk
+		// every account into the same dead route; the binding loop still
+		// cascades to another channel.
+		if d := p.params.NotFoundPause; d > 0 {
+			p.markChannelBusyLocked(a.Channel, model, now.Add(d))
+		}
 		return
 	case uperr.ClassUpstreamTimeout, uperr.ClassCanceled:
 		// Timeout / cancellation is never the account's fault (every account

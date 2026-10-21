@@ -209,6 +209,15 @@ func buildSOLOBody(call driver.ChatCall) ([]byte, error) {
 			}
 			wire["content"] = parts
 		}
+		if m.Role == ir.RoleTool && len(m.Content) == 0 {
+			// A tool result with no content: TRAE's SOLO endpoint answers
+			// 400 "the param is invalid" for an empty/absent content field
+			// on tool messages (field 2026-10-21, msg_5cdb126709 — the same
+			// session passed seconds earlier; the delta was a repaired
+			// pairing that left one tool result content-less). Give the
+			// upstream the empty-string content it expects.
+			wire["content"] = []map[string]any{{"type": "text", "text": "(no output)"}}
+		}
 		if len(m.ToolCalls) > 0 {
 			var tcs []map[string]any
 			for _, tc := range m.ToolCalls {
@@ -677,9 +686,13 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	case status == 429:
 		return uperr.New(uperr.ClassSoftRate, status, "trae: %s", truncate(body, 300))
 	case status == 404:
-		e := uperr.New(uperr.ClassModelRate, status, "trae: %s", truncate(body, 300))
-		e.ResetAt = time.Now().Add(60 * time.Second)
-		return e
+		// The path/model is missing upstream: identical on every account of
+		// this channel, so this is a binding property, not a rate limit. It
+		// used to be classified as model_rate (60s ResetAt), which cooled the
+		// account's model instead of just pausing the route (2026-10-19).
+		return uperr.New(uperr.ClassNotFound, status, "trae: %s", truncate(body, 300))
+	case status == 413:
+		return uperr.New(uperr.ClassBadRequest, status, "trae: %s", truncate(body, 300))
 	case status == 403:
 		return uperr.New(uperr.ClassWAF, status, "trae: %s", truncate(body, 300))
 	case status == 400:
@@ -857,6 +870,12 @@ func (d *Driver) Models(ctx context.Context) ([]string, error) {
 		"Doubao-Seed-2.1-Pro", "Doubao-Seed-2.1-Turbo", "Doubao-Seed-2.0-Code",
 		"seed-code-pro-0430",
 		"DeepSeek-V4-Flash", "DeepSeek-V4-Pro", "DeepSeek-V4-Flash-Official",
+		// Lower-case on purpose: TraeCode exposes this config_name verbatim and
+		// the upstream matches it exactly. Sending the title-cased V4 spelling
+		// makes Trae fall back to its default model, so the reply arrives from
+		// something that is not DeepSeek at all (2026-10-21, Trae2api-cn's
+		// model table documents the same constraint).
+		"deepseek-v4.1-flash",
 		"glm-5.2", "glm-5", "glm-5-turbo",
 		"kimi-k3", "kimi-k2.7-code", "kimi-k2.6",
 		"minimax-m3", "qwen-3.7-plus",

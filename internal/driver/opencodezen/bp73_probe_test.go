@@ -27,7 +27,14 @@ func TestTransientProbeErrClassification(t *testing.T) {
 		{"gate rejected", classifyHTTP(http.StatusForbidden, []byte(`{"error":{"type":"FreeTierError"}}`)), true},
 		// A plain 403 is an edge/WAF block (ClassWAF) — IP-scoped, transient.
 		{"other 403", classifyHTTP(http.StatusForbidden, []byte(`forbidden by policy`)), true},
-		{"model gone", classifyHTTP(http.StatusNotFound, []byte(`model not found`)), false},
+		// 2026-10-19: 404 now classifies as ClassNotFound and counts as
+		// transient for the probe. The free lane's routes move independently
+		// of model health (same reasoning as the gate 403 above): an edge or
+		// route change answering 404 says nothing about whether the model
+		// still exists, and retiring it would empty the route table over a
+		// path change. A model that is genuinely gone is still downgraded by
+		// the probe's definitive failures (bad request / explicit error).
+		{"model gone", classifyHTTP(http.StatusNotFound, []byte(`model not found`)), true},
 		{"bad request", classifyHTTP(http.StatusBadRequest, []byte(`bad`)), false},
 		{"plain error", errValue("boom"), false},
 	}

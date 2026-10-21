@@ -19,19 +19,18 @@ if not exist "%PGDATA%\PG_VERSION" (
 
 "%PGBIN%\pg_ctl.exe" -D "%PGDATA%" status >nul 2>&1
 if errorlevel 1 (
-  "%PGBIN%\pg_ctl.exe" -D "%PGDATA%" -l "%PGLOG%" -o "-p 55432 -c listen_addresses=127.0.0.1" start
-  if errorlevel 1 goto failed
-  echo [pg] started on 127.0.0.1:55432
+rem Start detached from this console: closing the launcher window must not
+rem deliver CTRL_CLOSE to postgres (that killed the DB at 2026-10-20 23:09).
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\pg\start-detached.ps1" -PgBin "%PGBIN%" -Data "%PGDATA%" -Log "%PGLOG%"
+if errorlevel 1 goto failed
+echo [pg] started on 127.0.0.1:55432
 ) else (
   echo [pg] already running on 127.0.0.1:55432
 )
 
-rem Create the application database if missing. Idempotent. Needs Go.
-where go >nul 2>nul
-if errorlevel 1 goto dsn
-go run ./scripts/pginit -dsn "postgres://bargainproxy@127.0.0.1:55432/postgres?sslmode=disable" -db bargainproxy
-
-:dsn
+rem The application database is created by the gateway itself on first run
+rem (store.EnsureDatabase), so this step needs no Go toolchain - boot autostart
+rem runs with a bare PATH (2026-10-21).
 echo [pg] ready. dsn: postgres://bargainproxy@127.0.0.1:55432/bargainproxy?sslmode=disable
 popd
 exit /b 0

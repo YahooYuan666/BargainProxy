@@ -14,7 +14,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -76,10 +78,7 @@ func (d *Driver) chatRelay(ctx context.Context, call driver.ChatCall, cr *Creds,
 	}
 	defer events.Body.Close()
 
-	sessionKey := strings.TrimSpace(call.Request.SessionKey)
-	if sessionKey == "" {
-		sessionKey = "main"
-	}
+	sessionKey := relaySessionKey(call.Request)
 	args := map[string]any{"sessionKey": sessionKey, "message": relayChatDirective + lastUserText(call.Request)}
 	if eff := strings.TrimSpace(call.Request.RequestedEffort); eff != "" {
 		args["thinking"] = eff
@@ -509,6 +508,31 @@ func (d *Driver) convertRelay(ctx context.Context, r io.Reader, runID, sessionKe
 		return nil, uperr.New(uperr.ClassTransport, 0, "autoclaw relay: stream ended without terminal signal")
 	}
 	return out, nil
+}
+
+// relaySessionKey returns the sandbox agent session key for a request. The
+// upstream agent keeps its own conversation state per key, so unrelated chats
+// MUST NOT share one: the old "main" fallback pooled every session into a
+// single agent context and answers/images crossed over between conversations
+// (2026-10-20). With no stable identity we mint a fresh key per request —
+// continuity is lost, contamination is not.
+func relaySessionKey(req *ir.ChatRequest) string {
+	if req != nil {
+		if k := strings.TrimSpace(req.SessionKey); k != "" {
+			return k
+		}
+	}
+	return relayRandomKey()
+}
+
+// relayRandomKey mints a per-request sandbox session key for requests that
+// carry no stable conversation identity.
+func relayRandomKey() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return fmt.Sprintf("sess-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }
 
 func lastUserText(req *ir.ChatRequest) string {

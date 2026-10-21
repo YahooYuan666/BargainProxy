@@ -29,33 +29,12 @@ if not exist "%ROOT%\bargainproxy.exe" (
   if errorlevel 1 goto failed
 )
 
-echo [3/4] panel password check...
-rem pgq prints the persisted hash as a JSON row; "null" (no rows) or empty
-rem output both mean the panel was never set up.
-set "PWHASH="
-for /f "usebackq delims=" %%i in (`go run ./scripts/pgq -dsn "%DSN%" -sql "SELECT value FROM settings WHERE key='panel_password_hash'" 2^>nul`) do set "PWHASH=%%i"
-if "%PWHASH%"=="" goto needpassword
-if "%PWHASH%"=="null" goto needpassword
-echo [ok] panel password already configured
+echo [3/4] panel state...
+rem The panel runs open (no password) in this build, so there is nothing to
+rem probe. The old password gate needed `go run` (absent from the boot PATH)
+rem and aborted the whole boot start when it could not decide (2026-10-21).
+echo [ok] panel open mode
 goto gateway
-
-:needpassword
-echo.
-echo   Panel is disabled until a password is set (otherwise http://127.0.0.1:13140/panel/ returns 404).
-set /p "BPPW=  Choose a panel password: "
-if "%BPPW%"=="" (
-  echo [error] empty password; run scripts\start-all.cmd again to retry.
-  goto failed
-)
-bargainproxy.exe -config config.json -set-password "%BPPW%"
-if errorlevel 1 goto failed
-echo [ok] panel password saved
-set "BPPW="
-rem A running gateway read its config (and the empty password) at startup, so
-rem it must be restarted to pick the new hash up — otherwise the panel stays
-rem 404 despite the saved password (found live in first-run testing).
-powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 13140 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { Stop-Process -Id $c.OwningProcess -Force }"
-ping -n 2 127.0.0.1 >nul
 
 :gateway
 echo [4/4] gateway on 127.0.0.1:13140...
@@ -63,15 +42,6 @@ rem netstat+findstr keeps this free of nested quoting (survives cmd /c from
 rem other shells, double-click, and scheduled tasks alike).
 netstat -ano | findstr /C::13140 | findstr /C:LISTENING >nul 2>nul
 if errorlevel 1 goto startgw
-rem Gateway is up, but a process started before the password was saved still
-rem serves a disabled panel (404) — restart it so the saved hash takes effect.
-powershell -NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri http://127.0.0.1:13140/panel/ -TimeoutSec 2 } catch { $c = $_.Exception.Response; if ($c -ne $null -and [int]$c.StatusCode -eq 404) { exit 1 } } ; exit 0"
-if errorlevel 1 (
-  echo [fix] running gateway predates the saved panel password; restarting it...
-  powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 13140 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) { Stop-Process -Id $c.OwningProcess -Force }"
-  ping -n 2 127.0.0.1 >nul
-  goto startgw
-)
 echo [ok] gateway already listening on 127.0.0.1:13140
 goto done
 

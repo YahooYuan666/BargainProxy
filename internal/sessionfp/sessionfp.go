@@ -56,12 +56,49 @@ func FromMessages(msgs []ir.Message) string {
 		case ir.RoleSystem:
 			system += textOf(m.Content)
 		case ir.RoleUser:
-			if firstUser == "" {
-				firstUser = textOf(m.Content)
+			if firstUser != "" {
+				continue
+			}
+			// Claude-Code-style clients prepend the same <system-reminder>
+			// skill/context blocks to EVERY conversation. Hashing the first
+			// user message verbatim therefore hands different conversations the
+			// same fingerprint (2026-10-20 field bug: two ZCode sessions got one
+			// conversation id, and the AutoClaw relay pooled both into its
+			// "main" sandbox session, so answers and images leaked across
+			// conversations). Use the first SUBSTANTIVE user text instead.
+			if t := stripReminders(textOf(m.Content)); strings.TrimSpace(t) != "" {
+				firstUser = t
 			}
 		}
 	}
+	if firstUser == "" {
+		// No substantive user text (a degenerate request or a harness-only
+		// prelude). A non-empty system prompt still identifies it; with
+		// neither, report "no identity" rather than inventing a shared key.
+		if strings.TrimSpace(system) == "" {
+			return ""
+		}
+		return Prefix(system, "")
+	}
 	return Prefix(system, firstUser)
+}
+
+// stripReminders removes <system-reminder>...</system-reminder> blocks, which
+// are harness boilerplate rather than conversation content.
+func stripReminders(s string) string {
+	for {
+		i := strings.Index(s, "<system-reminder>")
+		if i < 0 {
+			break
+		}
+		j := strings.Index(s[i:], "</system-reminder>")
+		if j < 0 {
+			s = s[:i]
+			break
+		}
+		s = s[:i] + s[i+j+len("</system-reminder>"):]
+	}
+	return strings.TrimSpace(s)
 }
 
 func textOf(parts []ir.ContentPart) string {

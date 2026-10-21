@@ -92,6 +92,43 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 `
 
+// EnsureDatabase creates the target database when the DSN points at a
+// database that does not exist yet. It connects to the maintenance database
+// ("postgres") on the same server, so first-run setup needs no client tools
+// (the portable distribution ships none) and no Go toolchain (boot autostart
+// runs the binary with a bare PATH — 2026-10-21).
+func EnsureDatabase(ctx context.Context, dsn string) error {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("parse dsn: %w", err)
+	}
+	target := cfg.Database
+	if target == "" || target == "postgres" {
+		return nil
+	}
+	admin := *cfg
+	admin.Database = "postgres"
+	conn, err := pgx.ConnectConfig(ctx, &admin)
+	if err != nil {
+		return fmt.Errorf("connect admin: %w", err)
+	}
+	defer conn.Close(ctx)
+	var exists bool
+	if err := conn.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)`, target).Scan(&exists); err != nil {
+		return fmt.Errorf("check database: %w", err)
+	}
+	if exists {
+		return nil
+	}
+	// Identifiers cannot be parameterized; the name comes from our own config,
+	// and is quoted here.
+	if _, err := conn.Exec(ctx, fmt.Sprintf(`CREATE DATABASE %q`, target)); err != nil {
+		return fmt.Errorf("create database %q: %w", target, err)
+	}
+	return nil
+}
+
 // OpenPostgres connects, applies the schema, and returns the store.
 func OpenPostgres(ctx context.Context, dsn string, box *cryptox.Box) (*Postgres, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)

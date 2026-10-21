@@ -42,6 +42,20 @@ type persistedFlow struct {
 	ErrMsg    string    `json:"err_msg,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
 	Created   time.Time `json:"created,omitempty"`
+	// WbState is the WorkBuddy device-flow state; the account lookup needs it
+	// on every poll, so it must survive a restart like the rest of the flow.
+	WbState string `json:"wb_state,omitempty"`
+	// Tok is the already-issued device-flow token. Upstream issues it once, so
+	// losing it to a restart loses the login entirely (2026-10-21).
+	Tok *persistedWbToken `json:"tok,omitempty"`
+}
+
+// persistedWbToken is the sealed device-flow token triplet.
+type persistedWbToken struct {
+	Access    string `json:"access"`
+	Refresh   string `json:"refresh,omitempty"`
+	ExpiresIn int64  `json:"expires_in,omitempty"`
+	Domain    string `json:"domain,omitempty"`
 }
 
 // persistFlow snapshots and seals the current state of a flow. Callers must
@@ -59,6 +73,13 @@ func (p *Panel) persistFlow(key string) {
 	snap := persistedFlow{
 		Channel: f.channel, Realm: f.realm, State: f.state, Status: f.status,
 		AccountID: f.accountID, ErrMsg: f.errMsg, ExpiresAt: f.expiresAt, Created: f.created,
+		WbState: f.wbState,
+	}
+	if f.tok != nil {
+		snap.Tok = &persistedWbToken{
+			Access: f.tok.access, Refresh: f.tok.refresh,
+			ExpiresIn: f.tok.expiresIn, Domain: f.tok.domain,
+		}
 	}
 	f.persistedAt = time.Now()
 	p.flowMu.Unlock()
@@ -149,9 +170,17 @@ func (p *Panel) loadPersistedFlows() {
 			p.dropPersistedFlow(key)
 			continue
 		}
-		p.flows[key] = &authFlow{
+		f := &authFlow{
 			channel: pf.Channel, realm: pf.Realm, state: pf.State, status: pf.Status,
 			accountID: pf.AccountID, errMsg: pf.ErrMsg, expiresAt: pf.ExpiresAt, created: pf.Created,
+			wbState: pf.WbState,
 		}
+		if pf.Tok != nil {
+			f.tok = &wbToken{
+				access: pf.Tok.Access, refresh: pf.Tok.Refresh,
+				expiresIn: pf.Tok.ExpiresIn, domain: pf.Tok.Domain,
+			}
+		}
+		p.flows[key] = f
 	}
 }

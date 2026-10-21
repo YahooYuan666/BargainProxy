@@ -157,8 +157,11 @@ var routedSpecs = map[string]tierRow{
 	"autoclaw|tdpsk_deepseek-v4-pro-202606":     {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "关闭 + high/max", ToolCall: true, Structured: true},
 	"autoclaw|tdpsk_deepseek-v4.1-flash-202606": {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
 	// Trae 免费用户折扣表：glm-5.3-flash 未单列，取客户端截图 0.06x（无折扣标签）。
-	"trae|glm-5.3-flash":  {Billing: "x0.06", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
-	"zcode|glm-5.3-flash": {Billing: "计划内额度", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	"trae|glm-5.3-flash": {Billing: "x0.06", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	// Trae 的 4.1-flash 折扣表（docs.trae.cn「内置模型限时折扣」）：免费忙时 x0.12 /
+	// 空闲 x0.06，付费会员全时段 x0.06。上游 config_name 必须是小写原样。
+	"trae|deepseek-v4.1-flash": {Billing: "免费忙时 x0.12 / 空闲 x0.06；付费会员 x0.06", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
+	"zcode|glm-5.3-flash":      {Billing: "计划内额度", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 }
 
 // mergeRouted appends route bindings that are not yet in the static catalog

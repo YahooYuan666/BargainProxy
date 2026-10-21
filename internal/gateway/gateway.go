@@ -178,11 +178,46 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		return emit(ev)
 	}
 	emitted := func() bool { return firstEvent }
+	busyCount := 0
+	attempted := false
 	for bi, binding := range bindings {
 		// The window is per binding: slow-to-first-byte channels (AutoClaw's
 		// sandbox relay) raise their own ceiling without making healthy quick
 		// channels wait longer (BP-71).
 		win := fbWaitFor(g.cfg.FallbackWait.D(), req, g.fbCeiling(binding.Channel))
+		if bi == len(bindings)-1 {
+			// The LAST binding has nowhere to cascade to, so a first-byte
+			// window can only hurt: it turns a slow-but-healthy upstream into a
+			// failure while the request's own header/idle watchdogs (300s) are
+			// the real safety net. This is what "widen AutoClaw" asks for —
+			// AutoClaw is usually the last resort, and its sandbox relay can
+			// legitimately prefill for minutes (2026-10-20).
+			win = 0
+		}
+		// Single-active mode: if this pool already has an account interacting,
+		// do not wait and do not use a second account — walk to the next pool.
+		// When every pool answers busy, the request ends as 并行数量超发.
+		if busy, who := g.pool.ChannelBusy(binding.Channel); busy {
+			busyCount++
+			lastErr = concurrencyError(binding.Channel, who)
+			continue
+		}
+		// Pre-flight mirrors the single-active rule: if this pool is already
+		// interacting, the preflight above reports "usable" (it only sees
+		// cooldowns), the request would commit and then bounce off Acquire.
+		// Skip here so the next binding gets tried (2026-10-21: the 11:06
+		// deepseek request ended as concurrency_exceeded on WorkBuddy alone
+		// although qoder was healthy).
+		// The AutoClaw relay carries exactly one text message to its sandbox
+		// agent and drops every other part. Sending an image request there does
+		// not fail — the model answers without the image, which the user reads
+		// as "it recognized a different picture" (2026-10-20). Skip the binding
+		// instead, so another channel that supports vision takes it.
+		if binding.Channel == model.ChannelAutoClaw && ir.HasImages(req.Messages) {
+			lastErr = uperr.New(uperr.ClassBadRequest, 400,
+				"autoclaw relay is text-only and cannot carry images; another channel is required")
+			continue
+		}
 		// Pre-flight availability gate (BP-64): do not queue on a channel
 		// that has nothing usable right now when another binding can serve.
 		// Structural blocks (empty pool, all disabled/paused, credit floor)
@@ -207,6 +242,7 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// behind a busy account (max_in_flight) burned its entire window
 		// waiting for a slot and cascaded without the upstream ever seeing it.
 		guardSeen := sentinelGuard(seen, g.cfg.Sentinels)
+		attempted = true
 		res, err := g.executeBinding(bctx, binding, req, guardSeen, win, bi > 0, emitted, tr)
 		if err == nil {
 			return res, nil
@@ -217,11 +253,31 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		}
 		ue, ok := uperr.As(err)
 		if ok && !uperr.Rotatable(ue.Class) {
-			// Timeout / cancellation may still try a different channel (the
-			// next binding is a different upstream), but only while nothing
-			// has reached the client (tickets 27/28).
-			if (ue.Class == uperr.ClassUpstreamTimeout || ue.Class == uperr.ClassCanceled) && !(req.Stream && firstEvent) {
-				continue
+			// Non-rotatable means "do not try another account of THIS channel",
+			// not "give up on every channel". A different channel is a
+			// different upstream and may well have the route:
+			//   - timeout / cancellation: the next upstream may be healthy;
+			//   - 404: this binding's path/model is missing, another provider
+			//     may still serve the same canonical model (2026-10-19);
+			//   - content-blocked: the rejection is THIS upstream's content
+			//     inspection, not a property of the request everywhere — a
+			//     ZCode refusal must hand the turn to WorkBuddy instead of
+			//     ending it as 400 (2026-10-21 field bug: a single-account
+			//     ZCode pool made "do not rotate within the pool" read as
+			//     "the request is dead", so glm-5.3-flash never reached the
+			//     healthy bindings behind it).
+			//   - bad-request: one upstream's strictness about a history shape
+			//     is not the request being globally invalid — the same session
+			//     answered 200 on qoder seconds before trae rejected it with
+			//     "the param is invalid" (msg_5cdb126709, 2026-10-21). Cascading
+			//     lets qoder finish the turn.
+			// All are only safe while nothing reached the client.
+			switch ue.Class {
+			case uperr.ClassUpstreamTimeout, uperr.ClassCanceled, uperr.ClassNotFound,
+				uperr.ClassContentBlocked, uperr.ClassSentinel, uperr.ClassBadRequest:
+				if !(req.Stream && firstEvent) {
+					continue
+				}
 			}
 			return nil, err
 		}
@@ -235,7 +291,26 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	if lastErr == nil {
 		lastErr = uperr.New(uperr.ClassInternal, 0, "no binding attempted")
 	}
+	if !attempted && busyCount > 0 {
+		// Every pool was already interacting; nothing was even dispatched.
+		// Say it plainly: this is a parallel-capacity refusal, not a broken
+		// upstream and not "no account available".
+		return nil, uperr.New(uperr.ClassConcurrencyExceeded, 429,
+			"并行数量超发：模型 %s 的所有号池当前都在处理其他请求（同时只允许一个账号交互），请稍后重试", req.Model)
+	}
 	return nil, lastErr
+}
+
+// concurrencyError renders the per-pool refusal. The gateway aggregates these
+// into the final 并行数量超发 error when no pool could take the request.
+func concurrencyError(channel, who string) *uperr.Error {
+	msg := "号池 " + channel + " 已有账号在交互"
+	if who != "" {
+		msg += "（" + who + "）"
+	}
+	ue := uperr.New(uperr.ClassConcurrencyExceeded, 429, "%s；同时只允许一个账号交互", msg)
+	ue.Channel = channel
+	return ue
 }
 
 // estimatePromptTokens is a coarse size estimate (chars/3 for text, a flat
@@ -446,10 +521,22 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		log.Printf("gateway: %s leg failed after %s: class=%s%s: %.160s",
 			binding.Channel, elapsed.Round(time.Millisecond), ue.Class, winNote, ue.Message)
 		g.pool.ApplyResult(lease.Account, req.Model, ue)
+		if ue.Class == uperr.ClassAccountRestricted {
+			// Say out loud that an account just left routing: otherwise the
+			// only trace is a disabled checkbox in the panel, and "the pool is
+			// broken" is indistinguishable from "two accounts got banned".
+			log.Printf("gateway: %s account %s (%s) disabled — upstream restricted it; re-login required: %.120s",
+				binding.Channel, lease.Account.ID, lease.Account.Nickname, ue.Message)
+		}
 		g.persistCreds(lease.Account)
 		lease.Release()
 		lastErr = streamErr
 		if !uperr.Rotatable(ue.Class) {
+			// Do not rotate accounts within THIS binding — but a downstream
+			// channel is a different upstream whose content inspection may
+			// accept what this one rejected. Return to the binding loop, which
+			// decides between cascade and surface (2026-10-21, same contract
+			// as the loop-level non-rotatable branch).
 			return nil, streamErr
 		}
 		if ctx.Err() != nil {
@@ -465,6 +552,12 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 }
 
 func (g *Gateway) classifyPoolError(err error, channel, modelName string) error {
+	// Race path: the channel turned busy between the pre-flight check and the
+	// lease. Same meaning — another pool may still take the request.
+	var cb *pool.ErrChannelBusy
+	if errors.As(err, &cb) {
+		return concurrencyError(cb.Channel, cb.Account)
+	}
 	var nc *pool.ErrNoCapacity
 	if errors.As(err, &nc) {
 		// Distinguish "every account is model-cooled for this model" from
@@ -710,6 +803,21 @@ func DescribeError(err error) (status int, class string, message string) {
 		return 503, ue.Class, "upstream queue full (capacity), retry shortly: " + ue.Message
 	case uperr.ClassWAF:
 		return 502, ue.Class, "upstream edge blocked the request: " + ue.Message
+	case uperr.ClassNotFound:
+		// The upstream has no such path/model. The client's remedy is to fix
+		// the model name (or the gateway's route table), so answer the honest
+		// 404 instead of a 429/500 that suggests "retry" or "gateway bug".
+		// Every channel was already tried when nothing had reached the client.
+		return 404, ue.Class, "upstream has no route for this model: " + ue.Message
+	case uperr.ClassAccountRestricted:
+		// The account was banned by upstream and has left routing. Answer 403
+		// (not 500): the client is not at fault, and retrying the same account
+		// is pointless — the panel now shows the disabled account.
+		return 403, ue.Class, "upstream restricted the account: " + ue.Message
+	case uperr.ClassConcurrencyExceeded:
+		// Every pool is serving someone else. 429 + the plain reason; queueing
+		// silently was the old behaviour and it looked like a hang.
+		return 429, ue.Class, ue.Message
 	default:
 		status := ue.Status
 		if status < 400 || status > 599 {
