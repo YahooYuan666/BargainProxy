@@ -1,18 +1,30 @@
-# Start portable PostgreSQL detached from the caller's console.
+# Start portable PostgreSQL so that the launcher window can close.
 #
-# Why detached: pg_ctl inherits the console of whoever launches it. When the
-# launcher window closes, Windows sends CTRL_CLOSE to every process on that
-# console and PostgreSQL dies with 0xC000013A while the gateway (its own
-# hidden console) survives — the panel then fails with "connection refused"
-# on 55432 (observed 2026-10-20). Start-Process -WindowStyle Hidden gives the
-# server its own console.
+# The two Windows traps, both observed in the field:
 #
-# Why no "-w": pg_ctl's ready-wait has proven unreliable here — the server
-# logged "ready to accept connections" and the port was listening, yet
-# "pg_ctl -w start" never returned and the launcher hung for minutes
-# (observed 2026-10-22: the first start-all after a stop always stalled at
-# the database step; the second one worked because the server was already
-# up). Readiness is decided by polling the port instead.
+# 1) Console inheritance kills the database. A process started from our console
+#    keeps that console attached; when the launcher window closes, Windows sends
+#    CTRL_CLOSE to everyone on it and PostgreSQL dies with 0xC000013A while the
+#    gateway (its own hidden console) survives. The panel then fails with
+#    "connection refused" on 55432 (2026-10-20).
+#
+# 2) pg_ctl's cmd wrapper keeps the window open. On Windows "pg_ctl start" runs
+#    the server through an intermediate "cmd.exe /D /C postgres.exe ...". That
+#    wrapper inherits the caller's console and lives as long as the server does,
+#    so the launcher window never closes even after start-all.cmd printed its
+#    last line (2026-10-22: a cmd.exe whose parent was long gone still held
+#    postgres.exe, and the console stayed open indefinitely). Starting
+#    postgres.exe directly is not an option either — it refuses to run as
+#    administrator ("Execution of PostgreSQL by a user with administrative
+#    permissions is not permitted"), which is exactly what pg_ctl's privilege
+#    drop handles for us.
+#
+# So pg_ctl stays, and the whole invocation is created through WMI
+# (Win32_Process.Create): that process has no parent console at all, so neither
+# it nor the cmd wrapper it spawns can hold ours. The call returns as soon as
+# the process is created (~130ms measured); readiness is decided by polling the
+# port, never by pg_ctl's own -w ready-wait (unreliable here: "ready to accept
+# connections" logged and the port listening, yet the wait never returned).
 param(
     [Parameter(Mandatory = $true)][string]$PgBin,
     [Parameter(Mandatory = $true)][string]$Data,
@@ -25,27 +37,25 @@ if (-not (Test-Path $pgctl)) {
     exit 1
 }
 
-# Quoting matters: -D/-l take paths, -o takes ONE argument containing spaces.
-$args = @(
-    '-D', "`"$Data`"",
-    '-l', "`"$Log`"",
-    '-o', '"-p 55432 -c listen_addresses=127.0.0.1"',
-    'start'
-)
+# Quote each path for the command line WMI will build.
+$cmdLine = '"{0}" -D "{1}" -l "{2}" -o "-p 55432 -c listen_addresses=127.0.0.1" start' -f $pgctl, $Data, $Log
 
-# No -Wait: Start-Process -Wait has been observed to never return here even
-# after pg_ctl.exe exited (2026-10-22, the launcher hung past its own 30s
-# deadline with no child process left). Poll the process ourselves.
-$p = Start-Process -FilePath $pgctl -ArgumentList $args -WindowStyle Hidden -PassThru
-$pgDeadline = (Get-Date).AddSeconds(40)
-while (-not $p.HasExited -and (Get-Date) -lt $pgDeadline) { Start-Sleep -Milliseconds 300 }
-if (-not $p.HasExited) { exit 1 }
-if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+try {
+    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine }
+} catch {
+    Write-Error "failed to create postgres starter: $_"
+    exit 1
+}
+if ($r.ReturnValue -ne 0) {
+    # 9 = path not found, 21 = invalid parameter; report the code, it is the
+    # only diagnostic Win32_Process.Create gives.
+    Write-Error "Win32_Process.Create failed with code $($r.ReturnValue); see $Log"
+    exit 1
+}
 
-# The server process is spawned; wait until it accepts connections.
 # A real TCP connect, not Get-NetTCPConnection: that cmdlet has hung forever
-# inside this detached script on this machine (2026-10-22) even though the
-# port was listening.
+# inside this detached script on this machine (2026-10-22) even though the port
+# was listening.
 function Test-PgReady {
     $tcp = $null
     try {
@@ -59,6 +69,7 @@ function Test-PgReady {
         if ($tcp) { $tcp.Close() }
     }
 }
+
 $deadline = (Get-Date).AddSeconds(30)
 while ((Get-Date) -lt $deadline) {
     if (Test-PgReady) { exit 0 }

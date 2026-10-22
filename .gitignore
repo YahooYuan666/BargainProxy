@@ -37,3 +37,4 @@
 # Other sessions' ad-hoc launch probes
 /.scratch_*.log
 /.scratch_*.ps1
+/.e2e.*
