@@ -1,6 +1,6 @@
-# Start portable PostgreSQL so that the launcher window can close.
+# Start portable PostgreSQL so the launcher window can close.
 #
-# The two Windows traps, both observed in the field:
+# Three Windows traps, all observed in the field:
 #
 # 1) Console inheritance kills the database. A process started from our console
 #    keeps that console attached; when the launcher window closes, Windows sends
@@ -12,19 +12,21 @@
 #    the server through an intermediate "cmd.exe /D /C postgres.exe ...". That
 #    wrapper inherits the caller's console and lives as long as the server does,
 #    so the launcher window never closes even after start-all.cmd printed its
-#    last line (2026-10-22: a cmd.exe whose parent was long gone still held
-#    postgres.exe, and the console stayed open indefinitely). Starting
-#    postgres.exe directly is not an option either — it refuses to run as
-#    administrator ("Execution of PostgreSQL by a user with administrative
-#    permissions is not permitted"), which is exactly what pg_ctl's privilege
-#    drop handles for us.
+#    last line (2026-10-22).
 #
-# So pg_ctl stays, and the whole invocation is created through WMI
-# (Win32_Process.Create): that process has no parent console at all, so neither
-# it nor the cmd wrapper it spawns can hold ours. The call returns as soon as
-# the process is created (~130ms measured); readiness is decided by polling the
-# port, never by pg_ctl's own -w ready-wait (unreliable here: "ready to accept
-# connections" logged and the port listening, yet the wait never returned).
+# 3) A pseudoconsole counts as a console too. Creating the wrapper through WMI
+#    (Win32_Process.Create) only avoids a classic console. Launched from Windows
+#    Terminal, the pseudoconsole is still inherited: the window stays open, and
+#    closing it kills the database (observed 2026-10-22 19:24 and 19:25 — the
+#    background worker died with 0xC000013A the moment the window was closed,
+#    and the next boot had to replay a crash recovery). Starting postgres.exe
+#    directly is not an option either: it refuses to run as administrator, which
+#    is exactly the check pg_ctl's privilege drop handles for us.
+#
+# The one flag that breaks the chain is DETACHED_PROCESS, and it has to be set
+# on pg_ctl's own parent. start-detached-helper.exe is that parent: a few lines
+# of Go that create pg_ctl with the flag and then wait for it. pg_ctl (without
+# -w) exits as soon as the server process exists, so the helper exits too.
 param(
     [Parameter(Mandatory = $true)][string]$PgBin,
     [Parameter(Mandatory = $true)][string]$Data,
@@ -32,30 +34,27 @@ param(
 )
 
 $pgctl = Join-Path $PgBin 'pg_ctl.exe'
-if (-not (Test-Path $pgctl)) {
-    Write-Error "pg_ctl not found: $pgctl"
-    exit 1
+$helper = Join-Path $PSScriptRoot 'start-detached-helper.exe'
+foreach ($need in @($pgctl, $helper)) {
+    if (-not (Test-Path $need)) {
+        Write-Error "required file missing: $need"
+        exit 1
+    }
 }
 
-# Quote each path for the command line WMI will build.
-$cmdLine = '"{0}" -D "{1}" -l "{2}" -o "-p 55432 -c listen_addresses=127.0.0.1" start' -f $pgctl, $Data, $Log
-
-try {
-    $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmdLine }
-} catch {
-    Write-Error "failed to create postgres starter: $_"
-    exit 1
-}
-if ($r.ReturnValue -ne 0) {
-    # 9 = path not found, 21 = invalid parameter; report the code, it is the
-    # only diagnostic Win32_Process.Create gives.
-    Write-Error "Win32_Process.Create failed with code $($r.ReturnValue); see $Log"
+# -o takes ONE argument containing spaces, so it is handed to the helper as a
+# single argv entry; the helper re-quotes it for pg_ctl.
+& $helper $pgctl '-D' $Data '-l' $Log '-o' '-p 55432 -c listen_addresses=127.0.0.1' start
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "pg_ctl start failed (exit $LASTEXITCODE); see $Log"
     exit 1
 }
 
 # A real TCP connect, not Get-NetTCPConnection: that cmdlet has hung forever
-# inside this detached script on this machine (2026-10-22) even though the port
-# was listening.
+# inside this script on this machine (2026-10-22) even though the port was
+# listening. The port opening is not the same as the server accepting queries
+# (crash recovery still runs), so this only proves the process came up; the
+# gateway retries the "starting up" state on its own.
 function Test-PgReady {
     $tcp = $null
     try {

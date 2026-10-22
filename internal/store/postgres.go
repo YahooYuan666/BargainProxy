@@ -8,11 +8,49 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"bargainproxy/internal/cryptox"
 	"bargainproxy/internal/model"
 )
+
+// startingUp reports the one error a freshly launched server gives while it
+// replays crash recovery: the port is already open, but no query is served
+// yet (SQLSTATE 57P03). Every other failure is reported as-is.
+func startingUp(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "57P03"
+}
+
+// sleepCtx waits, but gives up at once when the context is already done.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// connectReady dials and retries while the server answers "starting up".
+// pgx.ConnectConfig runs its startup queries immediately, so this is also
+// what proves the server can serve SQL, not merely accept TCP.
+func connectReady(ctx context.Context, cfg *pgx.ConnConfig) (*pgx.Conn, error) {
+	var last error
+	for {
+		conn, err := pgx.ConnectConfig(ctx, cfg)
+		if err == nil {
+			return conn, nil
+		}
+		last = err
+		if !startingUp(err) || !sleepCtx(ctx, time.Second) {
+			return nil, last
+		}
+	}
+}
 
 // Postgres is the PostgreSQL-backed store. Credentials are sealed with the
 // crypto envelope before touching the database. All statements use
@@ -108,7 +146,7 @@ func EnsureDatabase(ctx context.Context, dsn string) error {
 	}
 	admin := *cfg
 	admin.Database = "postgres"
-	conn, err := pgx.ConnectConfig(ctx, &admin)
+	conn, err := connectReady(ctx, &admin)
 	if err != nil {
 		return fmt.Errorf("connect admin: %w", err)
 	}
@@ -135,13 +173,32 @@ func OpenPostgres(ctx context.Context, dsn string, box *cryptox.Box) (*Postgres,
 	if err != nil {
 		return nil, fmt.Errorf("store: parse dsn: %w", err)
 	}
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("store: connect: %w", err)
+	// The launcher releases us the moment the port accepts TCP, which happens
+	// before crash recovery finishes. pgxpool connects lazily, so a ping here
+	// is the first real query — and a single "starting up" (57P03) used to kill
+	// the whole boot (2026-10-22 19:25). Retry that one state.
+	var pool *pgxpool.Pool
+	for {
+		pool, err = pgxpool.NewWithConfig(ctx, cfg)
+		if err == nil {
+			err = pool.Ping(ctx)
+		}
+		if err == nil || !startingUp(err) || ctx.Err() != nil {
+			break
+		}
+		if pool != nil {
+			pool.Close()
+			pool = nil
+		}
+		if !sleepCtx(ctx, time.Second) {
+			break
+		}
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("store: ping: %w", err)
+	if err != nil {
+		if pool != nil {
+			pool.Close()
+		}
+		return nil, fmt.Errorf("store: connect: %w", err)
 	}
 	if _, err := pool.Exec(ctx, DDL); err != nil {
 		pool.Close()
