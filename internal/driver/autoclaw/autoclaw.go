@@ -39,6 +39,23 @@ const (
 
 	defaultUserAPIBase = "https://autoglm-acceleration-api.zhipuai.cn"
 
+	// managedChatPath is AutoClaw's CN managed gateway (the AutoClaw 2.1.0
+	// account-points channel). It has NO "/v1" segment — a /v1 path answers
+	// 404 — and it takes the same X-Auth-* signature family the userapi calls
+	// use. Verified live 2026-10-21: 0.8-2.7s per call, images included.
+	managedChatPath = "/autoclaw-proxy/proxy/autoclaw/chat/completions"
+	// managedChannel/managedVersion identify the 2.1.0 desktop client that
+	// this gateway serves; a mismatch is refused.
+	managedChannel = "AutoClaw26"
+	managedVersion = "2.1.0"
+	// managedSystemPrompt is mandatory: the gateway checks that the caller
+	// speaks for the official client. It is prefixed onto the caller's own
+	// system message (or added as one when there is none).
+	managedSystemPrompt = "You are AutoClaw. Answer the user directly and concisely."
+
+	// proxyChatPath is the overseas direct channel. Kept for reference and
+	// tests; the CN managed gateway above carries production traffic
+	// (2026-10-21). A CN account's token is refused here with 401.
 	proxyChatPath    = "/autoclaw-proxy/proxy/autoclaw/v1/chat/completions"
 	sendCodePath     = "/userapi/v1/agent-send-code"
 	loginPath        = "/userapi/v1/agent-login/"
@@ -188,6 +205,104 @@ func userapiHeaders(token, secret string) http.Header {
 	return h
 }
 
+// managedChatHeaders builds the header family the CN managed gateway expects.
+// Distilled from a live 2.1.0 client (2026-10-21): the X-Auth-* signature is
+// mandatory (without it the gateway answers 401 "Invalid token"), and the
+// channel/version must name the 2.1.0 build this gateway serves.
+func managedChatHeaders(token, secret, model string) http.Header {
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	h.Set("Accept", "*/*")
+	h.Set("User-Agent", "AutoClaw/"+managedVersion+" (win-amd64)")
+	h.Set("X-Version", managedVersion)
+	h.Set("X-Tm", "win")
+	h.Set("X-Product", "autoclaw")
+	h.Set("X-Auth-Appid", appID)
+	h.Set("X-Auth-TimeStamp", ts)
+	h.Set("X-Auth-Sign", sign(ts, secret))
+	h.Set("X-Trace-Id", traceID())
+	h.Set("x_trace_id", "autoclaw-desktop")
+	h.Set("X-Lang", "zh-CN")
+	h.Set("X-Channel", managedChannel)
+	h.Set("X-Client-Type", "pc")
+	h.Set("X-Request-Model", model)
+	h.Set("X-Request-Id", traceID())
+	h.Set("X-Agent-Id", "main")
+	h.Set("Origin", "http://localhost:18432")
+	h.Set("Referer", "http://localhost:18432/")
+	if token != "" {
+		h.Set("X-Authorization", token)
+	}
+	return h
+}
+
+// managedBody rewrites the IR-built body into what the CN managed gateway
+// takes: the official system prompt is mandatory, and max_tokens /
+// max_completion_tokens are refused outright (verified 2026-10-21).
+func managedBody(body []byte, modelID string) ([]byte, error) {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, err
+	}
+	obj["model"] = modelID
+	delete(obj, "max_tokens")
+	delete(obj, "max_completion_tokens")
+	delete(obj, "user")
+
+	msgs, _ := obj["messages"].([]any)
+	prefixed := false
+	if len(msgs) > 0 {
+		if first, ok := msgs[0].(map[string]any); ok {
+			if role, _ := first["role"].(string); role == "system" {
+				// Prefix inside the caller's own system message: adding a
+				// second system message is refused.
+				switch c := first["content"].(type) {
+				case string:
+					first["content"] = managedSystemPrompt + "\n\n" + c
+					prefixed = true
+				case []any:
+					parts := make([]any, 0, len(c)+1)
+					parts = append(parts, map[string]any{"type": "text", "text": managedSystemPrompt})
+					first["content"] = append(parts, c...)
+					prefixed = true
+				}
+			}
+		}
+	}
+	if !prefixed {
+		obj["messages"] = append([]any{map[string]any{"role": "system", "content": managedSystemPrompt}}, msgs...)
+	}
+	return json.Marshal(obj)
+}
+
+// chatManaged performs one call on the CN managed gateway.
+func (d *Driver) chatManaged(ctx context.Context, cr *Creds, body []byte, modelID string) (*http.Response, error) {
+	wire, err := managedBody(body, modelID)
+	if err != nil {
+		return nil, uperr.New(uperr.ClassBadRequest, 400, "autoclaw managed body: %v", err)
+	}
+	secret := d.cfg.AppSecret
+	if secret == "" {
+		return nil, uperr.New(uperr.ClassInternal, 0, "autoclaw: channels.autoclaw.app_secret is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.base()+managedChatPath, bytes.NewReader(wire))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = managedChatHeaders(cr.bearer(), secret, modelID)
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "autoclaw managed: %v", err)
+	}
+	if resp.StatusCode >= 400 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		return nil, classifyHTTP(resp.StatusCode, raw)
+	}
+	return resp, nil
+}
+
 func proxyChatHeaders(token, model string) http.Header {
 	h := http.Header{}
 	h.Set("Accept", "application/json, text/plain, */*")
@@ -280,22 +395,22 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "autoclaw: %v", err)
 	}
-	resp, err := d.chatProxy(ctx, cr, body, modelID)
+	// The CN managed gateway is the production path since 2026-10-21: it
+	// answers in 0.8-2.7s and carries images. The overseas direct channel
+	// refuses a CN token (401) and the sandbox OpenAI endpoint is not enabled
+	// (404), so neither is tried first any more. The sandbox relay stays as a
+	// last resort only when explicitly re-enabled (channels.autoclaw.relay),
+	// because it is 5-38s slower and cannot see images at all.
+	resp, err := d.chatManaged(ctx, cr, body, modelID)
 	if err != nil {
-		log.Printf("autoclaw: proxy path unavailable: %v", err)
-		var serr error
-		resp, serr = d.chatSandbox(ctx, call.Account, cr, body, modelID)
-		if serr != nil {
-			// Current deployments: the userapi proxy is WAF-blocked (406) and
-			// the sandbox OpenAI endpoint is not enabled (404). The sandbox
-			// relay is the practical path; auth/credit/rate failures are
-			// terminal and must not be retried through it.
-			log.Printf("autoclaw: sandbox chat path unavailable: %v", serr)
-			if relayFallbackAllowed(serr) {
-				return d.chatRelay(ctx, call, cr, emit)
-			}
-			return nil, serr
+		log.Printf("autoclaw: managed gateway unavailable: %v", err)
+		if !d.cfg.RelayEnabled {
+			return nil, err
 		}
+		if re, ok := uperr.As(err); ok && !relayFallbackAllowed(re) {
+			return nil, err
+		}
+		return d.chatRelay(ctx, call, cr, emit)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

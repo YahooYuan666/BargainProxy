@@ -127,8 +127,46 @@ func (p *Panel) finishFlow(key, status, accountID, errMsg string) {
 	p.persistFlow(key)
 }
 
-func (p *Panel) expireFlow(key string) {
-	p.finishFlow(key, "failed", "", "等待授权超时，请重新发起")
+func (p *Panel) expireFlow(key string) { p.expireFlowAt(key, time.Time{}) }
+
+// expireFlowAt fails the flow once its (sliding) expiry passes. The original
+// implementation fired blindly oauthFlowTTL after start: a user who needed
+// more than five minutes in the browser (password, verification) got
+// 等待授权超时 even though the upstream had already issued the token — and
+// unlike a token loss, that failure is final. The timer now re-arms while the
+// flow's expiry keeps sliding (active polls, bounded by flowMaxLifetime) and
+// only fires when the flow is genuinely expired (misakano parity, field
+// report 2026-10-22).
+func (p *Panel) expireFlowAt(key string, created time.Time) {
+	p.flowMu.Lock()
+	f := p.flows[key]
+	if f == nil {
+		p.flowMu.Unlock()
+		return
+	}
+	if f.status != "pending" {
+		p.flowMu.Unlock()
+		return
+	}
+	expiry := f.expiresAt
+	born := f.created
+	if born.IsZero() {
+		born = created
+	}
+	p.flowMu.Unlock()
+	if wait := time.Until(expiry); wait > 0 {
+		time.AfterFunc(wait+time.Second, func() { p.expireFlowAt(key, born) })
+		return
+	}
+	// Expiry has passed — but only fail if no poll slid it forward in the
+	// meantime (touchFlow updates expiresAt under the same lock).
+	p.flowMu.Lock()
+	f = p.flows[key]
+	still := f != nil && f.status == "pending" && !time.Now().Before(f.expiresAt)
+	p.flowMu.Unlock()
+	if still {
+		p.finishFlow(key, "failed", "", "等待授权超时，请重新发起")
+	}
 }
 
 // shutdownServerAsync gracefully stops a loopback listener. Close (not
@@ -182,7 +220,7 @@ func (p *Panel) handleGoogleStart(w http.ResponseWriter, r *http.Request) {
 		channel: model.ChannelAntigravity, state: state, status: "pending",
 		expiresAt: time.Now().Add(oauthFlowTTL), server: hs,
 	})
-	time.AfterFunc(oauthFlowTTL, func() { p.expireFlow(key) })
+	time.AfterFunc(oauthFlowTTL, func() { p.expireFlowAt(key, time.Now()) })
 
 	q := url.Values{
 		"client_id":     {clientID},
@@ -439,13 +477,72 @@ func (p *Panel) handleWBStart(w http.ResponseWriter, r *http.Request) {
 		wbState:   st.State,
 		expiresAt: time.Now().Add(oauthFlowTTL),
 	})
-	time.AfterFunc(oauthFlowTTL, func() { p.expireFlow(key) })
+	time.AfterFunc(oauthFlowTTL, func() { p.expireFlowAt(key, time.Now()) })
+	// The panel page polls on its own, but that loop has been observed to
+	// silently stop (2026-10-22: the dialog said 自动检测中 while not a single
+	// poll reached the gateway). Watch from the gateway side too, so a login
+	// completes without depending on the browser tab staying alive.
+	go p.watchWBFlow(key)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"auth_url": st.AuthURL,
 		"state":    st.State,
 		"realm":    realm,
 	})
 }
+
+// watchWBFlow polls the upstream for one device flow until it completes or
+// expires. It reuses handleWBPoll's logic by driving the same flow key.
+func (p *Panel) watchWBFlow(key string) {
+	deadline := time.Now().Add(flowMaxLifetime)
+	for time.Now().Before(deadline) {
+		time.Sleep(4 * time.Second)
+		f, ok := p.getFlow(key)
+		if !ok || f.status != "pending" {
+			return // completed, failed, or expired
+		}
+		p.wbAdvance(key, f)
+	}
+}
+
+// wbAdvance runs one token/account check for a pending flow, exactly like a
+// panel poll does, but without an HTTP response to write.
+func (p *Panel) wbAdvance(key string, f authFlow) {
+	if f.tok != nil {
+		p.finishWBAuth(nopWriter{}, key, f, *f.tok)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	base := p.wbRealmBase(f.realm)
+	origin := wbRealmOrigin(f.realm)
+	data, err := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(f.wbState), origin, nil, "")
+	if err != nil {
+		return // pending or transient; the next round retries
+	}
+	var tok struct {
+		AccessToken  string `json:"accessToken"`
+		RefreshToken string `json:"refreshToken"`
+		ExpiresIn    int64  `json:"expiresIn"`
+		Domain       string `json:"domain"`
+	}
+	if json.Unmarshal(data, &tok) != nil || tok.AccessToken == "" {
+		return
+	}
+	parked := wbToken{access: tok.AccessToken, refresh: tok.RefreshToken, expiresIn: tok.ExpiresIn, domain: tok.Domain}
+	p.flowMu.Lock()
+	if live := p.flows[key]; live != nil {
+		live.tok = &parked
+	}
+	p.flowMu.Unlock()
+	p.finishWBAuth(nopWriter{}, key, f, parked)
+}
+
+// nopWriter discards the JSON a flow completion writes for the panel poll.
+type nopWriter struct{}
+
+func (nopWriter) Header() http.Header         { return http.Header{} }
+func (nopWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (nopWriter) WriteHeader(int)             {}
 
 func (p *Panel) handleWBPoll(w http.ResponseWriter, r *http.Request) {
 	var req struct {
@@ -540,13 +637,9 @@ func (p *Panel) finishWBAuth(w http.ResponseWriter, key string, f authFlow, tok 
 	defer cancel()
 	base := p.wbRealmBase(f.realm)
 	origin := wbRealmOrigin(f.realm)
-	var acct struct {
-		UID          string `json:"uid"`
-		EnterpriseID string `json:"enterpriseId"`
-		Nickname     string `json:"nickname"`
-	}
+	var acct wbAccountInfo
 	if acctData, aerr := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/login/account?state="+url.QueryEscape(f.wbState), origin, nil, tok.access); aerr == nil {
-		_ = json.Unmarshal(acctData, &acct)
+		acct = parseWBAccount(acctData)
 	}
 	if acct.UID == "" {
 		// uid is the stable identity and the token is already ours; keep the
@@ -637,7 +730,58 @@ func (p *Panel) wbCall(ctx context.Context, method, fullURL, origin string, body
 		return nil, fmt.Errorf("decode envelope")
 	}
 	if env.Code != 0 {
+		log.Printf("panel: workbuddy %s %s: upstream code=%d msg=%s", method, fullURL, env.Code, env.Msg)
 		return nil, &wbBizError{code: env.Code, msg: env.Msg}
 	}
+	log.Printf("panel: workbuddy %s %s: ok", method, fullURL)
 	return env.Data, nil
+}
+
+// wbAccountInfo is the identity the device flow returns for the logged-in
+// account.
+type wbAccountInfo struct {
+	UID          string
+	EnterpriseID string
+	Nickname     string
+}
+
+// parseWBAccount accepts both account-endpoint shapes the upstream serves:
+//
+//	flat:    {"uid":"…","nickname":"…","enterpriseId":"…"}
+//	list:    {"accounts":[{"uid":"…","nickname":"…","lastLogin":true,…}, …]}
+//
+// The list shape appeared on the international edge (field capture
+// 2026-10-22, uid c71ff2d7…): the flat decoder read nothing, so the panel
+// polled forever. The list picks the account flagged lastLogin, else the
+// first one. The flat shape stays supported (it is what the CN edge returns).
+func parseWBAccount(data json.RawMessage) wbAccountInfo {
+	var flat struct {
+		UID          string `json:"uid"`
+		EnterpriseID string `json:"enterpriseId"`
+		Nickname     string `json:"nickname"`
+	}
+	_ = json.Unmarshal(data, &flat)
+	if flat.UID != "" {
+		return wbAccountInfo{UID: flat.UID, EnterpriseID: flat.EnterpriseID, Nickname: flat.Nickname}
+	}
+	var list struct {
+		Accounts []struct {
+			UID          string `json:"uid"`
+			EnterpriseID string `json:"enterpriseId"`
+			Nickname     string `json:"nickname"`
+			LastLogin    bool   `json:"lastLogin"`
+		} `json:"accounts"`
+	}
+	_ = json.Unmarshal(data, &list)
+	for _, a := range list.Accounts {
+		if a.LastLogin && a.UID != "" {
+			return wbAccountInfo{UID: a.UID, EnterpriseID: a.EnterpriseID, Nickname: a.Nickname}
+		}
+	}
+	for _, a := range list.Accounts {
+		if a.UID != "" {
+			return wbAccountInfo{UID: a.UID, EnterpriseID: a.EnterpriseID, Nickname: a.Nickname}
+		}
+	}
+	return wbAccountInfo{}
 }

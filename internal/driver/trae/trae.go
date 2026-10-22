@@ -37,7 +37,18 @@ const (
 	deviceBrand    = "83DG"
 	osVersion      = "Windows 11 Pro"
 	functionSOLO   = "solo_work_lite"
+
+	// functionsTrae is the ladder of SOLO functions, tried in order. A model
+	// or tool set that one function refuses is often taken by the next: the
+	// upstream answers 400 with a business code (4001/4023/1005) rather than
+	// "this model does not exist", so the caller must walk the ladder instead
+	// of failing the turn (magpie-community/plugins packages/trae, 2026-10-21;
+	// field 2026-10-21 msg_5cdb126709: same session answered 200 seconds
+	// earlier on a different function).
 )
+
+// functionsTrae is the ordered ladder; the first entry is the preferred one.
+var functionsTrae = []string{functionSOLO, "chat_v3", "solo_agent", "solo_agent_lite"}
 
 // Creds is the persisted credential shape for a trae account.
 type Creds struct {
@@ -131,13 +142,30 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
-	body, err := buildSOLOBody(call)
-	if err != nil {
-		return nil, uperr.New(uperr.ClassBadRequest, 400, "trae: build body: %v", err)
+	// Walk the SOLO function ladder: an upstream 400 whose business code says
+	// "this function does not take this payload" is retried on the next
+	// function, not reported as a bad request (relay parity, 2026-10-21).
+	var resp *ir.ChatResponse
+	var lastBody []byte
+	lastFn := functionsTrae[0]
+	for _, fn := range functionsTrae {
+		body, berr := buildSOLOBody(call, fn)
+		if berr != nil {
+			return nil, uperr.New(uperr.ClassBadRequest, 400, "trae: build body: %v", berr)
+		}
+		lastBody, lastFn = body, fn
+		resp, err = d.chatOnce(ctx, creds, body, call, emit)
+		if err == nil {
+			return resp, nil
+		}
+		if !traeWrongFunction(err) || ctx.Err() != nil {
+			break
+		}
+		log.Printf("trae: function %s refused the payload (%v); trying the next", fn, err)
 	}
-	resp, err := d.chatOnce(ctx, creds, body, call, emit)
 	if err == nil {
-		return resp, nil
+		// The ladder was empty: nothing was attempted.
+		return nil, uperr.New(uperr.ClassInternal, 0, "trae: no function attempted")
 	}
 	// Self-heal (ticket 37): the upstream rejects a stale/rotated JWT with
 	// code=1001 ("not able to authenticate you") while the ug endpoints keep
@@ -149,6 +177,11 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		if rerr := d.refreshToken(ctx, call.Account, true); rerr == nil {
 			log.Printf("trae: token refresh ok (acct=%s), retrying chat", call.Account.ID)
 			if nc, perr := ParseCreds(call.Account.CredsJSON); perr == nil {
+				body, berr := buildSOLOBody(call, lastFn)
+				if berr != nil {
+					return nil, err
+				}
+				_ = lastBody
 				return d.chatOnce(ctx, nc, body, call, emit)
 			}
 		} else {
@@ -190,7 +223,7 @@ func (d *Driver) chatOnce(ctx context.Context, creds *Creds, body []byte, call d
 
 // buildSOLOBody converts the IR request into the SOLO chat body:
 // {messages, function:"solo_work_lite", stream:true, model}.
-func buildSOLOBody(call driver.ChatCall) ([]byte, error) {
+func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 	req := call.Request
 	var messages []map[string]any
 	for _, m := range req.Messages {
@@ -247,7 +280,7 @@ func buildSOLOBody(call driver.ChatCall) ([]byte, error) {
 	}
 	body := map[string]any{
 		"messages": messages,
-		"function": functionSOLO,
+		"function": function,
 		"stream":   true, // forced
 		"model":    call.UpstreamModel,
 	}
@@ -655,6 +688,29 @@ func detectError(payload string) (int, string, bool) {
 	return code, doc.Message, true
 }
 
+// traeWrongFunction reports whether the failure means "this SOLO function
+// will not take this payload", which is retried on the next function rather
+// than shown to the caller. The upstream uses the same 400 for a model it
+// does not serve on that function (code 4001/4023) and for a plan that cannot
+// use it (1005); neither is the request being invalid everywhere
+// (magpie-community/plugins packages/trae, 2026-10-21).
+func traeWrongFunction(err error) bool {
+	ue, ok := uperr.As(err)
+	if !ok || ue.Class != uperr.ClassBadRequest && ue.Class != uperr.ClassSoftRate {
+		return false
+	}
+	msg := ue.Message
+	for _, code := range []string{"4001", "4023", "1005"} {
+		if strings.Contains(msg, "code="+code) || strings.Contains(msg, code+":") {
+			return true
+		}
+	}
+	// A plain "the param is invalid" 400 from this endpoint is the function
+	// refusing the shape more often than not; walking the ladder costs one
+	// cheap request and a wrong guess is still bounded by it.
+	return strings.Contains(strings.ToLower(msg), "param is invalid")
+}
+
 func classifyBusiness(code int, msg string) *uperr.Error {
 	switch code {
 	case 1001:
@@ -669,8 +725,12 @@ func classifyBusiness(code int, msg string) *uperr.Error {
 	case 4001:
 		// Upstream rejected the payload shape ("bad request: json: cannot
 		// unmarshal …"): the account is fine, the body was not — no penalty,
-		// no rotation (mirrors workbuddy's 11101).
-		return uperr.New(uperr.ClassBadRequest, 400, "trae: %s", msg)
+		// no rotation (mirrors workbuddy's 11101). The code stays in the
+		// message so the caller can tell a function refusal (retried on the
+		// next ladder rung) from a genuinely broken payload.
+		e := uperr.New(uperr.ClassBadRequest, 400, "trae: code=4001 %s", msg)
+		e.Code = "4001"
+		return e
 	default:
 		return uperr.New(uperr.ClassInternal, 200, "trae: code=%d %s", code, msg)
 	}

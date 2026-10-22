@@ -51,6 +51,16 @@ label.chk input{width:auto}
 .view{padding:20px 24px 60px;max-width:1500px;width:100%;margin:0 auto}
 .view[hidden]{display:none}
 
+/* 源码更新提醒条（BP-88）：一行、可关闭、不与任何数据争夺注意力 */
+.updbar{display:flex;align-items:center;gap:10px;padding:9px 24px;font-size:12.5px;
+  color:var(--ink);background:color-mix(in srgb,var(--accent) 12%,var(--surface));
+  border-bottom:1px solid color-mix(in srgb,var(--accent) 35%,var(--line))}
+.updbar[hidden]{display:none}
+.updbar-ico{color:var(--accent);font-weight:700}
+.updbar-txt{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.updbar .grow{flex:1}
+.updbar-link{color:var(--accent);white-space:nowrap;text-decoration:underline}
+
 /* ── KPI 卡 ───────────────────────────────────────────── */
 .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:18px}
 .stat{background:var(--surface);border:1px solid var(--line);border-radius:11px;padding:14px 16px}
@@ -191,6 +201,16 @@ tr:last-child td{border-bottom:none}
       <button onclick="logout()">退出</button>
     </div>
 
+    <!-- 源码更新提醒条（BP-88）：只在"确有更新"或"本机构建但上游有新提交"
+         时出现；离线/已最新/本机构建无差异一律不占位，避免打扰。 -->
+    <div class="updbar" id="updBar" hidden>
+      <span class="updbar-ico">↑</span>
+      <span class="updbar-txt" id="updTxt"></span>
+      <span class="grow"></span>
+      <a class="updbar-link" id="updLink" href="#" target="_blank" rel="noopener noreferrer">去 GitHub 看看</a>
+      <button class="xs" onclick="dismissUpdate()">知道了</button>
+    </div>
+
     <!-- ══ 账号池视图（按渠道过滤）══ -->
     <section class="view" id="view-accounts">
       <div class="stats" id="kpiStats"></div>
@@ -200,6 +220,7 @@ tr:last-child td{border-bottom:none}
           <span class="grow"></span>
           <span class="note" id="accNote"></span>
         </header>
+        <div class="note" id="deadNote" style="display:none;padding:8px 12px;color:#e0a03a"></div>
         <div class="tbl-wrap">
           <table id="accounts"><thead><tr>
             <th>状态</th><th>账号</th><th>渠道</th><th>额度 / 窗口</th><th>冷却</th><th>在途</th><th style="width:190px">操作</th>
@@ -632,6 +653,29 @@ tr:last-child td{border-bottom:none}
           <div class="hint" id="svcState" style="margin-top:8px"></div>
         </div>
       </div>
+      <div class="box">
+        <header><h3>关于 / 源码更新（只提示，不会自动升级）</h3></header>
+        <div style="padding:14px 16px;display:grid;gap:12px">
+          <div class="row" style="display:flex;gap:18px;flex-wrap:wrap">
+            <span class="hint">当前程序：<span class="mono" id="verBuild">—</span></span>
+            <span class="hint">GitHub 最新：<span class="mono" id="verRemote">—</span></span>
+            <span class="hint">上次检查：<span id="verChecked">—</span></span>
+          </div>
+          <div class="hint" id="verSummary">还没有检查过。</div>
+          <div class="row">
+            <label class="chk"><input type="checkbox" id="verAuto" style="width:auto" onchange="setUpdateAuto(this.checked)">
+              自动检查（每 6 小时一次，只读查询，默认开）</label>
+          </div>
+          <div class="row" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <button onclick="checkUpdateNow()">立即检查</button>
+            <a class="hint" id="verRepo" href="#" target="_blank" rel="noopener noreferrer" style="text-decoration:underline">打开 GitHub 仓库</a>
+          </div>
+          <div class="hint">
+            这个项目只发布源码，没有可直接下载的安装包，所以这里<b>只提醒、不自动升级</b>：看到提示后请自行到 GitHub 拉取或重新编译。
+            本机带着未提交改动编译出来的程序无法判断是否落后，会如实显示"无法判断"，不会谎报有新版本。
+          </div>
+        </div>
+      </div>
     </section>
   </div>
 </div>
@@ -862,6 +906,7 @@ async function refresh(){
   try {
     const st = await api('state');
     allAccounts = st.accounts || [];
+    renderDeadModels(st.dead_models);
     document.getElementById('subMeta').textContent = `${allAccounts.length} 账号 · ${st.service||''}`;
     // nav counters; openaicompat stays hidden when nothing is configured.
     const byChan = {};
@@ -901,7 +946,82 @@ async function refresh(){
     await Promise.all([loadTasks(), loadLogs()]);
     if (!document.getElementById('view-usage').hidden) await loadUsage();
     if (!document.getElementById('view-tiers').hidden) await loadTiers();
+    loadVersion();          // 更新提醒条 + 关于卡片（读缓存，不发网络请求）
   } catch(e){ toast('加载失败：' + e.message, true); }
+}
+
+/* ── 源码更新提醒（BP-88）────────────────────────────────
+   只提示，不下载、不替换、不重启。四种状态里只有两种会显示提醒条：
+     behind  干净构建且上游确实更新了   → 提示有新提交
+     local_build + 上游与基准提交不同   → 说明"无法判断，但上游有更新提交"
+   latest / local_build（无差异）/ error / unknown 一律不打扰。 */
+let verState = null;
+
+function dismissUpdate(){
+  const bar = document.getElementById('updBar');
+  if (!bar) return;
+  bar.hidden = true;
+  // 记住"用户已关掉这个提交的提醒"，刷新页面不再重复弹同一条。
+  try {
+    if (verState && verState.remote) localStorage.setItem('updDismissed', verState.remote.sha || '');
+  } catch(e){ /* localStorage 不可用就每次提示，不影响功能 */ }
+}
+function updDismissed(sha){
+  try { return sha && localStorage.getItem('updDismissed') === sha; } catch(e){ return false; }
+}
+
+function renderVersion(v){
+  verState = v || {};
+  const b = verState.build || {};
+  const r = verState.remote || {};
+  const st = verState.status || 'unknown';
+
+  const buildTxt = !b.known ? '未记录构建来源'
+    : (b.short || '—') + (b.modified ? '（本机构建，含未提交改动）' : '');
+  const elBuild = document.getElementById('verBuild');
+  const elRemote = document.getElementById('verRemote');
+  const elChecked = document.getElementById('verChecked');
+  const elSummary = document.getElementById('verSummary');
+  const elAuto = document.getElementById('verAuto');
+  const elRepo = document.getElementById('verRepo');
+  if (!elBuild) return;   // 视图未渲染（防御：绝不因缺元素中断整个刷新）
+
+  elBuild.textContent = buildTxt;
+  elRemote.textContent = r.short ? (r.short + ' · ' + (r.title || '').slice(0, 40)) : '—';
+  elChecked.textContent = verState.checked_at ? fmtTime(verState.checked_at) : '—';
+  elSummary.textContent = verState.summary || '—';
+  elAuto.checked = verState.auto_check_enabled !== false;
+  if (verState.repo_url){ elRepo.href = verState.repo_url; elRepo.textContent = '打开 GitHub 仓库（' + (verState.repo || '') + '）'; }
+
+  const bar = document.getElementById('updBar');
+  const txt = document.getElementById('updTxt');
+  const link = document.getElementById('updLink');
+  if (!bar) return;
+  const sha = r.sha || '';
+  // notice 由服务端算好：真有更新，或本机构建的基准提交与上游不同。
+  // 本机构建恰好停在上游最新提交时 notice=false —— 没有东西可看，不打扰。
+  const show = verState.notice === true && !updDismissed(sha);
+  if (!show){ bar.hidden = true; return; }
+  txt.textContent = verState.summary || '';
+  link.href = r.url || verState.repo_url || '#';
+  bar.hidden = false;
+}
+
+async function loadVersion(){
+  try { renderVersion(await api('version')); }
+  catch(e){ /* 更新提醒失败绝不打断面板其它功能 */ }
+}
+async function checkUpdateNow(){
+  try {
+    renderVersion(await api('version/check', {method:'POST', body:'{}'}));
+    toast('已检查');
+  } catch(e){ toast('检查失败：' + e.message, true); }
+}
+async function setUpdateAuto(enabled){
+  try {
+    renderVersion(await api('version/auto', {method:'POST', body: JSON.stringify({enabled})}));
+    toast(enabled ? '已开启自动检查' : '已关闭自动检查（手动检查仍可用）');
+  } catch(e){ toast('设置失败：' + e.message, true); }
 }
 
 /* ── 模型与档位 ── */
@@ -1497,11 +1617,53 @@ function renderModelLocks(){
   if (note) note.textContent = bad ? bad+' 个模型整池不可用' : rows.length+' 个模型部分限流';
 }
 
+// cooldownLabel turns the gateway's reason/basis codes into the two things an
+// operator actually asks: what happened, and who decided when it ends.
+// Empty when the gateway recorded neither (older state blobs).
+function cooldownLabel(reason, by){
+  const why = {
+    'rate limit': '触发限流',
+    'out of credit': '额度用尽',
+    'auth failed': '登录失效',
+    'transport error': '网络异常',
+    'edge blocked': '被边缘拦截',
+    'restricted by upstream': '上游风控封禁'
+  }[reason] || reason || '';
+  const how = {
+    'upstream': '按上游给的时间',
+    'retry-after': '按上游要求等待',
+    'window': '等额度窗口刷新',
+    'backoff': '连败退避',
+    'fixed': '网关固定时长',
+    'human': '人工处理'
+  }[by] || '';
+  if (!why && !how) return '';
+  if (why && how) return why + '，' + how;
+  return why || how;
+}
+
+// renderDeadModels lists channel+model pairs the upstream said it no longer
+// serves (two distinct accounts confirmed). Without this an operator sees a
+// model quietly stop answering and has no way to know why.
+function renderDeadModels(list){
+  const el = document.getElementById('deadNote');
+  if (!el) return;
+  const rows = list || [];
+  if (!rows.length){ el.style.display='none'; el.textContent=''; return; }
+  el.style.display='';
+  el.textContent = '上游已无此模型：' + rows.map(r =>
+    `${r.channel}/${r.model}（${r.accounts} 个账号确认）`
+  ).join('；') + '。恢复后会自动重试，也可重启网关立即重试。';
+}
+
 function accState(a){
   if (a.disabled) return {cls:'bad', txt:'已禁用'};
   if (a.paused) return {cls:'warn', txt:'已暂停选号'};
   const now = Date.now();
-  if (a.cooldown_until && new Date(a.cooldown_until) > now) return {cls:'warn', txt:'冷却'};
+  if (a.cooldown_until && new Date(a.cooldown_until) > now) {
+    const why = cooldownLabel(a.cooldown_reason, a.cooldown_by);
+    return {cls:'warn', txt: why ? '冷却 · ' + why : '冷却'};
+  }
   if (a.model_cooldowns && a.model_cooldowns.length) return {cls:'warn', txt:'模型冷却'};
   return {cls:'ok', txt:'就绪'};
 }
@@ -1546,7 +1708,7 @@ function renderAccounts(){
       <td>${esc(a.nickname || a.uid || a.id)}<br><small class="muted mono">${esc(a.id)}</small></td>
       <td>${esc(a.realm ? chanNames[a.channel]+' ('+a.realm+')' : chanNames[a.channel]||a.channel)}</td>
       <td>${barHtml}${quota}${modelCoolHtml(a.model_cooldowns)}</td>
-      <td>${a.cooldown_until ? esc(fmtTime(a.cooldown_until)) : '—'}</td>
+      <td>${a.cooldown_until ? esc(fmtTime(a.cooldown_until)) + (cooldownLabel(a.cooldown_reason, a.cooldown_by) ? '<br><small class="muted">'+esc(cooldownLabel(a.cooldown_reason, a.cooldown_by))+'</small>' : '') : '—'}</td>
       <td class="mono">${esc(a.in_flight||0)}</td>
       <td>
         <button class="xs" onclick="probe(${i})">刷新额度</button>

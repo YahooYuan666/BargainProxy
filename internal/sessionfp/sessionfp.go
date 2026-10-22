@@ -23,6 +23,41 @@ func digest(kind, content string) string {
 	return kind + hex.EncodeToString(sum[:shortHashBytes])
 }
 
+// NativeHeaders are where agents already name their own conversation. The
+// list is ordered most-specific first, matching what the reference gateways
+// read (magpie's sessionHeaders, 2026-10-21). Reading these first matters:
+// a client that names its session knows the truth, while a first-message
+// digest can collide when two chats open with the same boilerplate (the
+// 2026-10-20 cross-talk bug, where ZCode's identical <system-reminder>
+// prefix made two sessions share one key).
+var NativeHeaders = []string{
+	"X-BargainProxy-Session",
+	"X-Opencode-Session",
+	"X-Session-Affinity",
+	"X-Session-Id",
+	"Session-Id",
+	"X-Claude-Code-Session-Id",
+	"X-Conversation-Id",
+	"X-Deepseek-Harness-Session-Id",
+}
+
+// FromHeader returns the conversation id the client named, "" when it named
+// none. Values are hashed so a raw client id never reaches logs or upstream
+// headers. A blank or absurdly long value is ignored rather than trusted.
+func FromHeader(get func(string) string) string {
+	if get == nil {
+		return ""
+	}
+	for _, h := range NativeHeaders {
+		v := strings.TrimSpace(get(h))
+		if v == "" || len(v) > 256 {
+			continue
+		}
+		return digest("sid:", v)
+	}
+	return ""
+}
+
 // CacheControl fingerprints a cache_control-marked content block by its
 // text. Callers pass the first marked block found in document order: in
 // prompt-caching practice the first breakpoint (system-prompt anchor) stays

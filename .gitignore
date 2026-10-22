@@ -33,3 +33,7 @@
 # 编辑器/系统生成的备份副本
 /*.exe~
 /*.exe.bak*
+
+# Other sessions' ad-hoc launch probes
+/.scratch_*.log
+/.scratch_*.ps1

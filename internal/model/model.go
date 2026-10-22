@@ -115,15 +115,28 @@ type Account struct {
 	CredsDirty bool `json:"-"`
 
 	// --- runtime scheduling state ---
-	AccountCooldownUntil time.Time                  `json:"account_cooldown_until,omitempty"`
-	ModelCooldowns       map[string]ModelCooldown   `json:"model_cooldowns,omitempty"`
-	Windows              map[string]Window          `json:"windows,omitempty"` // keys: "five_hour","weekly"
-	Credits              Credits                    `json:"credits,omitempty"`
-	CostTiers            map[string]CostObservation `json:"cost_tiers,omitempty"`
-	ConsecutiveFails     int                        `json:"consecutive_fails,omitempty"`
-	BreakerFails         int                        `json:"breaker_fails,omitempty"`
-	LastUsedAt           time.Time                  `json:"last_used_at,omitempty"`
-	UpdatedAt            time.Time                  `json:"updated_at,omitempty"`
+	// AccountCooldownUntil is when the account may be tried again.
+	AccountCooldownUntil time.Time `json:"account_cooldown_until,omitempty"`
+	// AccountCooldownReason says WHY the account is resting, in the same
+	// vocabulary operators read in the panel: "rate limit", "out of credit",
+	// "auth failed", "transport error", "edge blocked", "restricted". Kept
+	// beside the deadline (not derived from it) so the panel can answer
+	// "why is this account stopped, and until when" without guessing
+	// (2026-10-22, magpie's Rest.Why/By split).
+	AccountCooldownReason string `json:"account_cooldown_reason,omitempty"`
+	// AccountCooldownBy records what decided the deadline: "upstream" (the
+	// vendor's own reset time), "retry-after" (its header), "window" (an
+	// allowance window renewing), "backoff" (growing after repeated
+	// failures), "fixed" (a constant of ours) or "human" (a panel action).
+	AccountCooldownBy string                     `json:"account_cooldown_by,omitempty"`
+	ModelCooldowns    map[string]ModelCooldown   `json:"model_cooldowns,omitempty"`
+	Windows           map[string]Window          `json:"windows,omitempty"` // keys: "five_hour","weekly"
+	Credits           Credits                    `json:"credits,omitempty"`
+	CostTiers         map[string]CostObservation `json:"cost_tiers,omitempty"`
+	ConsecutiveFails  int                        `json:"consecutive_fails,omitempty"`
+	BreakerFails      int                        `json:"breaker_fails,omitempty"`
+	LastUsedAt        time.Time                  `json:"last_used_at,omitempty"`
+	UpdatedAt         time.Time                  `json:"updated_at,omitempty"`
 
 	// LastPickSeq is a monotonic sequence for the 0.1s anti-collision gap.
 	LastPickSeq uint64 `json:"-"`

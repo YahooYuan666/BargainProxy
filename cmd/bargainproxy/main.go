@@ -36,6 +36,7 @@ import (
 	"bargainproxy/internal/server"
 	"bargainproxy/internal/store"
 	"bargainproxy/internal/tasks"
+	"bargainproxy/internal/version"
 )
 
 func main() {
@@ -227,6 +228,15 @@ func main() {
 	if abs, err := filepath.Abs(*configPath); err == nil {
 		pn.SetConfigPath(abs)
 	}
+	// Source-update notice (BP-88): read-only — asks GitHub for the head commit
+	// of main and compares it with the commit this binary was built from. It
+	// never downloads, replaces or restarts anything. The transport is cloned
+	// from the default one so the check honours HTTPS_PROXY like every other
+	// outbound call; the checker bounds each fetch with its own timeout.
+	pn.SetVersionChecker(version.NewChecker(httpx.ChatClient()))
+	updateCtx, stopUpdateChecks := context.WithCancel(context.Background())
+	defer stopUpdateChecks()
+	go pn.RunUpdateChecks(updateCtx, version.DefaultInterval)
 	// Reconcile the boot task with the persisted preference (default ON): a
 	// fresh install gets the scheduled task without touching the panel.
 	if err := pn.EnsureBootTask(); err != nil {

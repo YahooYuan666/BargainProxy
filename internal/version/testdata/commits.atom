@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:media="http://search.yahoo.com/mrss/" xml:lang="en-US">
+  <id>tag:github.com,2008:/YahooYuan666/BargainProxy/commits/main</id>
+  <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commits/main"/>
+  <link type="application/atom+xml" rel="self" href="https://github.com/YahooYuan666/BargainProxy/commits/main.atom"/>
+  <title>Recent Commits to BargainProxy:main</title>
+  <updated>2026-10-21T17:16:42Z</updated>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/a975d93f959ac0016dc287c6a473bec925892def</id>
+    <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commit/a975d93f959ac0016dc287c6a473bec925892def"/>
+    <title>
+        BP-77~86：错误分类、并发语义纠偏与国际版登录修复
+    </title>
+    <updated>2026-10-21T17:16:42Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/197226291?s=30&amp;v=4"/>
+    <author>
+      <name>YahooYuan666</name>
+      <uri>https://github.com/YahooYuan666</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;BP-77~86：错误分类、并发语义纠偏与国际版登录修复
+
+- BP-77/78：404 与 WorkBuddy 11140（账号受限）独立分类，受限号粘性停用
+- BP-79/83：单池单账号语义纠偏——一账号在用但未满时可再骑同一号（2-3 任务），仅禁第二账号，全池持有者满才 429 并行数量超发；workbuddy chat 补官方头族
+- BP-80/81：会话指纹跳过 system-reminder 防串味；AutoClaw 中继会话键随机化、含图跳过；GLM-5.3-Flash 路由排最后
+- BP-82：content_blocked/sentinel 加入跨渠道级联名单
+- BP-84：面板国际版开关保存链修复（saveSettings 漏发字段）
+- BP-85：WorkBuddy 设备流 token 单次签发停靠（flow 内存+加密落库），修复浏览器登录成功但面板超时的丢 token 问题；wbCall 失败诊断日志
+- 国际版对齐 misakano：effort 钉 high、UA 品牌分族（workbuddy-ai slug）、global 单号并发上限 2
+- TRAE：deepseek-v4.1-flash 入路由（autoclaw 前）；空内容 tool 消息补占位（400 param invalid）；bad_request 入跨渠道级联
+- Qoder：10605 排队按 retryAfterSeconds 等待重试；设备指纹 UID+盐派生落盘
+- 路由热应用：面板设置保存即重应用 model_routes，不再等重启；清理重复 autoclaw 脏行
+- 启动：start-all 去除 Go 工具链依赖（开机 PATH 无 go 曾致自启失败）；exe 自建数据库（EnsureDatabase）；postgres 独立隐藏控制台启动&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/d91727e2356af42030477567e8f72ffb94f1221a</id>
+    <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commit/d91727e2356af42030477567e8f72ffb94f1221a"/>
+    <title>
+        BP-76：插件保留组/模型排序，更正描述为国模洋模全覆盖，补充 Hysteria2 出口方案
+    </title>
+    <updated>2026-10-19T10:04:51Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/197226291?s=30&amp;v=4"/>
+    <author>
+      <name>YahooYuan666</name>
+      <uri>https://github.com/YahooYuan666</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;BP-76：插件保留组/模型排序，更正描述为国模洋模全覆盖，补充 Hysteria2 出口方案
+
+- session-start.mjs：providerOrder 不再把 9 个组挪到末尾，用户拖好的组顺序保留
+- marketplace.json / plugin.json / README：描述从「仅 OpenCode 三供应商」更正为
+  3 族 × 3 协议线共 9 个供应商；补充组顺序与模型顺序的保留语义
+- docs/跨国外网出口与BBR2调优.md：新增 Hysteria 2（mihomo 进程内 listener）方案、
+  实测对照表与边界说明；真实 VPS 地址/UUID/密钥一律占位符&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/b4041d6078010ef0b8e51615c41077d38b0022c6</id>
+    <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commit/b4041d6078010ef0b8e51615c41077d38b0022c6"/>
+    <title>
+        fix(audit): BP-76 GPT 独立审核修改，修复协议、号池、监控与任务问题
+    </title>
+    <updated>2026-10-18T16:56:05Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/197226291?s=30&amp;v=4"/>
+    <author>
+      <name>YahooYuan666</name>
+      <uri>https://github.com/YahooYuan666</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;fix(audit): BP-76 GPT 独立审核修改，修复协议、号池、监控与任务问题
+
+本版本由 GPT 独立审核修改（ZCode / GPT-6.1），承接对照三个上游项目的全面审查。
+
+- 修复无原生终结信号的断流伪成功、Gemini 工具参数及多轮历史丢失
+- 合并 WorkBuddy 同账号并发刷新，隔离调用方取消并共享轮换结果
+- 如实传播成长与领奖失败，恢复旅行日内多轮巡检
+- 修复 Chat 缓存记账、结构化错误字段及流式错误传播
+- 将账号状态持久化移出全局调度锁，防止旧状态覆盖凭据或复活已删账号
+- 对账兜底默认账号的配置密钥，修正协议自测的误报通过
+- 新增 23 个永久回归测试；原审查九组独立探针全部通过
+
+验证：391 项通过，2 项真实网络测试按设计跳过；全仓竞态检测、静态检查与构建通过。
+发布仅包含源码和测试，不包含真实配置、凭据、运行数据或编译产物；未替换或重启运行中的网关。&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/8da1bcbac16f3cad9e4c74fdac81aea34b8cc158</id>
+    <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commit/8da1bcbac16f3cad9e4c74fdac81aea34b8cc158"/>
+    <title>
+        BP-72/73/74/75：首字窗口全池可配、OpenCode 启动探测、WorkBuddy 成长任务自愈、ZCode 插件保留隐藏状态
+    </title>
+    <updated>2026-10-18T08:00:20Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/197226291?s=30&amp;v=4"/>
+    <author>
+      <name>YahooYuan666</name>
+      <uri>https://github.com/YahooYuan666</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;BP-72/73/74/75：首字窗口全池可配、OpenCode 启动探测、WorkBuddy 成长任务自愈、ZCode 插件保留隐藏状态
+
+- BP-72：首字窗口下沉到拿到租约之后再计时，全局 first_byte_window 可配（90s）
+  并支持按渠道覆盖；估算计入工具 schema；每段失败/池级失败都落日志。
+- BP-73：OpenCode 免费道改为「启动探测一次 + 面板手动」，三态 ok/limited/fail，
+  限流/超时保留路由，全集失效才回退候选；新增逐模型探测用例。
+- BP-74：WorkBuddy 成长域 progress 改为对象形状的宽松解析；领奖改用
+  进度达标 + accept_status 判定（上游已不返回 status）；边缘 HTML 401 重试一次、
+  真凭证失效强制刷新后重试一次；修正 token 刷新端点与 X-Refresh-Token 头。
+- BP-75：ZCode 插件同步改为逐协议线保留隐藏状态，整组删除的供应商不再自动重建
+  （新增 --readd），保留用户模型排序，state 升级 v2 并兼容迁移 v1。&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/056e9c2d757403ec9969139aa0f94cd6346ba41a</id>
+    <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commit/056e9c2d757403ec9969139aa0f94cd6346ba41a"/>
+    <title>
+        BP-70/BP-71：对齐多工具参数流式与多模态预算、延长 AutoClaw 窗口、修复积分面板排版
+    </title>
+    <updated>2026-10-17T15:31:12Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/197226291?s=30&amp;v=4"/>
+    <author>
+      <name>YahooYuan666</name>
+      <uri>https://github.com/YahooYuan666</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;BP-70/BP-71：对齐多工具参数流式与多模态预算、延长 AutoClaw 窗口、修复积分面板排版
+
+- 对齐 AIClient2API PR #718 关键不变量：
+  * Anthropic StreamWriter 在遇到跨 toolIndex 交错到达的参数 delta 时，按 index 缓冲并在 EvDone 时按顺序完整发射 tool_use 块，杜绝并发块与空调用。
+  * tool_result 多模态预算：全局保留最近 5 张图片，超出部分静默裁剪（保留文本）；OpenAI 系驱动一律只发纯文本，杜绝 400 拒收。
+- BP-71 体验修复与优化：
+  * AutoClaw 首字节等待窗口：支持 channels.autoclaw.first_byte_window 配置（默认 90s），防止 300k+ token 上下文预热超时导致过早降级。
+  * 国模积分情况面板：服务端 cleanProbeError 清理反代 HTML 401 报错，前端副标题脱敏展示，表格不再被大段 HTML 撑崩。
+  * 模型路由更新：除 qwen 外 autoclaw 优先级高于 qoder；kimi-k3 优先走 trae。&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/5b79caa897a862d06eb84a74333b271fb879bb10</id>
+    <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commit/5b79caa897a862d06eb84a74333b271fb879bb10"/>
+    <title>
+        BP-69：修复三协议转译与历史 thinking 保真
+    </title>
+    <updated>2026-10-17T13:13:07Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/197226291?s=30&amp;v=4"/>
+    <author>
+      <name>YahooYuan666</name>
+      <uri>https://github.com/YahooYuan666</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;BP-69：修复三协议转译与历史 thinking 保真
+
+- Responses 流式工具调用：added/delta/done 统一 item id；arguments.done 回累积真值；output_item.done 补全 name/call_id/arguments（ZCode 在 done 事件组装最终 tool-call）。
+- Responses 输入项：跳过 reasoning/item_reference，避免生成空 user 消息；previous_response_id 改为明确 400（无状态网关不伪造续接）。
+- Chat/Responses usage 明细：补 prompt_tokens_details.cached_tokens、completion_tokens_details.reasoning_tokens、input_tokens_details.cached_tokens、output_tokens_details.reasoning_tokens；未知保持缺席，上报 0 显式回。
+- zcode 驱动：Thinking 未启用时用 RequestedEffort + BudgetFromLevel 打开 thinking；补 Anthropic tool_choice 方言（此前完全不发）与 top_k。
+- Anthropic 历史 thinking：IR 新增 Message.Thinking（独立于正文）；入口保留 text+signature；zcode 驱动捕获 signature_delta，Anthropic 出口非流式带真签名、流式发 signature_delta；仅回放 assistant 工具轮；上游 400 提到 thinking/signature 时去掉历史 thinking 重试一次；无签名块被拒后进程内熔断，避免每轮多一次往返。
+- tool_choice 全入口归一化：OpenAI chat 对象 / Responses 平对象 / Anthropic any·tool / Gemini ANY→auto|none|required；具名工具进 ToolChoiceName；保留 disable_parallel_tool_use。
+- 测试：新增/更新 12 项；全仓 go test ./...、go vet、gofmt 干净，改动包 -race 绿。
+- 实机：Responses 流式工具字段齐全、usage cached_tokens 可见、previous_response_id 400、protoprobe 18/18；zcode 池额度耗尽，历史 thinking 回放实机待验。&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/e595b0eaea274d7760a00ca529197d952b627c7b</id>
+    <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commit/e595b0eaea274d7760a00ca529197d952b627c7b"/>
+    <title>
+        添加 MIT LICENSE 并链接到 README
+    </title>
+    <updated>2026-10-17T11:21:35Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/197226291?s=30&amp;v=4"/>
+    <author>
+      <name>YahooYuan666</name>
+      <uri>https://github.com/YahooYuan666</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;添加 MIT LICENSE 并链接到 README&lt;/pre&gt;
+    </content>
+  </entry>
+  <entry>
+    <id>tag:github.com,2008:Grit::Commit/c7a1f634f30ea4c56e2b2f6c073a430ddb206236</id>
+    <link type="text/html" rel="alternate" href="https://github.com/YahooYuan666/BargainProxy/commit/c7a1f634f30ea4c56e2b2f6c073a430ddb206236"/>
+    <title>
+        穷鬼自建中转：BargainProxy 源码首发
+    </title>
+    <updated>2026-10-17T11:20:41Z</updated>
+    <media:thumbnail height="30" width="30" url="https://avatars.githubusercontent.com/u/197226291?s=30&amp;v=4"/>
+    <author>
+      <name>YahooYuan666</name>
+      <uri>https://github.com/YahooYuan666</uri>
+    </author>
+    <content type="html">
+      &lt;pre style=&#39;white-space:pre-wrap;width:81ex&#39;&gt;穷鬼自建中转：BargainProxy 源码首发
+
+个人自用的统一模型网关：把 Google Antigravity、WorkBuddy、Trae CN、
+ZCode、AutoClaw、Qoder、OpenCode 免费模型聚合成一套 OpenAI / Responses /
+Anthropic / Gemini 兼容 API，带账号池调度与 Web 面板。
+
+- 仅发布源代码，不含编译产物、运行数据与账号信息
+- 致敬 agentpoints（workbuddy2api-panel，MIT）与 AIClient2API（行为规范参考）
+- 自带 ZCode 9 供应商同步插件（plugins/bargainproxy-opencode）
+- AutoClaw 签名常量改为 config.json 配置，源码不随附
+- 严禁营业性商业用途；每个号池建议最多 3 个账号&lt;/pre&gt;
+    </content>
+  </entry>
+</feed>

@@ -157,6 +157,12 @@ type AutoClawSettings struct {
 	// plus channel overrides (BP-72).
 	FirstByteWindow Duration `json:"first_byte_window"`
 
+	// RelayEnabled re-enables the sandbox relay as a fallback when the CN
+	// managed gateway fails. Default false (2026-10-21): the relay is 5-38s
+	// slower per call and cannot receive images at all, so a managed-gateway
+	// failure should surface rather than be masked by a slow path.
+	RelayEnabled bool `json:"relay_enabled"`
+
 	// AppSecret signs the userapi requests (X-Auth-Sign). It is a constant
 	// baked into the official client, NOT this project's credential, and it
 	// is intentionally not shipped in source: set it in config.json from the
@@ -289,13 +295,13 @@ func Default() *Config {
 		// concurrency within a pool.
 		SingleActivePerChannel: true,
 		TaskAccountGap:         Duration(800 * time.Millisecond),
-		RPCTimeout:      Duration(120 * time.Second),
-		HeaderTimeout:   Duration(300 * time.Second),
-		IdleTimeout:     Duration(300 * time.Second),
-		SessionTTL:      Duration(30 * time.Minute),
-		CostTTL:         Duration(6 * time.Hour),
-		LogRetention:    Duration(336 * time.Hour),
-		Sentinels:       []string{"DANGEROUS_ACTIVITY_BLOCKED"},
+		RPCTimeout:             Duration(120 * time.Second),
+		HeaderTimeout:          Duration(300 * time.Second),
+		IdleTimeout:            Duration(300 * time.Second),
+		SessionTTL:             Duration(30 * time.Minute),
+		CostTTL:                Duration(6 * time.Hour),
+		LogRetention:           Duration(336 * time.Hour),
+		Sentinels:              []string{"DANGEROUS_ACTIVITY_BLOCKED"},
 	}
 }
 

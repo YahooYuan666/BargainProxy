@@ -208,12 +208,16 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// Skip here so the next binding gets tried (2026-10-21: the 11:06
 		// deepseek request ended as concurrency_exceeded on WorkBuddy alone
 		// although qoder was healthy).
-		// The AutoClaw relay carries exactly one text message to its sandbox
-		// agent and drops every other part. Sending an image request there does
-		// not fail — the model answers without the image, which the user reads
-		// as "it recognized a different picture" (2026-10-20). Skip the binding
-		// instead, so another channel that supports vision takes it.
-		if binding.Channel == model.ChannelAutoClaw && ir.HasImages(req.Messages) {
+		// The AutoClaw SANDBOX RELAY carries exactly one text message to its
+		// agent and drops every other part: an image request there does not
+		// fail, the model answers without the image, which the user reads as
+		// "it recognized a different picture" (2026-10-20). The CN managed
+		// gateway that now carries AutoClaw traffic is different: it takes
+		// OpenAI image parts and answers correctly (verified 2026-10-21 with a
+		// half-red/half-blue PNG: zai_glm-5.3-flash, zai_auto and
+		// zaicoding_glm-5.3 all named both colours). So an image request may
+		// use AutoClaw unless the relay is the path that would serve it.
+		if binding.Channel == model.ChannelAutoClaw && ir.HasImages(req.Messages) && g.cfg.Channels.AutoClaw.RelayEnabled {
 			lastErr = uperr.New(uperr.ClassBadRequest, 400,
 				"autoclaw relay is text-only and cannot carry images; another channel is required")
 			continue
@@ -558,6 +562,18 @@ func (g *Gateway) classifyPoolError(err error, channel, modelName string) error 
 	if errors.As(err, &cb) {
 		return concurrencyError(cb.Channel, cb.Account)
 	}
+	// Dead model: several distinct accounts were told the upstream does not
+	// serve it. Answer as "no such model on this channel" so the binding loop
+	// moves on instead of walking more accounts (2026-10-22).
+	var mg *pool.ErrModelGone
+	if errors.As(err, &mg) {
+		ue := uperr.New(uperr.ClassModelUnavailable, 404,
+			"%s does not serve model %s (%d accounts confirmed): %s",
+			mg.Channel, mg.Model, mg.Accounts, mg.Reason)
+		ue.Model = mg.Model
+		ue.Channel = mg.Channel
+		return ue
+	}
 	var nc *pool.ErrNoCapacity
 	if errors.As(err, &nc) {
 		// Distinguish "every account is model-cooled for this model" from
@@ -799,7 +815,15 @@ func DescribeError(err error) (status int, class string, message string) {
 		return 499, ue.Class, "request canceled before completion: " + ue.Message
 	case uperr.ClassUpstreamBusy:
 		// Capacity event: the account is healthy and the request is fine;
-		// 503 tells the client SDK to back off and retry shortly.
+		// 503 tells the client SDK to back off and retry shortly. When the
+		// upstream said how long the queue needs, say it: the client can then
+		// wait exactly that long instead of guessing (2026-10-21).
+		if !ue.ResetAt.IsZero() {
+			if wait := time.Until(ue.ResetAt); wait > 0 {
+				return 503, ue.Class, fmt.Sprintf("upstream queue is full; retry in %s: %s",
+					wait.Round(time.Second), ue.Message)
+			}
+		}
 		return 503, ue.Class, "upstream queue full (capacity), retry shortly: " + ue.Message
 	case uperr.ClassWAF:
 		return 502, ue.Class, "upstream edge blocked the request: " + ue.Message

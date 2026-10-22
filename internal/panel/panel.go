@@ -20,6 +20,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -29,6 +30,7 @@ import (
 	"bargainproxy/internal/cryptox"
 	"bargainproxy/internal/gateway"
 	"bargainproxy/internal/store"
+	"bargainproxy/internal/version"
 )
 
 //go:embed web/index.html
@@ -63,6 +65,9 @@ type Panel struct {
 	configPath string       // config.json path for the restart-required settings
 	taskRunner TaskRunner
 	hc         *http.Client // onboarding flows (OAuth/device) HTTP client
+	vcheck     *version.Checker
+	// startDelay overrides the first update check's delay (tests only).
+	startDelay time.Duration
 
 	mu        sync.Mutex
 	sessions  map[string]*session // sid -> session
@@ -182,6 +187,10 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /panel/api/tiers", p.authed(p.handleTiers, false))
 	mux.HandleFunc("GET /panel/api/accounts/credits", p.authed(p.handleAccountCredits, false))
 	mux.HandleFunc("GET /panel/api/packages", p.authed(p.handlePackages, false))
+	// Source-update notice (BP-88): read-only, no download/replace/restart.
+	mux.HandleFunc("GET /panel/api/version", p.authed(p.handleVersionGet, false))
+	mux.HandleFunc("POST /panel/api/version/check", p.authed(p.handleVersionCheck, true))
+	mux.HandleFunc("POST /panel/api/version/auto", p.authed(p.handleUpdateCheckToggle, true))
 }
 
 func (p *Panel) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -259,9 +268,10 @@ func (p *Panel) authed(next http.HandlerFunc, mutation bool) http.HandlerFunc {
 		if mutation {
 			tok := r.Header.Get("X-CSRF-Token")
 			if subtle.ConstantTimeCompare([]byte(tok), []byte(p.openCSRF())) != 1 {
-				// Hint for the rare case the frontend's auto-refresh could not
-				// recover (e.g. the state fetch failed too): the token is
-				// per-process, so a gateway restart invalidates open tabs.
+				// Logged: a stale page after a gateway restart retries with
+				// the old token, and without this line the rejection is
+				// invisible (2026-10-22: the login poll looked "stopped").
+				log.Printf("panel: csrf rejected %s %s", r.Method, r.URL.Path)
 				writeJSON(w, http.StatusForbidden, map[string]any{
 					"error": "csrf token invalid（网关可能已重启：刷新页面即可，面板会自动换新 token）",
 				})

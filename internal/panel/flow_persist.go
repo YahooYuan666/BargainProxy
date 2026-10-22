@@ -184,3 +184,32 @@ func (p *Panel) loadPersistedFlows() {
 		p.flows[key] = f
 	}
 }
+
+// --- test hooks ---
+
+// FlowLock exposes the flow map lock for tests.
+func (p *Panel) FlowLock() { p.flowMu.Lock() }
+
+// FlowUnlock releases the flow map lock.
+func (p *Panel) FlowUnlock() { p.flowMu.Unlock() }
+
+// SetFlowExpiryForTest overwrites a flow's expiry (caller must hold FlowLock).
+func (p *Panel) SetFlowExpiryForTest(key string, t time.Time) {
+	if f := p.flows[key]; f != nil {
+		f.expiresAt = t
+	}
+}
+
+// FlowStatus reports the flow's terminal/pending status.
+func (p *Panel) FlowStatus(key string) string {
+	p.flowMu.Lock()
+	defer p.flowMu.Unlock()
+	f := p.flows[key]
+	if f == nil {
+		return ""
+	}
+	return f.status
+}
+
+// ExpireFlowForTest runs the expiry check for one flow immediately.
+func (p *Panel) ExpireFlowForTest(key string) { p.expireFlow(key) }

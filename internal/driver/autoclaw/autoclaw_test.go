@@ -33,17 +33,36 @@ func TestParseCredsAcceptsReferenceCamelCase(t *testing.T) {
 	}
 }
 
-func TestStreamProxySSE(t *testing.T) {
-	var gotModel, gotReqModel, gotAuth string
+// TestStreamManagedSSE covers the default path since 2026-10-21: the CN
+// managed gateway, which needs X-Authorization plus the X-Auth-* signature,
+// the official system prompt, and no max_tokens.
+func TestStreamManagedSSE(t *testing.T) {
+	var gotModel, gotReqModel, gotAuth, gotSign, gotChannel, gotVersion string
+	var gotSystem string
+	var gotMaxTokens, gotToolsAny bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != proxyChatPath {
+		if r.URL.Path != managedChatPath {
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
-		gotAuth = r.Header.Get("Authorization")
+		gotAuth = r.Header.Get("X-Authorization")
+		gotSign = r.Header.Get("X-Auth-Sign")
+		gotChannel = r.Header.Get("X-Channel")
+		gotVersion = r.Header.Get("X-Version")
 		gotReqModel = r.Header.Get("X-Request-Model")
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		gotModel, _ = body["model"].(string)
+		if _, ok := body["max_tokens"]; ok {
+			gotMaxTokens = true
+		}
+		if msgs, ok := body["messages"].([]any); ok && len(msgs) > 0 {
+			if first, ok := msgs[0].(map[string]any); ok {
+				if str, ok2 := first["content"].(string); ok2 {
+					gotSystem = str
+					gotToolsAny = strings.HasPrefix(str, managedSystemPrompt)
+				}
+			}
+		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
 		fmt.Fprintln(w, `data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}`)
@@ -81,7 +100,19 @@ func TestStreamProxySSE(t *testing.T) {
 		t.Fatalf("model=%q reqModel=%q", gotModel, gotReqModel)
 	}
 	if gotAuth != "Bearer tok" {
-		t.Fatalf("auth = %q", gotAuth)
+		t.Fatalf("X-Authorization = %q", gotAuth)
+	}
+	if gotSign == "" {
+		t.Fatal("X-Auth-Sign missing: the gateway answers 401 without it")
+	}
+	if gotChannel != managedChannel || gotVersion != managedVersion {
+		t.Fatalf("channel=%q version=%q", gotChannel, gotVersion)
+	}
+	if !gotToolsAny {
+		t.Fatalf("official system prompt missing, got %q", gotSystem)
+	}
+	if gotMaxTokens {
+		t.Fatal("max_tokens must be stripped: the CN gateway refuses it")
 	}
 }
 

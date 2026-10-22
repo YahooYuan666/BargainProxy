@@ -307,7 +307,14 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds) ([]byte, error) {
 				fn["description"] = t.Description
 			}
 			if t.Parameters != nil {
-				fn["parameters"] = t.Parameters
+				// Type every enum before sending: this upstream answers 400
+				// code 11133 for an enum with no type or with several types,
+				// which MCP servers emit routinely (2026-10-21).
+				params := t.Parameters
+				if prompt.FixEnumTypes(params) {
+					log.Printf("workbuddy: typed enum(s) in tool %q schema", t.Name)
+				}
+				fn["parameters"] = params
 			}
 			tools = append(tools, map[string]any{"type": "function", "function": fn})
 		}

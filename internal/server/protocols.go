@@ -16,6 +16,7 @@ import (
 	"bargainproxy/internal/protocol/anthropic"
 	"bargainproxy/internal/protocol/geminiv1"
 	"bargainproxy/internal/protocol/responses"
+	"bargainproxy/internal/sessionfp"
 	"bargainproxy/internal/uperr"
 )
 
@@ -25,6 +26,19 @@ func (s *Server) MountProtocols(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/messages/count_tokens", s.auth(s.handleCountTokens))
 	mux.HandleFunc("POST /v1/responses", s.auth(s.handleResponses))
 	mux.HandleFunc("POST /v1beta/models/{model}", s.auth(s.handleGeminiGenerate))
+}
+
+// applyNativeSession prioritises the session id the client names in its own
+// headers over any fingerprint derived from message content. A client that
+// names its conversation knows the truth; content digests can collide when
+// two chats open with the same boilerplate (2026-10-20 cross-talk bug).
+func applyNativeSession(r *http.Request, req *ir.ChatRequest) {
+	if req == nil || r == nil {
+		return
+	}
+	if v := sessionfp.FromHeader(r.Header.Get); v != "" {
+		req.SessionKey = v
+	}
 }
 
 // --- Anthropic Messages ---
@@ -50,6 +64,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.Model = gateway.TrimModelName(req.Model)
+	applyNativeSession(r, req)
 	if url, bad := gateway.HasUnsupportedImageURL(req); bad {
 		writeJSON(w, http.StatusBadRequest, anthropic.RenderError("invalid_request_error",
 			"external image URL is not supported (use base64 data URLs): "+url))
@@ -163,6 +178,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Model = gateway.TrimModelName(req.Model)
+	applyNativeSession(r, req)
 	if url, bad := gateway.HasUnsupportedImageURL(req); bad {
 		writeJSON(w, http.StatusBadRequest, responses.RenderError("invalid_request_error",
 			"external image URL is not supported (use base64 data URLs): "+url))
@@ -276,6 +292,7 @@ func (s *Server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Model = gateway.TrimModelName(modelName)
+	applyNativeSession(r, req)
 	if req.Model == "" {
 		writeJSON(w, http.StatusBadRequest, geminiv1.RenderError(400, "INVALID_ARGUMENT", "model is required"))
 		return

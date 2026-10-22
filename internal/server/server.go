@@ -192,6 +192,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Model = gateway.TrimModelName(req.Model)
+	applyNativeSession(r, req)
 
 	// Policy: no server-side fetching of external image URLs.
 	if url, bad := gateway.HasUnsupportedImageURL(req); bad {

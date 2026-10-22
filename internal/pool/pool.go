@@ -74,11 +74,36 @@ func (e *ErrChannelBusy) Error() string {
 	return fmt.Sprintf("pool: %s is interacting (one account per pool at a time)", e.Channel)
 }
 
+// ErrModelGone reports that the upstream has explicitly said it does not
+// serve this model on this channel, confirmed by several distinct accounts.
+// The caller should move to the next binding: no account here can serve it,
+// so retrying would only produce the same answer.
+type ErrModelGone struct {
+	Channel  string
+	Model    string
+	Accounts int
+	Reason   string
+}
+
+func (e *ErrModelGone) Error() string {
+	if e.Reason != "" {
+		return fmt.Sprintf("pool: %s does not serve model %s (%s)", e.Channel, e.Model, e.Reason)
+	}
+	return fmt.Sprintf("pool: %s does not serve model %s", e.Channel, e.Model)
+}
+
 // Params tunes pool behaviour.
 type Params struct {
 	MaxQueueWait time.Duration // max wait for a slot when all busy (sticky queue)
 	SessionTTL   time.Duration // sticky binding TTL
 	CostTTL      time.Duration // cost observation validity
+	// StickyGrace is how long after a rest ends an account is "sticky only":
+	// it keeps the conversations already bound to it but takes no new ones
+	// until it proves healthy. 0 disables the band.
+	StickyGrace time.Duration
+	// StickyFailThreshold marks an account sticky-only once it has failed this
+	// many times in a row without resting yet. 0 disables the band.
+	StickyFailThreshold int
 	// GlobalMaxInFlight caps how many tasks one WorkBuddy international
 	// (realm=global) account may run at once. That edge's risk control is
 	// tighter, so a global account runs below the CN ceiling even when the
@@ -149,7 +174,10 @@ type Pool struct {
 	// independent of per-account cooldowns; expired entries are skipped
 	// lazily on read.
 	busyUntil map[string]time.Time
-	closed    bool
+	// deadModels records channel+model pairs the upstream explicitly said it
+	// no longer serves, counted by DISTINCT accounts (see deadmodel.go).
+	deadModels map[string]*deadModelVerdict
+	closed     bool
 }
 
 type sessionBinding struct {
@@ -164,6 +192,12 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 	}
 	if params.MaxQueueWait <= 0 {
 		params.MaxQueueWait = 120 * time.Second
+	}
+	if params.StickyGrace <= 0 {
+		params.StickyGrace = 2 * time.Minute
+	}
+	if params.StickyFailThreshold <= 0 {
+		params.StickyFailThreshold = 2
 	}
 	if params.GlobalMaxInFlight <= 0 {
 		params.GlobalMaxInFlight = 2
@@ -201,6 +235,7 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 		uses:        map[string][]string{},
 		lastExplore: map[string]time.Time{},
 		busyUntil:   map[string]time.Time{},
+		deadModels:  map[string]*deadModelVerdict{},
 		pending:     map[string]*model.Account{},
 		persistWake: make(chan struct{}, 1),
 		persistDone: make(chan struct{}),
@@ -485,6 +520,13 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		return nil, &ErrNoCapacity{Channel: channel}, false
 	}
 
+	// Dead model first: when the upstream has told two distinct accounts that
+	// it does not serve this model, no account-level gate below is worth
+	// consulting — the answer is the same for every account (2026-10-22).
+	if dead, why, n := p.deadModelLocked(channel, modelName, now); dead {
+		return nil, &ErrModelGone{Channel: channel, Model: modelName, Accounts: n, Reason: why}, false
+	}
+
 	// Single-active mode (2026-10-20): one account per pool may interact at a
 	// time. A second request is NOT queued on this pool and NOT sent to another
 	// account of the same pool — the caller routes to the next binding. This is
@@ -512,7 +554,11 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		key := channel + "|" + sessionKey
 		if b, ok := p.sessions[key]; ok {
 			a := p.accounts[b.accountID]
-			if a == nil || !p.usableForModel(a, modelName, now) || p.floorBlockedLocked(a, modelName, now) {
+			// A bound conversation may continue while the account is
+			// AdmitSticky (short grace after a rest); only AdmitNone
+			// unbinds it. That keeps a mid-conversation account from being
+			// swapped out just because its rest ended moments ago.
+			if a == nil || p.admissionLocked(a, modelName, now) == AdmitNone || p.floorBlockedLocked(a, modelName, now) {
 				delete(p.sessions, key) // broken for this model: fall through and reselect
 			} else if p.inflight[a.ID] < p.limitForAccount(a) {
 				b.lastUsed = now
@@ -549,10 +595,11 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		if a.Realm == "global" && !p.globalEnabled {
 			continue // workbuddy international switch is off (default)
 		}
-		if now.Before(a.AccountCooldownUntil) {
-			continue
-		}
-		if mc, ok := a.ModelCooldowns[modelName]; ok && now.Before(mc.Until) {
+		// New conversations need full admission: an account that has just
+		// left a rest, or that keeps failing, is refused here but still
+		// serves the conversations already bound to it (AdmitSticky), which
+		// never reach this loop.
+		if p.admissionLocked(a, modelName, now) != AdmitNew {
 			continue
 		}
 		if p.inflight[a.ID] >= p.limitForAccount(a) {
@@ -773,6 +820,17 @@ func (p *Pool) SetWaitParams(maxQueueWait, sessionTTL, costTTL time.Duration) {
 
 // ApplyResult folds an upstream result into the account state machine. Call
 // after every upstream attempt. Success clears failure counters.
+// restAccount records an account-level rest together with WHY and WHAT set the
+// deadline. Keeping the two beside the timestamp is what lets the panel say
+// "rate limit, back at 21:05" instead of just "cooling down" (2026-10-22).
+func (p *Pool) restAccount(a *model.Account, until time.Time, reason, by string, now time.Time) {
+	if until.After(a.AccountCooldownUntil) {
+		a.AccountCooldownUntil = until
+		a.AccountCooldownReason = reason
+		a.AccountCooldownBy = by
+	}
+}
+
 func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -780,6 +838,13 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 	if upstreamErr == nil {
 		a.ConsecutiveFails = 0
 		a.BreakerFails = 0
+		if !now.Before(a.AccountCooldownUntil) {
+			// The rest expired and the account is serving again: drop the
+			// stale explanation so the panel does not show "rate limit" on a
+			// healthy account.
+			a.AccountCooldownReason = ""
+			a.AccountCooldownBy = ""
+		}
 		a.UpdatedAt = now
 		p.changedLocked(a)
 		return
@@ -795,7 +860,11 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 			h := p.setModelCooldown(a, upstreamErr.Model, upstreamErr.ResetAt, "429 rate limit", upstreamErr.Message, now)
 			upstreamErr.HoldUntil = h
 		} else {
-			a.AccountCooldownUntil = later(a.AccountCooldownUntil, until)
+			by := "fixed"
+			if !upstreamErr.ResetAt.IsZero() {
+				by = "upstream"
+			}
+			p.restAccount(a, until, "rate limit", by, now)
 		}
 		a.BreakerFails++
 	case uperr.ClassModelRate:
@@ -812,12 +881,12 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// 429 renderers and Retry-After can point at the next attempt.
 		upstreamErr.HoldUntil = until
 	case uperr.ClassHardCredit:
-		a.AccountCooldownUntil = later(a.AccountCooldownUntil, NextDay4AM(now))
+		p.restAccount(a, NextDay4AM(now), "out of credit", "upstream", now)
 		a.BreakerFails = 0
 	case uperr.ClassAuth:
 		// Grace self-heal: short stop instead of permanent disable; the
 		// refresh task will either fix it or the panel surfaces it.
-		a.AccountCooldownUntil = later(a.AccountCooldownUntil, now.Add(10*time.Minute))
+		p.restAccount(a, now.Add(10*time.Minute), "auth failed", "fixed", now)
 	case uperr.ClassAccountRestricted:
 		// The upstream has restricted this account (workbuddy 403 code=11140
 		// "request illegal" / "账号存在异常行为，已被限制使用"). No refresh can
@@ -829,16 +898,18 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// another account of the same channel immediately.
 		a.Disabled = true
 		a.Paused = false
+		a.AccountCooldownReason = "restricted by upstream"
+		a.AccountCooldownBy = "human"
 		a.ConsecutiveFails = 0
 		a.BreakerFails = 0
 		if a.ModelCooldowns != nil {
 			delete(a.ModelCooldowns, model)
 		}
 	case uperr.ClassWAF:
-		a.AccountCooldownUntil = later(a.AccountCooldownUntil, now.Add(60*time.Second))
+		p.restAccount(a, now.Add(60*time.Second), "edge blocked", "fixed", now)
 	case uperr.ClassTransport:
 		a.ConsecutiveFails++
-		a.AccountCooldownUntil = later(a.AccountCooldownUntil, now.Add(backoffTransport(a.ConsecutiveFails)))
+		p.restAccount(a, now.Add(backoffTransport(a.ConsecutiveFails)), "transport error", "backoff", now)
 	case uperr.ClassBadRequest, uperr.ClassContentBlocked, uperr.ClassSentinel:
 		// No account penalty: the account is fine, the payload was not.
 		return
@@ -849,6 +920,11 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// the channel+model pair briefly so a storm of retries does not walk
 		// every account into the same dead route; the binding loop still
 		// cascades to another channel.
+		// Positive evidence: the upstream named this model as absent. Two
+		// distinct accounts agreeing promotes it to "the model is gone here",
+		// which stops the pool from walking every remaining account into the
+		// same dead end (2026-10-22).
+		p.noteMissingModelLocked(a.Channel, model, a.ID, upstreamErr.Message, now)
 		if d := p.params.NotFoundPause; d > 0 {
 			p.markChannelBusyLocked(a.Channel, model, now.Add(d))
 		}

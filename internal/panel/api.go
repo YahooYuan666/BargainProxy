@@ -51,19 +51,26 @@ func (p *Panel) SetTaskRunner(tr TaskRunner) { p.taskRunner = tr }
 // --- state ---
 
 type accountView struct {
-	ID          string                `json:"id"`
-	Channel     string                `json:"channel"`
-	Nickname    string                `json:"nickname,omitempty"`
-	UID         string                `json:"uid,omitempty"`
-	Realm       string                `json:"realm,omitempty"`
-	Disabled    bool                  `json:"disabled"`
-	Paused      bool                  `json:"paused"`
-	InFlight    int                   `json:"in_flight"`
-	CooldownEnd string                `json:"cooldown_until,omitempty"`
-	ModelCool   []modelCoolView       `json:"model_cooldowns,omitempty"`
-	Credits     *model.Credits        `json:"credits,omitempty"`
-	Windows     map[string]windowView `json:"windows,omitempty"`
-	LastUsed    string                `json:"last_used,omitempty"`
+	ID          string `json:"id"`
+	Channel     string `json:"channel"`
+	Nickname    string `json:"nickname,omitempty"`
+	UID         string `json:"uid,omitempty"`
+	Realm       string `json:"realm,omitempty"`
+	Disabled    bool   `json:"disabled"`
+	Paused      bool   `json:"paused"`
+	InFlight    int    `json:"in_flight"`
+	CooldownEnd string `json:"cooldown_until,omitempty"`
+	// CooldownReason/CooldownBy explain the rest: "rate limit" / "out of
+	// credit" / "auth failed" …, and what decided the deadline ("upstream"
+	// reset time, "retry-after", "window", "backoff", "fixed", "human").
+	// The panel shows them so an operator does not have to guess why an
+	// account is out and when it returns (2026-10-22).
+	CooldownReason string                `json:"cooldown_reason,omitempty"`
+	CooldownBy     string                `json:"cooldown_by,omitempty"`
+	ModelCool      []modelCoolView       `json:"model_cooldowns,omitempty"`
+	Credits        *model.Credits        `json:"credits,omitempty"`
+	Windows        map[string]windowView `json:"windows,omitempty"`
+	LastUsed       string                `json:"last_used,omitempty"`
 }
 
 // modelCoolView is one unexpired (account, model) rate-limit hold for the
@@ -100,6 +107,8 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 			}
 			if a.AccountCooldownUntil.After(time.Now()) {
 				v.CooldownEnd = a.AccountCooldownUntil.Format(time.RFC3339)
+				v.CooldownReason = a.AccountCooldownReason
+				v.CooldownBy = a.AccountCooldownBy
 			}
 			if len(a.ModelCooldowns) > 0 {
 				now := time.Now()
@@ -139,6 +148,7 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 	models := p.gw.ListModels()
 	out := map[string]any{
 		"accounts":         views,
+		"dead_models":      pl.DeadModels(),
 		"models":           models,
 		"workbuddy_global": p.wbGlobalEnabled(),
 		"settings":         p.hotSettingsView(),

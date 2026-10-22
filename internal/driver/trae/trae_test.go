@@ -49,7 +49,7 @@ func TestSOLOBodyShape(t *testing.T) {
 			Tools: []ir.ToolDef{{Name: "f"}},
 		},
 	}
-	raw, err := buildSOLOBody(call)
+	raw, err := buildSOLOBody(call, functionSOLO)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
@@ -107,7 +107,7 @@ func TestSOLOToolParametersAreJSONStrings(t *testing.T) {
 			},
 		},
 	}
-	raw, err := buildSOLOBody(call)
+	raw, err := buildSOLOBody(call, functionSOLO)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}

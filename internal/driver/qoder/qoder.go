@@ -51,9 +51,16 @@ const (
 	// deepseek-v4.1-flash p1 binding kept failing. Defaults are the
 	// reference's conservative budget: 3 rounds, 180s per round, 600s total,
 	// plus 0–2s jitter so simultaneous wakeups do not stampede the queue.
+	// Queue budget (2026-10-21 revision): the gateway now waits at most
+	// queueWaitBudget in total, then hands the answer back to the client as
+	// "busy, retry in N seconds". Measured queue behaviour: p50 3.3s, p95
+	// 12.9s, tail up to 63s on very large sessions — so 30s covers >95% of
+	// real waits while a parked minute-long request no longer looks like a
+	// freeze. Reference gateways return 503 + Retry-After instead of holding
+	// the connection (magpie-community/plugins packages/qoder).
 	queueMaxRounds   = 3
-	queueWaitMax     = 180 * time.Second
-	queueWaitBudget  = 600 * time.Second
+	queueWaitMax     = 30 * time.Second
+	queueWaitBudget  = 30 * time.Second
 	defaultQueueWait = 30 * time.Second
 
 	pathJobExchange = "/api/v1/jobToken/exchange"
@@ -220,9 +227,15 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 				return nil, err
 			}
 			if queueRounds >= queueMaxRounds || queueSpent+wait > queueWaitBudget {
-				// Budget exhausted: surface the honest queue error instead of
-				// holding the request open forever.
-				return nil, err
+				// Budget exhausted: hand the queue answer back to the client as
+				// a busy signal WITH the wait the upstream asked for. The
+				// gateway stops holding the connection (which is what the user
+				// experiences as a freeze) and the client decides whether to
+				// retry, switch model or give up.
+				busy := uperr.New(uperr.ClassUpstreamBusy, 503,
+					"qoder: queued, ask again in %s (%s)", wait.Round(time.Second), clip(ue.Message, 80))
+				busy.ResetAt = time.Now().Add(wait)
+				return nil, busy
 			}
 			queueRounds++
 			queueSpent += wait
