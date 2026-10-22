@@ -61,7 +61,7 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	if err != nil {
 		return nil, err
 	}
-	for _, h := range disguiseHeaders(deriveRequestIDs([]byte(`{"messages":[]}`))) {
+	for _, h := range disguiseHeaders(deriveRequestIDs([]byte(`{"messages":[]}`)), "chat") {
 		req.Header.Set(h[0], h[1])
 	}
 	resp, err := d.rpc.Do(req)
@@ -90,7 +90,7 @@ func (d *Driver) Models(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, h := range disguiseHeaders(deriveRequestIDs([]byte(`{"messages":[]}`))) {
+	for _, h := range disguiseHeaders(deriveRequestIDs([]byte(`{"messages":[]}`)), "chat") {
 		req.Header.Set(h[0], h[1])
 	}
 	resp, err := d.rpc.Do(req)
@@ -429,7 +429,7 @@ func (d *Driver) chatOnce(ctx context.Context, wire []byte, emit driver.Emit) (*
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	for _, h := range disguiseHeaders(ids) {
+	for _, h := range disguiseHeaders(ids, "chat") {
 		req.Header.Set(h[0], h[1])
 	}
 	resp, err := d.http.Do(req)
@@ -636,6 +636,12 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 			return uperr.New(uperr.ClassBadRequest, status,
 				"opencodezen: free-tier gate rejected the request (disguise/gate contract may have changed): %s", truncate(body, 300))
 		}
+		if uperr.IsEdgeBlock(body) {
+			return uperr.EdgeBlocked(status, "opencodezen: edge blocked: %s", truncate(body, 300))
+		}
+		if uperr.IsEdgeBlock(body) {
+			return uperr.EdgeBlocked(status, "opencodezen: edge blocked: %s", truncate(body, 300))
+		}
 		return uperr.New(uperr.ClassWAF, status, "opencodezen: %s", truncate(body, 300))
 	case status == 429:
 		return uperr.New(uperr.ClassUpstreamBusy, status, "opencodezen: %s", truncate(body, 300))
@@ -789,7 +795,7 @@ func (d *Driver) responsesOnce(ctx context.Context, wire []byte, emit driver.Emi
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	for _, h := range disguiseHeaders(ids) {
+	for _, h := range disguiseHeaders(ids, "responses") {
 		req.Header.Set(h[0], h[1])
 	}
 	resp, err := d.http.Do(req)

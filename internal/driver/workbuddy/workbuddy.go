@@ -71,6 +71,11 @@ const (
 	// model-level rate-limit message, which must stay soft_rate — so the
 	// wording decides, never the code alone (2026-10-20).
 	codeAccountRestricted = 11140
+	// codeChannelRefused: the channel check refused the caller's system
+	// prompt as an "unapproved channel". Request-level, not the account's
+	// fault; the driver retries once with the prompt moved into the user turn
+	// (BP-93).
+	codeChannelRefused = 11128
 )
 
 // Driver implements driver.Driver for the workbuddy channel.
@@ -167,18 +172,46 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		return nil, uperr.New(uperr.ClassAuth, 401, "workbuddy: missing access token")
 	}
 
-	body, err := d.buildBody(call, creds)
+	body, err := d.buildBody(call, creds, false)
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "workbuddy: build body: %v", err)
 	}
+	resp, err := d.postChat(ctx, creds, call, body)
+	if err != nil {
+		// 11128 "illegal API invocation from an unapproved channel" is the
+		// channel check refusing the caller's *system prompt* — not the
+		// account, and not something another account would accept. The edge
+		// only inspects system and assistant messages, so the same text
+		// passes once it arrives as the user's first turn (BP-93, following
+		// magpie-community/plugins workbuddy 0.1.29's field findings on both
+		// official builds).
+		if ue, ok := err.(*uperr.Error); ok && ue.Class == uperr.ClassBadRequest &&
+			strings.Contains(ue.Message, "11128") {
+			moved, berr := d.buildBody(call, creds, true)
+			if berr == nil {
+				log.Printf("workbuddy: 11128 channel refusal; resending with the system prompt as the user's instructions")
+				resp, err = d.postChat(ctx, creds, call, moved)
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
+	defer streamBody.Close()
+	return d.parseStream(ctx, streamBody, call, emit)
+}
 
+// postChat sends one chat request and returns the open response body on 200.
+// Any non-200 is classified into *uperr.Error.
+func (d *Driver) postChat(ctx context.Context, creds *Creds, call driver.ChatCall, body []byte) (*http.Response, error) {
 	url := d.chatBase(creds) + "/v2/chat/completions"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	if creds.DeviceToken != "" {
 		req.Header.Set("X-Device-Token", creds.DeviceToken)
@@ -193,12 +226,14 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		resp.Body.Close()
 		return nil, classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
 	}
-	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
-	defer streamBody.Close()
-	return d.parseStream(ctx, streamBody, call, emit)
+	return resp, nil
 }
 
-func (d *Driver) buildBody(call driver.ChatCall, creds *Creds) ([]byte, error) {
+// buildBody renders the upstream request. systemAsUser moves the caller's
+// system prompt into the first user turn inside <instructions> tags and puts
+// the upstream's own default system line first — the shape the channel check
+// accepts when it has refused the original (BP-93).
+func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool) ([]byte, error) {
 	req := call.Request
 	// Empty-name tool calls poison the session upstream-side (business error
 	// 11133): a stream that ends before the name fragment arrives yields
@@ -276,7 +311,12 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds) ([]byte, error) {
 	if mode == "" {
 		mode = "custom"
 	}
-	if mode == "custom" && d.promptReplace.Load() {
+	if systemAsUser {
+		// The retry must carry the caller's OWN system text, moved — not the
+		// replaced or stripped version — or the agent's instructions are lost
+		// and the model behaves like a different agent (BP-93).
+		messages = moveSystemToUser(messages)
+	} else if mode == "custom" && d.promptReplace.Load() {
 		messages = prompt.ReplaceSystem(messages, prompt.DefaultSystemPrompt)
 	} else {
 		messages = prompt.StripSystem(messages)
@@ -343,6 +383,85 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds) ([]byte, error) {
 		return nil, err
 	}
 	return prompt.SanitizeBody(raw), nil
+}
+
+// moveSystemToUser rewrites the conversation so the caller's system prompt is
+// read to the model as the first thing the user says, inside <instructions>
+// tags, with the upstream's own default system line first.
+//
+// Why: WorkBuddy's channel check reads system and assistant messages only and
+// refuses the whole request (400 code 11128 "Illegal API invocation from an
+// unapproved channel") when it recognizes an agent identity line there. The
+// identical text in a user message, a user message's parts, or a tool result
+// passes. Both official builds also insist the first message IS a system
+// prompt, hence the neutral lead (BP-93, field findings recorded by
+// magpie-community/plugins workbuddy 0.1.29).
+//
+// A system message further down the conversation becomes a user message where
+// it stands, so nothing is silently dropped.
+func moveSystemToUser(messages []map[string]any) []map[string]any {
+	if len(messages) == 0 {
+		return messages
+	}
+	var lead []string
+	i := 0
+	for ; i < len(messages); i++ {
+		if role, _ := messages[i]["role"].(string); role != "system" {
+			break
+		}
+		lead = append(lead, messageText(messages[i]["content"]))
+	}
+	out := make([]map[string]any, 0, len(messages)+1)
+	out = append(out, map[string]any{"role": "system", "content": prompt.DegradedSystemPrompt})
+	for _, m := range messages[i:] {
+		if role, _ := m["role"].(string); role == "system" {
+			m = map[string]any{"role": "user", "content": messageText(m["content"])}
+		}
+		out = append(out, m)
+	}
+	said := strings.TrimSpace(strings.Join(lead, "\n\n"))
+	if said != "" {
+		block := "<instructions>\n" + said + "\n</instructions>"
+		at := -1
+		for j, m := range out {
+			if role, _ := m["role"].(string); role == "user" {
+				at = j
+				break
+			}
+		}
+		if at < 0 {
+			out = append(out, map[string]any{"role": "user", "content": block})
+		} else {
+			switch c := out[at]["content"].(type) {
+			case string:
+				out[at] = map[string]any{"role": "user", "content": block + "\n\n" + c}
+			case []map[string]any:
+				out[at] = map[string]any{"role": "user",
+					"content": append([]map[string]any{{"type": "text", "text": block}}, c...)}
+			default:
+				out[at] = map[string]any{"role": "user", "content": block}
+			}
+		}
+	}
+	return out
+}
+
+// messageText flattens a wire message's content to text.
+func messageText(v any) string {
+	switch c := v.(type) {
+	case string:
+		return c
+	case []map[string]any:
+		var parts []string
+		for _, p := range c {
+			if t, ok := p["text"].(string); ok && t != "" {
+				parts = append(parts, t)
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
 }
 
 // emptyAssistantContent reports whether the serialized content carries no
@@ -640,6 +759,12 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		return e
 	case codeBadParams:
 		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: %s", msg)
+	case codeChannelRefused:
+		// The channel check refused the caller's system prompt. Request-level:
+		// no account penalty, and the driver retries once with the prompt moved
+		// into the user turn (BP-93). The code stays in the message so the
+		// retry can recognize it.
+		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: 11128 channel refused: %s", msg)
 	case codeAccountRestricted:
 		// Same code carries two meanings; the wording decides (see the
 		// constant's comment). Rate-limit wording keeps the account usable.
@@ -712,8 +837,9 @@ func isPromptTooLong(lowerBody string) bool {
 // call for that reason.
 //
 // Values are stable derivations from the account uid/session key, never random
-// per request: the official client reuses one machine id and one conversation
-// id per conversation, so rotating them would look *more* suspicious.
+// per request: the official client reuses one conversation id per
+// conversation, so rotating them would look *more* suspicious. Their *shapes*
+// matter too — see identity.go (BP-90).
 //
 // Set channels.workbuddy.disable_client_fingerprint to turn this off.
 func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call driver.ChatCall) {
@@ -725,53 +851,100 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 	if global {
 		origin, lang = "https://www.workbuddy.ai", "en-US"
 	}
-	ua := desktopUA
-	if global {
-		ua = desktopUAGlobal
-	}
-	req.Header.Set("User-Agent", ua)
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("User-Agent", workBuddyUA(global))
 	req.Header.Set("X-CodeBuddy-Request", "1")
-	req.Header.Set("Accept-Language", lang)
-	req.Header.Set("X-Product", "WorkBuddy")
+	// X-Product is the SKU segment: the real client always sends "SaaS" and
+	// carries the product name in X-IDE-Name/Type instead. Sending "WorkBuddy"
+	// here is a same-header-different-value tell — easier to match on than an
+	// extra header would be (BP-90, official captures of both packages).
+	req.Header.Set("X-Product", "SaaS")
 	req.Header.Set("X-Agent-Purpose", "conversation")
 	req.Header.Set("X-IDE-Name", "WorkBuddy")
 	req.Header.Set("X-IDE-Type", "WorkBuddy")
-	req.Header.Set("X-IDE-Version", clientVersion)
-	req.Header.Set("X-No-Enterprise-Id", "1")
+	req.Header.Set("X-IDE-Version", workBuddyClientVersion(global))
 	req.Header.Set("X-Domain", strings.TrimPrefix(origin, "https://"))
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
 	}
-	seed := creds.UID
-	if seed == "" {
-		seed = call.Account.ID
+	// Browser/CLI-shaped headers the desktop client never sends on chat:
+	// Origin, Referer, Accept-Language, X-Machine-ID, X-Session-ID,
+	// X-Requested-With and the X-No-* sentinels all came from the CodeBuddy
+	// CLI's conventions. Both official WorkBuddy packages omit every one of
+	// them here (BP-90) — an extra header is a fingerprint in its own right.
+	//
+	// channels.workbuddy.send_browser_headers restores them for A/B work.
+	if d.cfg.SendBrowserHeaders {
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Referer", origin+"/")
+		req.Header.Set("Accept-Language", lang)
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("X-No-Enterprise-Id", "1")
+		machine := stableHex(uidSeed(creds, call) + "|machine")
+		req.Header.Set("X-Machine-ID", machine)
+		req.Header.Set("X-Session-ID", machine)
 	}
-	machine := stableHex(seed + "|machine")
-	req.Header.Set("X-Machine-ID", machine)
-	req.Header.Set("X-Session-ID", machine)
-	conv := ""
-	if sk := call.Request.SessionKey; sk != "" {
-		conv = stableHex(seed + "|" + sk)
+	// The openai-node SDK / agent segment the client also sends.
+	req.Header.Set("X-Agent-Type", "main")
+	req.Header.Set("X-Agent-Intent", "craft")
+	req.Header.Set("X-Stainless-Lang", "js")
+	req.Header.Set("X-Stainless-Package-Version", stainlessSDKVersion)
+	req.Header.Set("X-Stainless-OS", "Windows")
+	req.Header.Set("X-Stainless-Arch", "x64")
+	req.Header.Set("X-Stainless-Runtime", "node")
+	req.Header.Set("X-Stainless-Runtime-Version", stainlessNodeVersion)
+	req.Header.Set("X-Stainless-Retry-Count", "0")
+
+	// Conversation header family. Every id here has the shape the real client
+	// sends: a dashed UUID v4 for the conversation, millisecond-prefixed 32-hex
+	// for per-message ids, and unrelated random values for trace/span.
+	seed := uidSeed(creds, call)
+	sk := call.Request.SessionKey
+	var conv, convReq, acp string
+	if sk != "" {
+		conv = stableUUIDV4(seed, sk, "")
+		// Turn-level aggregation key: stable per conversation, and a different
+		// value from the conversation id (the client keeps them apart).
+		convReq = stableUUIDV4(seed, sk, "turn")
+		acp = stableUUIDV4(seed, sk, "acp")
 	} else {
-		// No stable conversation identity: mint a per-request id. A constant
-		// fallback told upstream that every unrelated conversation was the
-		// same one — the 2026-10-20 field bug where two ZCode sessions shared
-		// a conversation id and the model's answers/images crossed over.
-		conv = randomHex()
+		// No stable conversation identity: mint fresh ids. A constant fallback
+		// told upstream that every unrelated conversation was the same one —
+		// the 2026-10-20 field bug where two ZCode sessions shared a
+		// conversation id and the model's answers/images crossed over.
+		conv, convReq, acp = randomUUIDV4(), randomUUIDV4(), randomUUIDV4()
 	}
-	msg := stableHex(conv + "|message")
+	msg := newMessageID()
+	trace := newTraceID()
+	span := newSpanID()
+	parent := newSpanID()
 	req.Header.Set("X-Conversation-ID", conv)
-	req.Header.Set("X-Conversation-Request-ID", conv)
+	req.Header.Set("X-Conversation-Request-ID", convReq)
 	req.Header.Set("X-Conversation-Message-ID", msg)
 	req.Header.Set("X-Request-ID", msg)
-	req.Header.Set("X-Root-Request-ID", conv)
-	req.Header.Set("X-Trace-ID", conv)
-	req.Header.Set("X-B3-TraceId", conv)
-	req.Header.Set("X-B3-SpanId", msg[:16])
+	req.Header.Set("X-Root-Request-ID", convReq)
+	// Trace and request ids never correlate on the real client: X-Trace-ID is
+	// its own random value and B3 follows the trace, not the request.
+	req.Header.Set("X-Trace-ID", trace)
+	req.Header.Set("X-B3-TraceId", trace)
+	req.Header.Set("X-B3-SpanId", span)
+	req.Header.Set("X-B3-ParentSpanId", parent)
 	req.Header.Set("X-B3-Sampled", "1")
+	// The client also sends the single-header b3 and W3C traceparent forms.
+	// Sending only the X-B3-* trio is a shape it never produces.
+	req.Header.Set("b3", trace+"-"+span+"-1-"+parent)
+	req.Header.Set("traceparent", "00-"+trace+"-"+span+"-01")
+	req.Header.Set("acp-connection-id", acp)
+}
+
+// uidSeed is the per-account isolation seed for derived ids.
+func uidSeed(creds *Creds, call driver.ChatCall) string {
+	if creds.UID != "" {
+		return creds.UID
+	}
+	if call.Account != nil {
+		return call.Account.ID
+	}
+	return ""
 }
 
 // stableHex derives a 32-hex id from a seed (deterministic per account/session,
@@ -835,6 +1008,9 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		e.ResetAt = parseResetWallClock(text)
 		return e
 	case status == 403:
+		if uperr.IsEdgeBlock(body) {
+			return uperr.EdgeBlocked(status, "workbuddy: edge blocked: %s", truncate(body, 300))
+		}
 		return uperr.New(uperr.ClassWAF, status, "workbuddy: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "workbuddy: %s", truncate(body, 300))

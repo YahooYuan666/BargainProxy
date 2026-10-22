@@ -61,6 +61,17 @@ type Config struct {
 	// accounts in a burst is a risk-control signal; the reference projects use
 	// ~0.8s between accounts and 1.05s between report chunks. 0 disables.
 	TaskAccountGap Duration `json:"task_account_gap"`
+	// TaskAccountSpread spreads the accounts of one automatic task run over a
+	// window instead of firing them back to back (BP-96). Several accounts of
+	// one pool doing the same thing within seconds is the most recognizable
+	// time shape there is; a fixed gap only changes "all at once" into "at a
+	// fixed beat". Each account's slot is derived from (task, account, date),
+	// so it is stable for the day and a restart does not reshuffle it. Manual
+	// (panel-clicked) runs are never spread. 0 disables spreading.
+	TaskAccountSpread Duration `json:"task_account_spread"`
+	// TaskAccountSpreadMinGap is the least distance between two accounts'
+	// slots in that window; colliding slots are pushed apart by it.
+	TaskAccountSpreadMinGap Duration `json:"task_account_spread_min_gap"`
 
 	// FirstByteWindow is the ceiling for the per-binding first-byte wait,
 	// applied to EVERY channel (BP-72). The wait is fallback_wait + 1s per
@@ -128,6 +139,13 @@ type WorkBuddySettings struct {
 	// checks, and bare requests are what upstream later flags as abnormal
 	// activity (2026-10-20 field finding). Set true only for A/B diagnosis.
 	DisableClientFingerprint bool `json:"disable_client_fingerprint"`
+	// SendBrowserHeaders re-adds the browser/CLI-shaped headers (Origin,
+	// Referer, Accept-Language, X-Machine-ID, X-Session-ID, the X-No-*
+	// sentinels). The real desktop client does NOT send them on the chat path
+	// (BP-90, both official packages); they were inherited from the CodeBuddy
+	// CLI's conventions, and an extra header is itself a fingerprint. Kept as
+	// an escape hatch for A/B diagnosis.
+	SendBrowserHeaders bool `json:"send_browser_headers"`
 }
 
 // TraeSettings configures the Trae CN channel.
@@ -293,15 +311,17 @@ func Default() *Config {
 		// One account per pool at a time: the anti-risk-control default
 		// (2026-10-20). Explicitly setting false restores multi-account
 		// concurrency within a pool.
-		SingleActivePerChannel: true,
-		TaskAccountGap:         Duration(800 * time.Millisecond),
-		RPCTimeout:             Duration(120 * time.Second),
-		HeaderTimeout:          Duration(300 * time.Second),
-		IdleTimeout:            Duration(300 * time.Second),
-		SessionTTL:             Duration(30 * time.Minute),
-		CostTTL:                Duration(6 * time.Hour),
-		LogRetention:           Duration(336 * time.Hour),
-		Sentinels:              []string{"DANGEROUS_ACTIVITY_BLOCKED"},
+		SingleActivePerChannel:  true,
+		TaskAccountGap:          Duration(800 * time.Millisecond),
+		TaskAccountSpread:       Duration(5 * time.Minute),
+		TaskAccountSpreadMinGap: Duration(30 * time.Second),
+		RPCTimeout:              Duration(120 * time.Second),
+		HeaderTimeout:           Duration(300 * time.Second),
+		IdleTimeout:             Duration(300 * time.Second),
+		SessionTTL:              Duration(30 * time.Minute),
+		CostTTL:                 Duration(6 * time.Hour),
+		LogRetention:            Duration(336 * time.Hour),
+		Sentinels:               []string{"DANGEROUS_ACTIVITY_BLOCKED"},
 	}
 }
 

@@ -736,6 +736,9 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		e.ResetAt = time.Now().Add(1 * time.Hour)
 		return e
 	case status == 403:
+		if uperr.IsEdgeBlock(body) {
+			return uperr.EdgeBlocked(status, "zcode: edge blocked: %s", truncate(body, 300))
+		}
 		return uperr.New(uperr.ClassWAF, status, "zcode: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "zcode: %s", truncate(body, 300))

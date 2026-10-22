@@ -438,7 +438,7 @@ func (c *Catalog) fetchLive(ctx context.Context, etag string) ([]string, string,
 	if err != nil {
 		return nil, "", err
 	}
-	for _, h := range disguiseHeaders(deriveRequestIDs([]byte(`{"messages":[]}`))) {
+	for _, h := range disguiseHeaders(deriveRequestIDs([]byte(`{"messages":[]}`)), "chat") {
 		req.Header.Set(h[0], h[1])
 	}
 	if etag != "" {

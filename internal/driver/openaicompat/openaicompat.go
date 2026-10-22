@@ -372,6 +372,12 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	case status == 402 || strings.Contains(lower, "insufficient") || strings.Contains(text, "余额"):
 		return uperr.WithFields(uperr.New(uperr.ClassHardCredit, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 403:
+		// A CDN/WAF edge block is not this account's fault: every account
+		// behind the same egress hits it, so charging them one by one turns
+		// one edge rule into a dead pool (BP-94).
+		if uperr.IsEdgeBlock(body) {
+			return uperr.WithFields(uperr.EdgeBlocked(status, "openaicompat: edge blocked: %s", truncate(body, 300)), body)
+		}
 		return uperr.WithFields(uperr.New(uperr.ClassWAF, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 400 || status == 404:
 		return uperr.WithFields(uperr.New(uperr.ClassBadRequest, status, "openaicompat: %s", truncate(body, 300)), body)

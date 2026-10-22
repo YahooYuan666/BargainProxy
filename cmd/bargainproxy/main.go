@@ -252,6 +252,7 @@ func main() {
 	sched := tasks.New(gw, st, p, log.Default())
 	sched.SetLogRetention(cfg.LogRetention.D())
 	sched.SetAccountGap(cfg.TaskAccountGap.D())
+	sched.SetAccountSpread(cfg.TaskAccountSpread.D(), cfg.TaskAccountSpreadMinGap.D())
 	sched.LoadSettings()
 	pn.SetTaskRunner(sched)
 	// OpenCode Zen automation: the panel drives sync/probe on the scheduler's

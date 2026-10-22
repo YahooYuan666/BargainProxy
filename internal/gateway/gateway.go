@@ -498,6 +498,12 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		}
 		if streamErr == nil {
 			g.pool.ApplyResult(lease.Account, req.Model, nil)
+			// Tell the pool what this answer said about the vendor's prefix
+			// cache: stickiness is only worth keeping while that cache is warm
+			// (BP-95).
+			if resp != nil {
+				g.pool.NoteSessionCache(binding.Channel, req.SessionKey, resp.Usage)
+			}
 			// Record the model use so the cost observer can classify billing
 			// tiers from balance deltas (credit channels only).
 			if binding.Channel == model.ChannelWorkBuddy || binding.Channel == model.ChannelTrae {
@@ -827,6 +833,11 @@ func DescribeError(err error) (status int, class string, message string) {
 		return 503, ue.Class, "upstream queue full (capacity), retry shortly: " + ue.Message
 	case uperr.ClassWAF:
 		return 502, ue.Class, "upstream edge blocked the request: " + ue.Message
+	case uperr.ClassEdgeBlock:
+		// A CDN/WAF edge refused the request before it reached the vendor.
+		// Same client-facing story as the WAF case, but no account was
+		// charged and the channel was paused instead (BP-94).
+		return 502, ue.Class, "upstream edge blocked the request (request-level, no account affected): " + ue.Message
 	case uperr.ClassNotFound:
 		// The upstream has no such path/model. The client's remedy is to fix
 		// the model name (or the gateway's route table), so answer the honest

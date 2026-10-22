@@ -81,6 +81,11 @@ type Scheduler struct {
 	// (the reference projects use ~0.8s between accounts and 1.05s between
 	// report chunks); 0 disables (2026-10-20).
 	accountGap time.Duration
+	// accountSpread is the window over which automatic task runs spread their
+	// accounts, and accountSpreadGap the least distance between two of them
+	// (BP-96). Zero window keeps the evenly-spaced behaviour.
+	accountSpread    time.Duration
+	accountSpreadGap time.Duration
 
 	// OpenCode Zen automation (BP-54/55; zen.go). Catalog sync only — probing
 	// is a one-shot at boot plus panel-driven, never scheduled.
@@ -136,8 +141,13 @@ func New(gw *gateway.Gateway, st store.Store, pl *pool.Pool, logger *log.Logger)
 		taskEnabled:  map[string]bool{},
 		lastProbeAt:  map[string]time.Time{},
 		accountGap:   800 * time.Millisecond,
-		checkinHours: []int{9, 21},
-		growthHours:  []int{9},
+		// Spread automatic runs over 5 minutes by default: enough that several
+		// accounts of one pool never share a recognizable burst, small enough
+		// that a 9:00 task is still a 9:00 task (BP-96).
+		accountSpread:    5 * time.Minute,
+		accountSpreadGap: 30 * time.Second,
+		checkinHours:     []int{9, 21},
+		growthHours:      []int{9},
 		// agentpoints activity_hours default 10, travel_hours default 9,21.
 		activityHours: []int{10},
 		travelHours:   []int{9, 21},
@@ -169,6 +179,103 @@ func (s *Scheduler) SetAccountGap(d time.Duration) {
 	s.mu.Unlock()
 }
 
+// SetAccountSpread sets the per-account spread window and its minimum gap
+// (config task_account_spread_minutes / ..._min_gap_seconds). 0 disables it,
+// keeping the old evenly-spaced behaviour (BP-96).
+func (s *Scheduler) SetAccountSpread(window, minGap time.Duration) {
+	s.mu.Lock()
+	s.accountSpread, s.accountSpreadGap = window, minGap
+	s.mu.Unlock()
+}
+
+// spreadOffsets is the per-account wait for one automatic run (BP-96).
+//
+// Why not just an even gap: several accounts of one pool doing the same thing
+// within a few seconds of each other is the most recognizable time shape there
+// is (a field report logged ten CN accounts checking in inside ten seconds of
+// 9:00). A fixed gap only turns "all at once" into "at a fixed beat", which is
+// just as recognizable. Each slot here is derived from (task, account, date),
+// so it is fixed for the day — a restart does not reshuffle it — and the slots
+// are then pushed apart so no two accounts land closer than minGap.
+//
+// ids empty (a panel click) or a single account means no spreading at all.
+func (s *Scheduler) spreadOffsets(taskType string, ids []string) []time.Duration {
+	s.mu.Lock()
+	window, minGap := s.accountSpread, s.accountSpreadGap
+	s.mu.Unlock()
+	if window <= 0 || len(ids) <= 1 {
+		return nil
+	}
+	if minGap <= 0 {
+		minGap = time.Second
+	}
+	// Slots live in the first (window - total*minGap) so pushing a collision
+	// up can never run past the window.
+	usable := window - time.Duration(len(ids))*minGap
+	if usable <= 0 {
+		// Too many accounts for the window: even spacing is all that fits.
+		out := make([]time.Duration, len(ids))
+		for i := range out {
+			out[i] = time.Duration(i) * minGap
+		}
+		return out
+	}
+	today := time.Now().In(Shanghai).Format("2006-01-02")
+	type slot struct {
+		at time.Duration
+		id string
+	}
+	slots := make([]slot, len(ids))
+	for i, id := range ids {
+		slots[i] = slot{at: time.Duration(fnv64a(taskType+"|"+id+"|"+today) % uint64(usable)), id: id}
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		if slots[i].at != slots[j].at {
+			return slots[i].at < slots[j].at
+		}
+		return slots[i].id < slots[j].id
+	})
+	for i := 1; i < len(slots); i++ {
+		if gap := slots[i].at - slots[i-1].at; gap < minGap {
+			slots[i].at = slots[i-1].at + minGap
+		}
+	}
+	out := make([]time.Duration, len(ids))
+	for _, sl := range slots {
+		for i, id := range ids {
+			if id == sl.id {
+				out[i] = sl.at
+				break
+			}
+		}
+	}
+	return out
+}
+
+// accountIDsOf maps accounts to their ids, for the spread hash.
+func accountIDsOf(accounts []*model.Account) []string {
+	ids := make([]string, len(accounts))
+	for i, a := range accounts {
+		ids[i] = a.ID
+	}
+	return ids
+}
+
+// fnv64a is a small stable hash (FNV-1a, 64-bit). Not cryptographic: it only
+// has to be the same value for the same input on every run.
+func fnv64a(s string) uint64 {
+	const (
+		offset = 14695981039346656037
+		prime  = 1099511628211
+	)
+	h := uint64(offset)
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
+}
+
 // accountPause sleeps the configured inter-account gap. Call between accounts
 // of the same run, never after the last one.
 func (s *Scheduler) accountPause(ctx context.Context) {
@@ -182,6 +289,18 @@ func (s *Scheduler) accountPause(ctx context.Context) {
 	case <-ctx.Done():
 	case <-time.After(d):
 	}
+}
+
+// accountWait sleeps this account's share of the spread window, then the plain
+// inter-account gap. offset comes from spreadOffsets; 0 means "no wait".
+func (s *Scheduler) accountWait(ctx context.Context, offset time.Duration) {
+	if offset > 0 {
+		select {
+		case <-ctx.Done():
+		case <-time.After(offset):
+		}
+	}
+	s.accountPause(ctx)
 }
 
 // TaskTypes lists the runnable task types (panel contract).
@@ -722,9 +841,19 @@ func (s *Scheduler) runPerAccount(
 	today := time.Now().In(Shanghai).Format("2006-01-02")
 	var notes []string
 	var firstErr error
+	// Automatic runs spread their accounts over the spread window; an
+	// account-targeted run (a panel click) never waits (BP-96).
+	var offsets []time.Duration
+	if accountID == "" {
+		ids := make([]string, len(accounts))
+		for i, a := range accounts {
+			ids[i] = a.ID
+		}
+		offsets = s.spreadOffsets(taskType, ids)
+	}
 	for i, acc := range accounts {
-		if i > 0 {
-			s.accountPause(ctx)
+		if offsets != nil {
+			s.accountWait(ctx, offsets[i])
 		}
 		if acc.Disabled && !s.disabledKeepAliveEligible(taskType) {
 			continue
@@ -1207,9 +1336,19 @@ func (s *Scheduler) probeAll(ctx context.Context, accountID string) (string, err
 		if !ok {
 			continue
 		}
-		for i, acc := range s.accountsOf(ch) {
-			if i > 0 {
-				s.accountPause(ctx)
+		probeAccounts := s.accountsOf(ch)
+		var probeOffsets []time.Duration
+		if accountID == "" {
+			ids := make([]string, len(probeAccounts))
+			for i, a := range probeAccounts {
+				ids[i] = a.ID
+			}
+			probeOffsets = s.spreadOffsets(TaskProbeAll, ids)
+		}
+		for i, acc := range probeAccounts {
+			// Probes are upstream traffic too: spread them on automatic runs.
+			if probeOffsets != nil {
+				s.accountWait(ctx, probeOffsets[i])
 			}
 			if (acc.Disabled && !s.includeDisabledNow()) || (accountID != "" && acc.ID != accountID) {
 				continue
@@ -1266,9 +1405,12 @@ func (s *Scheduler) refreshTokens(ctx context.Context) (string, error) {
 		if !ok {
 			continue
 		}
-		for i, acc := range s.accountsOf(ch) {
-			if i > 0 {
-				s.accountPause(ctx)
+		refreshAccounts := s.accountsOf(ch)
+		refreshOffsets := s.spreadOffsets(TaskRefreshTokens, accountIDsOf(refreshAccounts))
+		for i, acc := range refreshAccounts {
+			// Token refresh is a per-account RPC; spread it the same way.
+			if refreshOffsets != nil {
+				s.accountWait(ctx, refreshOffsets[i])
 			}
 			if acc.Disabled && !s.includeDisabledNow() {
 				continue

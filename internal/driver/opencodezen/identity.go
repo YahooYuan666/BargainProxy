@@ -28,7 +28,27 @@ const AnonymousKey = "public"
 // openCodeClientVersion is the CLI version the disguise mimics. Upstream
 // tightens against old versions; bump here when it does (2026-10-18: the
 // free lane started answering 400 FreeTierError to 1.18.31).
-const openCodeClientVersion = "1.19.3"
+//
+// 1.19.0 is the version the reference implementation reproduces byte for byte
+// (magpie-community/plugins packages/zen-free), captured from the release
+// binary's own requests. Our previous "1.19.3 (windows amd64; node20)" string
+// was invented: the real CLI reports ai-sdk provider-utils and Bun runtime
+// segments instead, so the whole UA differed in shape, not just in version
+// (BP-97). That also explains why bumping the version number alone (BP-72) did
+// not lift the gate.
+const openCodeClientVersion = "1.19.0"
+
+// openCodeRuntimeVersion is the Bun runtime segment of the real UA.
+const openCodeRuntimeVersion = "1.3.14"
+
+// openCodeProviderUtils is the ai-sdk provider-utils version, which differs per
+// protocol because each protocol's ai-sdk package bundles its own copy (values
+// captured from the release binary).
+var openCodeProviderUtils = map[string]string{
+	"chat":      "4.0.23",
+	"responses": "4.0.40",
+	"anthropic": "4.0.46",
+}
 
 // gateToolNames are the two function tools the free lane requires on every
 // request (live 2026-10-16: a request without them answers 403
@@ -253,15 +273,28 @@ func randomHex32() string {
 	return hex.EncodeToString(b[:])
 }
 
-// openCodeUserAgent mimics the official CLI UA string.
-func openCodeUserAgent() string {
-	return fmt.Sprintf("opencode/%s (windows amd64; node20)", openCodeClientVersion)
+// openCodeUserAgent is the CLI's own User-Agent for one protocol:
+//
+//	opencode/<ver> ai-sdk/provider-utils/<sdk> runtime/bun/<bun>
+//
+// The ai-sdk segment differs per protocol because each protocol's ai-sdk
+// package bundles its own provider-utils copy (BP-97, values captured from the
+// release binary). An unknown protocol falls back to the chat segment.
+func openCodeUserAgent(protocol string) string {
+	sdk, ok := openCodeProviderUtils[protocol]
+	if !ok {
+		sdk = openCodeProviderUtils["chat"]
+	}
+	return fmt.Sprintf("opencode/%s ai-sdk/provider-utils/%s runtime/bun/%s",
+		openCodeClientVersion, sdk, openCodeRuntimeVersion)
 }
 
 // disguiseHeaders returns the full header set every upstream request carries.
-func disguiseHeaders(ids requestIDs) [][2]string {
+// protocol picks the ai-sdk segment of the User-Agent ("chat"/"responses"/
+// "anthropic"); "" means chat.
+func disguiseHeaders(ids requestIDs, protocol string) [][2]string {
 	return [][2]string{
-		{"user-agent", openCodeUserAgent()},
+		{"user-agent", openCodeUserAgent(protocol)},
 		{"x-opencode-client", "cli"},
 		{"x-opencode-session", ids.session},
 		{"x-session-affinity", ids.session},

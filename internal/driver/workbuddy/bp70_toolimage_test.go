@@ -25,7 +25,7 @@ func TestBuildBodyToolMessageIsPlainText(t *testing.T) {
 		},
 	}}
 	creds := &Creds{AccessToken: fakeToken("access"), UID: "u-100", Realm: "cn"}
-	raw, err := d.buildBody(call, creds)
+	raw, err := d.buildBody(call, creds, false)
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}

@@ -196,18 +196,29 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	}
 	var lastErr error
 	// 10605 is the upstream's QUEUEING PROTOCOL, not a rate limit: the answer
-	// carries retryAfterSeconds and the official client sleeps exactly that
-	// long before retrying the same request. Bounded here by queueMaxRounds
-	// and queueWaitBudget so a gateway request never parks for an hour
-	// (2026-10-21, qoder2api-hub #38/#57 parity — a fixed 2s single retry is
-	// what kept the deepseek-v4.1-flash binding failing).
+	// carries retryAfterSeconds and the official client waits before resending
+	// the SAME request. Two mechanisms, in order (BP-92):
+	//
+	//   1. Queue-status polling: ask /ask/queue/status with the request's
+	//      request_set_id until the queue says the request is no longer
+	//      queued, then resend with that same request_set_id — that identity
+	//      is what makes Qoder treat the resend as the same queued request
+	//      rather than a new one at the back of the line.
+	//   2. If the status endpoint is missing or unreadable, fall back to the
+	//      previous behaviour: sleep retryAfterSeconds and resend.
+	//
+	// Both are bounded by queueWaitBudget so a gateway request never parks for
+	// an hour; past the budget the answer goes back to the client as a busy
+	// signal with the wait the upstream asked for.
 	queueRounds := 0
 	var queueSpent time.Duration
+	requestSetID := ""
 	for attempt := 0; attempt < 1+queueMaxRounds; attempt++ {
 		if err := d.ensureFreshSession(ctx, rt); err != nil {
 			return nil, qoderError(err)
 		}
-		res, emitted, err := d.streamOnce(ctx, rt, call, emit)
+		var usedSetID string
+		res, emitted, err := d.streamOnce(ctx, rt, call, emit, requestSetID, &usedSetID)
 		if err == nil {
 			return res, nil
 		}
@@ -237,16 +248,41 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 				busy.ResetAt = time.Now().Add(wait)
 				return nil, busy
 			}
+			// The resend must carry the same request_set_id the queued request
+			// used (or, if the body named one, that one).
+			if id := queueRequestSetID(ue.Message); id != "" {
+				requestSetID = id
+			} else {
+				requestSetID = usedSetID
+			}
 			queueRounds++
-			queueSpent += wait
-			jitter := time.Duration(randIntN(2000)) * time.Millisecond
-			log.Printf("qoder: upstream queued (%s) — waiting %s (round %d/%d, spent %s)",
-				clip(ue.Message, 60), wait.Round(time.Second), queueRounds, queueMaxRounds,
-				queueSpent.Round(time.Second))
-			select {
-			case <-ctx.Done():
-				return nil, qoderError(ctx.Err())
-			case <-time.After(wait + jitter):
+			state, haveState := parseQueueState([]byte(extractJSONObject(ue.Message)))
+			polled := false
+			rt.mu.Lock()
+			sess := rt.sess
+			rt.mu.Unlock()
+			if haveState && requestSetID != "" && sess != nil {
+				deadline := time.Now().Add(minDuration(wait, queuePollBudget))
+				if d.awaitQueue(ctx, sess, state, requestSetID, deadline) {
+					polled = true
+				} else if ctx.Err() != nil {
+					return nil, qoderError(ctx.Err())
+				} else {
+					logQueueFallback("queue not ready or status unreadable")
+				}
+			}
+			if !polled {
+				// Fallback: the plain sleep the previous behaviour used.
+				queueSpent += wait
+				jitter := time.Duration(randIntN(2000)) * time.Millisecond
+				log.Printf("qoder: upstream queued (%s) — waiting %s (round %d/%d, spent %s)",
+					clip(ue.Message, 60), wait.Round(time.Second), queueRounds, queueMaxRounds,
+					queueSpent.Round(time.Second))
+				select {
+				case <-ctx.Done():
+					return nil, qoderError(ctx.Err())
+				case <-time.After(wait + jitter):
+				}
 			}
 			continue
 		}
@@ -255,11 +291,14 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	return nil, lastErr
 }
 
-func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, bool, error) {
+func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCall, emit driver.Emit, requestSetID string, usedSetID *string) (*ir.ChatResponse, bool, error) {
 	cat := d.getCatalog(ctx, rt)
-	body, display, qoderKey, toolsEnabled, err := d.buildChatBody(call, rt, cat)
+	body, display, qoderKey, toolsEnabled, setId, err := d.buildChatBody(call, rt, cat, requestSetID)
 	if err != nil {
 		return nil, false, err
+	}
+	if usedSetID != nil {
+		*usedSetID = setId
 	}
 	encoded, err := gatewayEncode(body)
 	if err != nil {
@@ -535,21 +574,28 @@ func (d *Driver) streamLineError(line string) error {
 }
 
 // buildChatBody converts the IR request into the Qoder wire body.
-func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCatalog) ([]byte, string, string, bool, error) {
+func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCatalog, requestSetID string) ([]byte, string, string, bool, string, error) {
 	payload, err := irPayload(call)
 	if err != nil {
-		return nil, "", "", false, uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", err)
+		return nil, "", "", false, "", uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", err)
 	}
 	display, qoderKey, err := cat.resolveModel(call.UpstreamModel)
 	if err != nil {
-		return nil, "", "", false, uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", err)
+		return nil, "", "", false, "", uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", err)
 	}
 	messages := extractMessages(payload["messages"])
 	b := newRequestBody()
 	nid := newUUID()
 	b.RequestID = nid
 	b.ChatRecordID = nid
-	b.RequestSetID = newUUID()
+	// The queue protocol recognises a resend as the SAME queued request only
+	// when it carries the same request_set_id (BP-92). A fresh one each retry
+	// puts the request at the back of the queue again, which is why a queued
+	// binding used to keep failing.
+	if requestSetID == "" {
+		requestSetID = newUUID()
+	}
+	b.RequestSetID = requestSetID
 	b.SessionID = newUUID()
 	b.Stream = true
 	rt.mu.Lock()
@@ -564,11 +610,11 @@ func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCata
 
 	effort, effErr := resolveReasoningEffort(payload)
 	if effErr != nil {
-		return nil, "", "", false, uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", effErr)
+		return nil, "", "", false, "", uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", effErr)
 	}
 	params, perr := buildParameters(payload, effort, cat.maxOutputTokens(qoderKey))
 	if perr != nil {
-		return nil, "", "", false, uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", perr)
+		return nil, "", "", false, "", uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", perr)
 	}
 	b.Parameters = params
 	reasoningOn := cat.reasoningDefault(qoderKey)
@@ -595,7 +641,7 @@ func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCata
 		}
 	}
 	if hasImages && !cat.VisionModels[display] {
-		return nil, "", "", false, uperr.New(uperr.ClassBadRequest, 400,
+		return nil, "", "", false, "", uperr.New(uperr.ClassBadRequest, 400,
 			"qoder: image input is not supported by model %q", display)
 	}
 	if hasImages {
@@ -604,9 +650,9 @@ func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCata
 	}
 	raw, err := marshalNoEscape(b)
 	if err != nil {
-		return nil, "", "", false, uperr.New(uperr.ClassInternal, 0, "qoder: marshal body: %v", err)
+		return nil, "", "", false, "", uperr.New(uperr.ClassInternal, 0, "qoder: marshal body: %v", err)
 	}
-	return raw, display, qoderKey, toolsEnabled, nil
+	return raw, display, qoderKey, toolsEnabled, requestSetID, nil
 }
 
 // irPayload renders the IR request in the OpenAI shape the chat.go converters

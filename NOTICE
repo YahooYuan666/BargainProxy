@@ -37,9 +37,36 @@ projects. Attribution and license compliance:
    **gemini-openai-proxy** (https://github.com/zhu327/gemini-openai-proxy,
    MIT) — layering and protocol-mapping ideas.
 
+6. **misakano7545/workbuddy2api-panel**
+   (https://github.com/misakano7545/workbuddy2api-panel, MIT) — the actively
+   maintained line of the same workbuddy2api lineage; later WorkBuddy behaviour
+   was checked against it. No code copied beyond what item 1 already covers.
+
+7. **magpie** (https://github.com/yetone/magpie, MIT) — native session-header
+   affinity, separating a failure's cause from how long to rest, and repairing
+   untyped enums in tool schemas. Re-implemented, no code copied.
+
+8. **magpie-community/plugins** (https://github.com/magpie-community/plugins, MIT),
+   packages trae, autoclaw and qoder — the TRAE function ladder
+   (chat_v3 / solo_work_lite / solo_agent / solo_agent_lite), the AutoClaw CN
+   managed-gateway channel, and the Qoder 10605 queue semantics. Behaviour
+   reference only.
+
+9. **qoder2api-hub** (https://github.com/shuishuipingan/qoder2api-hub, MIT) and
+   **Trae2api-cn** (https://github.com/autumnsentiment/Trae2api-cn, MIT) —
+   Qoder's queued-request protocol, and TRAE model names plus multimodal
+   payload shape.
+
+## Behaviour noted, no code taken (upstream has no license)
+
+10. **qoder2api** (https://github.com/Zhengyuuuui/qoder2api) and **autoclaw2api**
+    (https://github.com/Zhengyuuuui/autoclaw2api) publish no license, so only
+    observable behaviour was recorded (device-fingerprint derivation, channel
+    inventory). Nothing from either repository was copied.
+
 ## User-owned algorithm
 
-6. The greedy burn-rate scheduling for window-quota accounts
+11. The greedy burn-rate scheduling for window-quota accounts
    (`weeklyGreed = remainingFraction / max(secondsToReset, 600)`) follows the
    scheduler the user authored in their AIClient2API fork.
 

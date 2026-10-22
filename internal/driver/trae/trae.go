@@ -754,6 +754,9 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	case status == 413:
 		return uperr.New(uperr.ClassBadRequest, status, "trae: %s", truncate(body, 300))
 	case status == 403:
+		if uperr.IsEdgeBlock(body) {
+			return uperr.EdgeBlocked(status, "trae: edge blocked: %s", truncate(body, 300))
+		}
 		return uperr.New(uperr.ClassWAF, status, "trae: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "trae: %s", truncate(body, 300))

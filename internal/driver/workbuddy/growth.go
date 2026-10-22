@@ -23,19 +23,28 @@ import (
 	"strings"
 	"time"
 
+	"bargainproxy/internal/driver"
+	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
 	"bargainproxy/internal/uperr"
 )
 
 const (
-	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
-	// desktopUAGlobal is the international package's UA. The second brand
-	// segment differs by distribution: CN keeps the camel-case product name,
-	// the international build rewrites it to the lowercase slug (misakano
-	// upstream's packet capture, 2026-10-21). Sending the CN brand to the
-	// global edge looks like a foreign client and risks 403 11140.
-	desktopUAGlobal       = "WorkBuddy/5.5.6 workbuddy-ai/5.5.6 CLI/2.137.1"
-	clientVersion         = "5.5.6"
+	// desktopUA is the CN package's User-Agent. The first segment is always the
+	// camel-case product name (openai-node's buildUserAgent does that) and only
+	// the second segment follows the distribution: CN keeps the camel-case
+	// product name, the international build rewrites it to the lowercase slug
+	// (official packet captures of both packages, 2026-10-22). Version segments
+	// are per realm — the two distributions ship on different cadences, so
+	// sending CN's number to the global edge does not match any real build.
+	desktopUA             = "WorkBuddy/" + clientVersionCN + " WorkBuddy/" + clientVersionCN + " CLI/" + cliVersion
+	desktopUAGlobal       = "WorkBuddy/" + clientVersionGlobal + " workbuddy-ai/" + clientVersionGlobal + " CLI/" + cliVersion
+	clientVersionCN       = "5.8.3"
+	clientVersionGlobal   = "5.8.4"
+	cliVersion            = "2.161.0"
+	clientVersion         = clientVersionCN // legacy alias used by the growth/billing paths
+	stainlessSDKVersion   = "6.25.0"
+	stainlessNodeVersion  = "v22.21.1"
 	reportPath            = "/v2/report"
 	appearanceSetPath     = "/v2/user-asset/appearance/set"
 	growthTasksPath       = "/v2/activity/growth/tasks"
@@ -55,6 +64,25 @@ const (
 	buddyTaskIncomplete   = "first_buddy task not completed yet"
 	desktopWebEventOrigin = "/C:/Program%20Files/WorkBuddy/resources/app.asar/renderer/index.html"
 )
+
+// workBuddyUA is the desktop client's User-Agent for a realm. The first
+// segment stays the camel-case product name on both packages; only the second
+// brand segment follows the distribution, and the version numbers differ
+// because the two builds ship on different cadences.
+func workBuddyUA(global bool) string {
+	if global {
+		return desktopUAGlobal
+	}
+	return desktopUA
+}
+
+// workBuddyClientVersion is the X-IDE-Version the client reports for a realm.
+func workBuddyClientVersion(global bool) string {
+	if global {
+		return clientVersionGlobal
+	}
+	return clientVersionCN
+}
 
 // webBase resolves the web-domain base (configurable; defaults to the
 // official CN web host).
@@ -513,7 +541,7 @@ func (d *Driver) desktopChatWithExpert(ctx context.Context, creds *Creds, expert
 }
 
 func (d *Driver) desktopChatOnce(ctx context.Context, creds *Creds, expertID string) (string, string, error) {
-	conversationID := fmt.Sprintf("bp-conv-%d", time.Now().UnixNano())
+	conversationID := randomUUIDV4()
 	body := map[string]any{
 		"model": "fast-model",
 		"messages": []any{
@@ -534,19 +562,20 @@ func (d *Driver) desktopChatOnce(ctx context.Context, creds *Creds, expertID str
 	h := req.Header
 	h.Set("Authorization", "Bearer "+creds.AccessToken)
 	h.Set("Content-Type", "application/json")
-	h.Set("Accept", "text/event-stream")
-	h.Set("User-Agent", desktopUA)
+	h.Set("Accept", "application/json")
+	h.Set("User-Agent", workBuddyUA(creds.RealmOrDefault() == "global"))
 	h.Set("X-Domain", base)
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", creds.UID)
-	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
-	h.Set("X-Agent-Intent", "craft")
-	h.Set("X-Agent-Type", "main")
-	h.Set("X-IDE-Name", "WorkBuddy")
-	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
-	h.Set("x-codebuddy-request", "1")
+	// A hand-built header set drifted from the chat path (it missed the
+	// trace/B3/stainless/acp segment and pinned X-IDE-Version). Route it
+	// through the same builder so the two paths cannot diverge again (BP-90).
+	call := driver.ChatCall{
+		Account:       nil,
+		UpstreamModel: "fast-model",
+		Request:       &ir.ChatRequest{SessionKey: conversationID},
+	}
+	d.applyClientFingerprint(req, creds, call)
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)
 	}
@@ -1063,7 +1092,7 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 
 	// 1. Chat activity (lights chat_5 progress + growth streak).
 	for i := 0; i < 5; i++ {
-		cid := fmt.Sprintf("bp-chat5-%d-%d", time.Now().UnixNano(), i)
+		cid := randomUUIDV4()
 		err := d.ReportChatActivity(ctx, acc, cid, "", "", "")
 		if err != nil {
 			record("chat_5", err, "")
@@ -1075,7 +1104,7 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 2. Real chat on glm-5.2 (Model_chat_GLM5.2).
-	glmCid := fmt.Sprintf("bp-glm52-%d", time.Now().UnixNano())
+	glmCid := randomUUIDV4()
 	if err := d.ReportChatActivity(ctx, acc, glmCid, "", "glm-5.2", "glm-5.2"); err == nil {
 		record("Model_chat_GLM5.2", nil, "glm-5.2 activity reported")
 	} else {
@@ -1091,7 +1120,7 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 4. Desktop chat chain (RichMeow_Chat).
-	conv := fmt.Sprintf("bp-rich-%d", time.Now().UnixNano())
+	conv := randomUUIDV4()
 	reqID := uuidToken()
 	if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopChatSequence(conv, reqID, "msg-rich", "fast-model", "fast-model")); err == nil {
 		record("RichMeow_Chat", nil, "desktop chat chain sent")
@@ -1108,7 +1137,7 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 6. Automation create event (automation_1).
-	if err := d.reportDesktopEvents(ctx, mustCreds(acc), []desktopEvent{DesktopAutomationCreateEvent("bp-auto-" + fmt.Sprint(time.Now().Unix()%100000))}); err == nil {
+	if err := d.reportDesktopEvents(ctx, mustCreds(acc), []desktopEvent{DesktopAutomationCreateEvent(randomUUIDV4())}); err == nil {
 		record("automation_1", nil, "automation event sent")
 	} else {
 		record("automation_1", err, "")
@@ -1128,7 +1157,7 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 	allTemplates := true
 	for _, tpl := range templates {
-		conv := fmt.Sprintf("bp-tpl-%s-%d", tpl.id, time.Now().UnixNano())
+		conv := randomUUIDV4()
 		reqID := uuidToken()
 		if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopTemplateUseSequence(conv, reqID, tpl.id, tpl.name)); err != nil {
 			allTemplates = false
@@ -1137,12 +1166,12 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	record("template_5", errFromBool(allTemplates), "5 template chains sent")
 
 	// 9. Playbook prompt (playbook_prompt).
-	pbConv := fmt.Sprintf("bp-pb-%d", time.Now().UnixNano())
+	pbConv := randomUUIDV4()
 	pbReq := uuidToken()
 	record("playbook_prompt", d.reportDesktopEvents(ctx, mustCreds(acc), DesktopPlaybookPromptSequence(pbConv, pbReq, "case-bp-1", "灵感案例")), "playbook chain sent")
 
 	// 10. Design canvas (create_canvas).
-	cvConv := fmt.Sprintf("bp-cv-%d", time.Now().UnixNano())
+	cvConv := randomUUIDV4()
 	cvReq := uuidToken()
 	record("create_canvas", d.reportDesktopEvents(ctx, mustCreds(acc), DesktopDesignCanvasSequence(cvConv, cvReq)), "canvas chain sent")
 

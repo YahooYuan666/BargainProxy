@@ -5,7 +5,9 @@
 package prompt
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -100,6 +102,13 @@ func sanitizeMap(m map[string]any) {
 // account uid and the conversation id (panel parity: isolates upstream
 // prefix caching per account, which is a significant cost reduction).
 //
+// The value is a UUID-v4-shaped hash, not "<uid>:<conversation>". The real
+// client sends a UUID here; a gateway that writes the account uid in the
+// clear into a request body is self-identifying, and the uid is exactly the
+// field a risk-control rule would key on (BP-90, following
+// misakano7545/workbuddy2api-panel issue #51). The uid still participates in
+// the hash, so cross-account isolation is unchanged.
+//
 // No conversation identity means NO cache key: falling back to the bare uid
 // gives every unrelated conversation one shared prefix slot, which is exactly
 // the cross-conversation contamination seen on 2026-10-20. Omitting the field
@@ -108,5 +117,19 @@ func InjectPromptCacheKey(body map[string]any, uid, conversationID string) {
 	if uid == "" || conversationID == "" {
 		return
 	}
-	body["prompt_cache_key"] = uid + ":" + conversationID
+	body["prompt_cache_key"] = StableUUID(uid + "|" + conversationID)
+}
+
+// StableUUID derives a UUID-v4-shaped (36-char, dashed) value from a seed.
+//
+// The version and variant nibbles are set per RFC 4122: leaving them as they
+// fall would put impossible values in the `4xxx` / `[89ab]xxx` positions,
+// which is a distinguishable trait rather than a disguise.
+func StableUUID(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	var u [16]byte
+	copy(u[:], sum[:16])
+	u[6] = (u[6] & 0x0f) | 0x40
+	u[8] = (u[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }

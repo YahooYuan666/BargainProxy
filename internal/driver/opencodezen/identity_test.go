@@ -43,7 +43,7 @@ func TestCanonicalSessionShapeAndStability(t *testing.T) {
 
 func TestDisguiseHeadersComplete(t *testing.T) {
 	ids := deriveRequestIDs([]byte(`{"messages":[{"role":"user","content":"hi"}]}`))
-	headers := disguiseHeaders(ids)
+	headers := disguiseHeaders(ids, "chat")
 	names := map[string]bool{}
 	for _, h := range headers {
 		names[h[0]] = true
@@ -53,8 +53,31 @@ func TestDisguiseHeadersComplete(t *testing.T) {
 			t.Fatalf("missing header %s", want)
 		}
 	}
-	if !strings.HasPrefix(openCodeUserAgent(), "opencode/") {
-		t.Fatalf("UA = %q", openCodeUserAgent())
+	if ua := openCodeUserAgent("chat"); !strings.HasPrefix(ua, "opencode/") {
+		t.Fatalf("UA = %q", ua)
+	}
+}
+
+// TestUserAgentMatchesOfficialShape pins BP-97: the real CLI's UA carries the
+// ai-sdk provider-utils and Bun runtime segments, and the provider-utils
+// version differs per protocol. An invented "(windows amd64; node20)" tail is a
+// different shape entirely, which is why bumping only the version number never
+// lifted the free-tier gate.
+func TestUserAgentMatchesOfficialShape(t *testing.T) {
+	for protocol, sdk := range openCodeProviderUtils {
+		want := "opencode/" + openCodeClientVersion + " ai-sdk/provider-utils/" + sdk +
+			" runtime/bun/" + openCodeRuntimeVersion
+		if got := openCodeUserAgent(protocol); got != want {
+			t.Fatalf("UA(%s) = %q, want %q", protocol, got, want)
+		}
+	}
+	// An unknown protocol falls back to the chat segment rather than sending
+	// an empty ai-sdk version.
+	if got, want := openCodeUserAgent("gemini"), openCodeUserAgent("chat"); got != want {
+		t.Fatalf("unknown protocol UA = %q, want the chat segment %q", got, want)
+	}
+	if openCodeClientVersion != "1.19.0" {
+		t.Fatalf("client version = %q, want the captured 1.19.0", openCodeClientVersion)
 	}
 }
 

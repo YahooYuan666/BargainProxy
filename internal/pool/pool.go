@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
 	"bargainproxy/internal/uperr"
 )
@@ -129,8 +130,7 @@ type Params struct {
 	// machines are untouched. 0 disables the pause (still no rotation, still
 	// no account penalty). Default 45s.
 	UpstreamBusyCooldown time.Duration
-	// NotFoundPause is the channel+model shared pause applied when the upstream
-	// answers 404 (the path or model does not exist there). It is NOT an
+	// NotFoundPause is the channel+model shared pause applied when the upstream	// answers 404 (the path or model does not exist there). It is NOT an
 	// account state change: no cooldown, no failure count — the same request
 	// would 404 on every account of that channel. The pause only stops a
 	// request storm from hammering a dead route while the binding loop
@@ -143,7 +143,13 @@ type Params struct {
 	// upstream window (a 6004 can state hours). The upstream reset is kept in
 	// ResetAt for the panel. Default 2h.
 	ModelRateHoldCap time.Duration
-	Now              func() time.Time
+	// EdgeBlockPause is the channel-wide pause applied when a CDN/WAF edge
+	// refused a request (Cloudflare 1010 and kin). Edge blocks are
+	// request-level: every account behind the same egress hits them, so the
+	// pause goes on the channel and no account is charged (BP-94).
+	// Default 60s; 0 disables the pause.
+	EdgeBlockPause time.Duration
+	Now            func() time.Time
 }
 
 // Pool is the account pool.
@@ -156,6 +162,7 @@ type Pool struct {
 	inflight    map[string]int
 	waiters     map[string]chan struct{} // channel -> broadcast on release
 	seq         uint64                   // monotonic pick sequence
+	sinkSeq     uint64                   // monotonic sink order (BP-91)
 	limits      map[string]int           // channel -> per-account in-flight limit
 	onChange    func(*model.Account)     // serial state-only snapshots outside the pool lock
 	pending     map[string]*model.Account
@@ -183,6 +190,17 @@ type Pool struct {
 type sessionBinding struct {
 	accountID string
 	lastUsed  time.Time
+
+	// Cache evidence from the last answer (BP-95). A conversation is worth
+	// keeping on its account only while what the vendor cached of it is worth
+	// keeping — that is the whole reason to stay: the next turn reads the
+	// prefix instead of paying for it again. Once the cache has gone cold, or
+	// the vendor never reported caching anything, staying buys nothing and
+	// costs the pool its load spreading.
+	cacheKnown bool
+	cacheRead  int // tokens the last answer read from the vendor's cache
+	cacheWrite int // tokens it wrote to it
+	answeredAt time.Time
 }
 
 // New builds a pool. limits maps channel -> per-account max in-flight.
@@ -219,6 +237,9 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 	}
 	if params.NotFoundPause <= 0 {
 		params.NotFoundPause = 60 * time.Second
+	}
+	if params.EdgeBlockPause <= 0 {
+		params.EdgeBlockPause = 60 * time.Second
 	}
 	if params.ModelRateHoldCap <= 0 {
 		params.ModelRateHoldCap = 2 * time.Hour
@@ -558,13 +579,20 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 			// AdmitSticky (short grace after a rest); only AdmitNone
 			// unbinds it. That keeps a mid-conversation account from being
 			// swapped out just because its rest ended moments ago.
-			if a == nil || p.admissionLocked(a, modelName, now) == AdmitNone || p.floorBlockedLocked(a, modelName, now) {
+			switch {
+			case a == nil,
+				p.admissionLocked(a, modelName, now) == AdmitNone,
+				p.floorBlockedLocked(a, modelName, now),
+				// Staying is only worth it while the vendor's cache of this
+				// conversation is still warm: that cache is the entire reason
+				// to keep the conversation where it is (BP-95).
+				!p.stickyWorthLocked(b, now):
 				delete(p.sessions, key) // broken for this model: fall through and reselect
-			} else if p.inflight[a.ID] < p.limitForAccount(a) {
+			case p.inflight[a.ID] < p.limitForAccount(a):
 				b.lastUsed = now
 				p.sessions[key] = b
 				return p.leaseLocked(a, now), nil, false
-			} else {
+			default:
 				// Bound account healthy but full: hold the request for it
 				// rather than drifting to another account (no-drift queue,
 				// bounded by Acquire's deadline). The next tryAcquire round
@@ -838,6 +866,9 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 	if upstreamErr == nil {
 		a.ConsecutiveFails = 0
 		a.BreakerFails = 0
+		// It answered, so it is not a risk-control candidate any more: take it
+		// out of the sunk set and let the rotation reach it again (BP-91).
+		a.RateLimitedAt = time.Time{}
 		if !now.Before(a.AccountCooldownUntil) {
 			// The rest expired and the account is serving again: drop the
 			// stale explanation so the panel does not show "rate limit" on a
@@ -866,6 +897,10 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 			}
 			p.restAccount(a, until, "rate limit", by, now)
 		}
+		// A rate limit with quota left means "busy", not "broken": keep the
+		// account selectable but put it behind the ones that have not been
+		// limited since (BP-91).
+		p.sinkLocked(a, now)
 		a.BreakerFails++
 	case uperr.ClassModelRate:
 		m := upstreamErr.Model
@@ -905,6 +940,16 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		if a.ModelCooldowns != nil {
 			delete(a.ModelCooldowns, model)
 		}
+	case uperr.ClassEdgeBlock:
+		// A CDN/WAF edge refused the request before it reached the vendor:
+		// request-level, not the account's. Pausing the channel briefly stops
+		// a retry storm from re-hitting the same edge rule, and — unlike the
+		// ClassWAF branch — no account is charged a strike, because every
+		// account behind this egress hits it identically (BP-94).
+		if d := p.params.EdgeBlockPause; d > 0 {
+			p.markChannelBusyLocked(a.Channel, model, now.Add(d))
+		}
+		return
 	case uperr.ClassWAF:
 		p.restAccount(a, now.Add(60*time.Second), "edge blocked", "fixed", now)
 	case uperr.ClassTransport:
@@ -1341,6 +1386,7 @@ func (p *Pool) broadcast(channel string) {
 	}
 }
 
+// gcSessionsLocked drops expired bindings.
 func (p *Pool) gcSessionsLocked(now time.Time) {
 	ttl := p.params.SessionTTL
 	for k, b := range p.sessions {
@@ -1348,6 +1394,68 @@ func (p *Pool) gcSessionsLocked(now time.Time) {
 			delete(p.sessions, k)
 		}
 	}
+}
+
+// cacheWorthTokens is how many tokens read from the vendor's cache (or written
+// to it) make a conversation worth keeping where it is across turns. Below it,
+// the prefix is too small for the cache to be paying for the stickiness.
+const cacheWorthTokens = 1024
+
+// cacheColdAfter is how long a vendor keeps a prompt cached without it being
+// read: five minutes at Anthropic and at OpenAI, the shortest there is.
+const cacheColdAfter = 5 * time.Minute
+
+// stickyWorthLocked reports whether keeping this conversation on its account
+// still buys anything (BP-95).
+//
+// The point of stickiness is the vendor's prefix cache: the next turn reads the
+// conversation instead of paying for it again. Once that cache has gone cold,
+// or the vendor never reported caching anything, staying costs the pool its
+// load spreading and buys nothing.
+//
+// No evidence yet (the binding was made but no answer came back, or the
+// upstream reports no cache accounting at all) counts as worth keeping: the
+// old behaviour is the safe default, and a channel that never reports cache
+// figures must not lose stickiness entirely.
+func (p *Pool) stickyWorthLocked(b sessionBinding, now time.Time) bool {
+	if !b.cacheKnown || b.answeredAt.IsZero() {
+		return true
+	}
+	if b.cacheRead+b.cacheWrite < cacheWorthTokens {
+		return false
+	}
+	return now.Sub(b.answeredAt) <= cacheColdAfter
+}
+
+// NoteSessionCache records what the last answer said about the vendor's prefix
+// cache, so the next Acquire can tell whether staying on this account still
+// buys a cache hit (BP-95). Channels that report no cache accounting pass
+// known=false, which keeps stickiness exactly as it was.
+func (p *Pool) NoteSessionCache(channel, sessionKey string, u ir.Usage) {
+	if sessionKey == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := channel + "|" + sessionKey
+	b, ok := p.sessions[key]
+	if !ok {
+		return
+	}
+	b.cacheKnown = u.CacheKnown
+	b.cacheRead = u.CachedInputTokens
+	// What this answer wrote to the vendor's cache. A turn that read nothing
+	// but is the FIRST answer of the binding built the cache: what the vendor
+	// now holds is the prompt that turn sent, so count it as written — that is
+	// what the next turn stands to read (the reasoning magpie records as
+	// "written counts as read"). A later turn that reads nothing is a miss:
+	// the cache is not being reused, so staying buys nothing.
+	b.cacheWrite = 0
+	if b.answeredAt.IsZero() && u.CachedInputTokens == 0 {
+		b.cacheWrite = u.InputTokens
+	}
+	b.answeredAt = p.params.Now()
+	p.sessions[key] = b
 }
 
 // SessionBinding returns (accountID, ok) for tests and the panel.
@@ -1359,7 +1467,20 @@ func (p *Pool) SessionBinding(channel, sessionKey string) (string, bool) {
 }
 
 // pickLocked dispatches to the channel strategy. Callers must hold the lock.
+//
+// Before the strategy runs, accounts that were rate limited while still
+// having quota sink behind those that were not (BP-91). Without this, an
+// account whose rest just ended takes the very next request back — the load
+// returns to the same account every time, which is exactly the pattern a
+// vendor's risk control reads as a bot (magpie's Sink; same field finding as
+// BP-79). Sinking is not a penalty: the account stays selectable, it just
+// goes last, and the first answer clears the flag.
 func (p *Pool) pickLocked(channel, modelName string, candidates []*model.Account, now time.Time) *model.Account {
+	if len(candidates) > 1 {
+		if ready := p.notSunkLocked(candidates, now); len(ready) > 0 && len(ready) < len(candidates) {
+			candidates = ready
+		}
+	}
 	switch channel {
 	case model.ChannelAntigravity:
 		return p.pickGreedyLocked(candidates, now)
@@ -1368,6 +1489,33 @@ func (p *Pool) pickLocked(channel, modelName string, candidates []*model.Account
 	default:
 		return p.pickLRULocked(candidates)
 	}
+}
+
+// sinkTTL bounds how long a rate-limit sinks an account. The flag is cleared
+// by any successful answer, so the TTL only matters for an account that never
+// gets picked again — without it, a pool where every account sank once would
+// keep the ordering forever.
+const sinkTTL = 30 * time.Minute
+
+// notSunkLocked filters out accounts that sank after a rate limit, when at
+// least one candidate has not. An empty result means every candidate sank;
+// the caller then tries them all rather than refusing.
+func (p *Pool) notSunkLocked(candidates []*model.Account, now time.Time) []*model.Account {
+	out := make([]*model.Account, 0, len(candidates))
+	for _, a := range candidates {
+		if a.RateLimitedAt.IsZero() || now.Sub(a.RateLimitedAt) > sinkTTL {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// sinkLocked records that the upstream rate limited this account. Callers must
+// hold the lock. Re-sinking moves it to the back of the sunk order.
+func (p *Pool) sinkLocked(a *model.Account, now time.Time) {
+	p.sinkSeq++
+	a.RateLimitedAt = now
+	a.SinkSeq = p.sinkSeq
 }
 
 // pickGreedyLocked ranks window-quota accounts by burn-rate greed:

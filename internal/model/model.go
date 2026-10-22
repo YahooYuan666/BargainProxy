@@ -138,6 +138,22 @@ type Account struct {
 	LastUsedAt        time.Time                  `json:"last_used_at,omitempty"`
 	UpdatedAt         time.Time                  `json:"updated_at,omitempty"`
 
+	// RateLimitedAt is when the upstream last rate limited this account while
+	// it still had quota left (BP-91). Such an account stays usable — it just
+	// goes behind every account that has not been limited since, so load walks
+	// around the pool instead of returning to the same account the moment its
+	// rest ends. That repeated-return pattern is what a vendor's risk control
+	// notices (magpie's Sink; same field finding as BP-79's single-active
+	// rule).
+	//
+	// Distinct from AccountCooldownUntil: that means "do not send", this means
+	// "send last". Cleared when the account answers successfully.
+	RateLimitedAt time.Time `json:"rate_limited_at,omitempty"`
+	// SinkSeq orders the sunk: the one that sank first goes first among them,
+	// so the result is a rotation rather than a permanent demotion of
+	// whichever account was limited once.
+	SinkSeq uint64 `json:"sink_seq,omitempty"`
+
 	// LastPickSeq is a monotonic sequence for the 0.1s anti-collision gap.
 	LastPickSeq uint64 `json:"-"`
 }

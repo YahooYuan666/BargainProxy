@@ -10,6 +10,8 @@ func stateSnapshot(a *model.Account) *model.Account {
 		Realm: a.Realm, ProjectID: a.ProjectID,
 		Disabled: a.Disabled, Paused: a.Paused,
 		AccountCooldownUntil: a.AccountCooldownUntil, Credits: a.Credits,
+		AccountCooldownReason: a.AccountCooldownReason, AccountCooldownBy: a.AccountCooldownBy,
+		RateLimitedAt: a.RateLimitedAt, SinkSeq: a.SinkSeq,
 		ConsecutiveFails: a.ConsecutiveFails, BreakerFails: a.BreakerFails,
 		LastUsedAt: a.LastUsedAt, UpdatedAt: a.UpdatedAt,
 	}

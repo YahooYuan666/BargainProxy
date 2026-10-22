@@ -19,6 +19,13 @@ const (
 	ClassBadRequest     = "bad_request"     // request content invalid for this upstream; no account penalty
 	ClassContentBlocked = "content_blocked" // content policy rejection; no account penalty
 	ClassWAF            = "waf"             // edge/WAF block, likely IP-scoped; short cooldown
+	// ClassEdgeBlock: a CDN/WAF edge refused the request before it reached
+	// the vendor's API (Cloudflare's "error code: 1010" browser-integrity
+	// block and its kin). It is request/edge-level, not account-level: the
+	// same account answers fine once the edge lets it through, and charging
+	// the account a strike turns one edge rule into a dead pool (sub2api
+	// e0fa4b94f, 2026-10-21). The pool pauses the channel briefly instead.
+	ClassEdgeBlock = "edge_block"
 	ClassTransport      = "transport"       // network/5xx; short cooldown, retry then rotate
 	// ClassUpstreamTimeout: the upstream accepted the connection but stalled —
 	// header watchdog, idle watchdog, or an explicit deadline. Not the
@@ -130,7 +137,7 @@ func New(class string, status int, format string, args ...any) *Error {
 func Rotatable(class string) bool {
 	switch class {
 	case ClassBadRequest, ClassContentBlocked, ClassSentinel, ClassUpstreamBusy,
-		ClassUpstreamTimeout, ClassCanceled, ClassNotFound:
+		ClassUpstreamTimeout, ClassCanceled, ClassNotFound, ClassEdgeBlock:
 		return false
 	default:
 		return true

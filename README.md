@@ -18,8 +18,9 @@
 2. **每个号池建议最多绑定 3 个账号。** 同一上游（WorkBuddy / Trae / ZCode / AutoClaw / Qoder / Google）
    塞太多账号不会更快，反而更容易撞上同 IP 风控与关联封禁；超过 3 个后收益极小、风险成倍上升。
    先用 1~2 个跑顺，需要更多并发再逐个加。
-3. **本项目由纯 AI 制作**，主要集成两个开源项目：`agentpoints`（workbuddy2api-panel 一系）与
-   `AIClient2API`（Google / Antigravity 反代规范），详见 [NOTICE](NOTICE)。
+3. **本项目由纯 AI 制作**，主要集成 `agentpoints`（workbuddy2api-panel 一系）与
+   `AIClient2API`（Google / Antigravity 反代规范），并参考了 magpie、sub2api、CLIProxyAPI 等项目，
+   完整名单见下方「致敬」与 [NOTICE](NOTICE)。
    作者没有能力对全部路径做海量测试验证——上游接口改动、模型增删、Agent 版本差异都可能导致某个功能报错。
    **欢迎提 issue / 报 bug**（请附请求日志页的错误分类与渠道，不要贴对话内容与凭据）。
    如果你只是想把模型稳定用起来，**更建议直接使用 agentpoints 或 AIClient2API**——它们维护更久、社区验证更多；
@@ -31,15 +32,44 @@
 
 ## 🫡 致敬
 
-这个项目不是从零开始，它基本是站在两个开源项目的肩膀上：
+这个项目不是从零开始。下面每一个项目都实实在在贡献过思路或代码，向各位作者和维护者致敬 🫡。
+没有他们，就没有这个「穷鬼自建中转」。
 
-- **[agentpoints](https://github.com/linguo2625469/workbuddy2api-panel)**（workbuddy2api-panel 一系，MIT）——
-  号池成本分层调度、模型级冷却、WorkBuddy/Trae/ZCode 池、签到与成长任务等大量实现思路和代码来自这里，**代码级移植**。
+**代码级移植（MIT）**
+
+- **[agentpoints / workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)**（MIT）——
+  号池成本分层调度、模型级冷却、WorkBuddy / Trae / ZCode 池、签到与成长任务，大量实现直接移植自这里。
+  原始上游是 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)（已删库，署名保留）。
+- **[misakano7545/workbuddy2api-panel](https://github.com/misakano7545/workbuddy2api-panel)**（MIT）——
+  同一血统里 2026-10 之后仍在每日更新的主线，WorkBuddy 单池的后续行为对照都看这里。
+
+**行为规范参考（只学做法，不复制代码）**
+
 - **[AIClient2API](https://github.com/justlovemaki/AIClient-2-API)**（GPLv3）——
-  Google / Antigravity 反代、协议转换与配额窗口的行为规范参考（按许可边界只做清洁室重写，未复制 GPL 代码）。
+  Google / Antigravity 反代、协议转换与配额窗口的行为规范。按许可边界做清洁室重写，未复制 GPL 代码。
+- **[sub2api](https://github.com/Wei-Shaw/sub2api)**（LGPL-3.0）——
+  会话指纹、三态准入（可调度 / 仅粘性 / 不可调度）、401 宽限自愈，均为清洁室重写。
+- **[yetone/magpie](https://github.com/yetone/magpie)**（MIT）——
+  同为 Go 多上游网关，是最贴近的同类项目。原生会话头优先、失败原因与冷却时长分开、工具 schema 补类型，都借鉴自这里。
+- **[magpie-community/plugins](https://github.com/magpie-community/plugins)**（MIT）——
+  社区插件仓，里面的 trae、autoclaw、qoder 三个包正好对应我们三个自研渠道：
+  [trae](https://github.com/magpie-community/plugins/tree/main/packages/trae) 的 function 四档阶梯、
+  [autoclaw](https://github.com/magpie-community/plugins/tree/main/packages/autoclaw) 的 CN 托管网关通道、
+  [qoder](https://github.com/magpie-community/plugins/tree/main/packages/qoder) 的 10605 排队口径。
+- **[CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**（MIT）与
+  **[gemini-openai-proxy](https://github.com/zhu327/gemini-openai-proxy)**（MIT）——
+  「协议适配 → 统一中间表示 → 号池 → 上游驱动」的分层，以及 Gemini 与 OpenAI 的结构映射。
+- **[shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)**（MIT）与
+  **[autumnsentiment/Trae2api-cn](https://github.com/autumnsentiment/Trae2api-cn)**（MIT）——
+  Qoder 排队协议与 TRAE 模型名、多模态形状的协议参考。
 
-向两位作者和维护者致敬 🫡。没有他们，就没有这个「穷鬼自建中转」。
-如果你需要更稳定、维护更久的选择，请优先使用上面两个原项目。
+**只记行为、不取代码（原仓库没有许可证）**
+
+- [Zhengyuuuui/qoder2api](https://github.com/Zhengyuuuui/qoder2api)、
+  [Zhengyuuuui/autoclaw2api](https://github.com/Zhengyuuuui/autoclaw2api)——
+  设备指纹派生与通道清单只作为行为记录，没有复制任何代码。
+
+如果你需要更稳定、维护更久的选择，请优先使用 agentpoints 或 AIClient2API。
 
 ---
 
@@ -179,4 +209,4 @@ internal/cryptox      AES-256-GCM 凭据信封
 
 本项目仅限个人自用（管理自己的账号），**严禁用于营业性商业目的**，不授权、不支持任何形式的对外售卖、代充、批量注册与共享池运营。
 
-本项目**由纯 AI 制作**，主要集成 `agentpoints` 与 `AIClient2API` 两个开源项目，未对全部代码路径做海量测试；上游服务、模型清单与 Agent 行为随时可能变化，任何一处变化都可能导致功能失效。**如果你追求稳定，请直接使用 agentpoints 或 AIClient2API。**
+本项目**由纯 AI 制作**，主要集成 `agentpoints` 与 `AIClient2API`，并参考了 magpie、sub2api、CLIProxyAPI 等项目（完整名单见上方「致敬」），未对全部代码路径做海量测试；上游服务、模型清单与 Agent 行为随时可能变化，任何一处变化都可能导致功能失效。**如果你追求稳定，请直接使用 agentpoints 或 AIClient2API。**
