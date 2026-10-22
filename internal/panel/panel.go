@@ -169,6 +169,8 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/api/accounts/autoclaw/sendcode", p.authed(p.handleAutoClawSendCode, true))
 	mux.HandleFunc("POST /panel/api/accounts/autoclaw/login", p.authed(p.handleAutoClawLogin, true))
 	mux.HandleFunc("POST /panel/api/accounts/qoder/pat", p.authed(p.handleQoderPAT, true))
+	mux.HandleFunc("POST /panel/api/accounts/lobster/start", p.authed(p.handleLobsterStart, true))
+	mux.HandleFunc("GET /panel/api/accounts/lobster/poll", p.authed(p.handleLobsterPoll, false))
 	mux.HandleFunc("GET /panel/api/logs", p.authed(p.handleLogs, false))
 	mux.HandleFunc("GET /panel/api/tasks", p.authed(p.handleTasks, false))
 	mux.HandleFunc("POST /panel/api/tasks/run", p.authed(p.handleTaskRun, true))

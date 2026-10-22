@@ -103,7 +103,7 @@ type creditOverviewRow struct {
 
 var domesticCreditChannels = []string{
 	model.ChannelWorkBuddy, model.ChannelTrae, model.ChannelZCode,
-	model.ChannelAutoClaw, model.ChannelQoder,
+	model.ChannelAutoClaw, model.ChannelQoder, model.ChannelLobster,
 }
 
 func creditKind(channel string) string {

@@ -162,6 +162,9 @@ tr:last-child td{border-bottom:none}
       <li><a href="#qoder" data-view="accounts" data-chan="qoder">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 2.5l5.5 3v5L8 13.5l-5.5-3v-5z"/><path d="M8 8v5.5M8 8l5.5-2.5M8 8L2.5 5.5"/></svg>
         Qoder 账号<span class="n" id="nQoder"></span></a></li>
+      <li><a href="#lobster" data-view="accounts" data-chan="lobster">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4.5 6.5a3.5 3.5 0 0 1 7 0v4a3.5 3.5 0 0 1-7 0z"/><path d="M2.5 6.5L4.5 8M13.5 6.5L11.5 8M6 3.2V1.8M10 3.2V1.8M8 10.5v2"/></svg>
+        Lobster 账号<span class="n" id="nLobster"></span></a></li>
       <li><a href="#tiers" data-view="tiers">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 12.5h12M2 8h12M2 3.5h12"/><path d="M5 6v2.5M9 10.5V13"/></svg>
         模型与档位</a></li>
@@ -692,6 +695,7 @@ tr:last-child td{border-bottom:none}
           <button class="tab" data-tab="zcode">ZCode</button>
           <button class="tab" data-tab="autoclaw">AutoClaw</button>
           <button class="tab" data-tab="qoder">Qoder</button>
+          <button class="tab" data-tab="lobster">Lobster</button>
           <button class="tab" data-tab="import">导入 JSON</button>
         </span>
       </h3>
@@ -743,6 +747,12 @@ tr:last-child td{border-bottom:none}
         </div>
         <button class="primary" onclick="addQoder()">校验并添加</button>
       </div>
+      <!-- LobsterAI（有道龙虾）浏览器登录 -->
+      <div id="addTabLobster" class="tabp" hidden>
+        <div class="hint" style="margin-bottom:8px">使用有道账号登录 LobsterAI（有道龙虾）。点击后在浏览器完成登录，回调会自动入池。</div>
+        <div class="hint" style="margin-bottom:8px">说明：这是非官方渠道，走的是桌面客户端自己的接口，需要你自己的账号；额度按账号积分扣。</div>
+        <button class="primary" onclick="startLobster()">获取 Lobster 登录链接</button>
+      </div>
       <!-- 导入 JSON -->
       <div id="addTabImport" class="tabp" hidden>
         <div class="row" style="margin-bottom:8px">
@@ -752,6 +762,7 @@ tr:last-child td{border-bottom:none}
             <option value="trae">trae（Trae CN）</option>
             <option value="zcode">zcode（Z.AI）</option>
             <option value="autoclaw">autoclaw（AutoClaw 凭证文件）</option>
+            <option value="lobster">lobster（LobsterAI 有道龙虾）</option>
           </select>
           <input id="impLabel" placeholder="备注名（可选）" style="max-width:200px">
         </div>
@@ -863,13 +874,13 @@ function toggleTheme(){ document.body.classList.toggle('light', document.getElem
 /* ── 视图切换 ── */
 // Channel hashes (#google/#workbuddy/#trae/#zcode) map onto the accounts
 // view; #google is the default landing view.
-const titles = {accounts:'账号池', google:'账号池', workbuddy:'账号池', trae:'账号池', zcode:'账号池', autoclaw:'账号池', qoder:'账号池', tasks:'任务中心', usage:'用量统计', tiers:'模型与档位', zen:'opencode免费模型', packages:'国模积分情况', logs:'请求日志', guide:'使用指南', settings:'设置'};
-const chanHashes = {google:'antigravity', workbuddy:'workbuddy', trae:'trae', zcode:'zcode', autoclaw:'autoclaw', qoder:'qoder'};
-const chanNames = {antigravity:'Google（Antigravity）', workbuddy:'WorkBuddy', trae:'Trae CN', zcode:'ZCode', autoclaw:'AutoClaw', qoder:'Qoder', openaicompat:'OpenAI 兼容兜底', opencodezen:'OpenCode 免费通道'};
+const titles = {accounts:'账号池', google:'账号池', workbuddy:'账号池', trae:'账号池', zcode:'账号池', autoclaw:'账号池', qoder:'账号池', lobster:'账号池', tasks:'任务中心', usage:'用量统计', tiers:'模型与档位', zen:'opencode免费模型', packages:'国模积分情况', logs:'请求日志', guide:'使用指南', settings:'设置'};
+const chanHashes = {google:'antigravity', workbuddy:'workbuddy', trae:'trae', zcode:'zcode', autoclaw:'autoclaw', qoder:'qoder', lobster:'lobster'};
+const chanNames = {antigravity:'Google（Antigravity）', workbuddy:'WorkBuddy', trae:'Trae CN', zcode:'ZCode', autoclaw:'AutoClaw', qoder:'Qoder', lobster:'LobsterAI（有道龙虾）', openaicompat:'OpenAI 兼容兜底', opencodezen:'OpenCode 免费通道'};
 function switchView(hash){
   const [view, chan] = hash.replace('#','').split('/');
   if (!titles[view]) return;
-  const target = (view === 'google' || view === 'workbuddy' || view === 'trae' || view === 'zcode' || view === 'autoclaw' || view === 'qoder') ? 'accounts' : view;
+  const target = (view === 'google' || view === 'workbuddy' || view === 'trae' || view === 'zcode' || view === 'autoclaw' || view === 'qoder' || view === 'lobster') ? 'accounts' : view;
   document.querySelectorAll('.view').forEach(v => v.hidden = v.id !== 'view-'+target);
   document.querySelectorAll('#navList a').forEach(a => {
     const on = a.dataset.view === target &&
@@ -911,7 +922,7 @@ async function refresh(){
     // nav counters; openaicompat stays hidden when nothing is configured.
     const byChan = {};
     allAccounts.forEach(a => { byChan[a.channel] = (byChan[a.channel]||0)+1; });
-    ['antigravity','workbuddy','trae','zcode','autoclaw','qoder'].forEach(ch => {
+    ['antigravity','workbuddy','trae','zcode','autoclaw','qoder','lobster'].forEach(ch => {
       const el = document.getElementById('n'+ch.charAt(0).toUpperCase()+ch.slice(1));
       if (el) el.textContent = byChan[ch] ? String(byChan[ch]) : '';
     });
@@ -2102,7 +2113,7 @@ function openAdd(){
 function closeAdd(){ document.getElementById('addVeil').classList.remove('on'); stopPoll(); }
 document.querySelectorAll('#addTabs .tab').forEach(b => b.onclick = () => {
   document.querySelectorAll('#addTabs .tab').forEach(x => x.classList.toggle('on', x === b));
-  ['google','wb','trae','zcode','autoclaw','qoder','import'].forEach(t => {
+  ['google','wb','trae','zcode','autoclaw','qoder','lobster','import'].forEach(t => {
     document.getElementById('addTab'+t.charAt(0).toUpperCase()+t.slice(1)).hidden = b.dataset.tab !== t;
   });
   ['onboardLoad','onboardReady','onboardDone','onboardErr'].forEach(id => document.getElementById(id).hidden = true);
@@ -2195,6 +2206,16 @@ async function startZcode(){
     window.open(r.authorize_url, '_blank', 'noopener');
     pollFlow('accounts/zcode/poll', 450);
   } catch(e){ onboardFail('发起失败：' + e.message + (String(e.message).includes('404') ? '（ZCode 登录端点未部署）' : '')); }
+}
+// LobsterAI（有道龙虾）浏览器登录：loopback 回调，和 Trae/ZCode 同一套 start→poll。
+async function startLobster(){
+  try {
+    const r = await api('accounts/lobster/start', {method:'POST', body:'{}'});
+    onboardState = r.state;
+    onboardBegin('lobster', r.authorize_url);
+    window.open(r.authorize_url, '_blank', 'noopener');
+    pollFlow('accounts/lobster/poll', 150);
+  } catch(e){ onboardFail('发起失败：' + e.message); }
 }
 // AutoClaw SMS onboarding (stateless: send-code then phone+code login).
 async function acSendCode(){

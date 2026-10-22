@@ -13,13 +13,19 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
+	"unicode"
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
@@ -123,16 +129,60 @@ func soloHeaders(req *http.Request, c *Creds, stream bool) {
 	}
 }
 
-// ugHeaders sets the checkin/usage header set.
+// ugHeaders sets the checkin/usage header set. It must read as the IDE's
+// growth page: an Electron-shell User-Agent (Bun/script-shaped UAs are
+// answered 9074 no matter how seldom the check-in is asked —
+// yetone/magpie#808) and the account's device id in the 16-digit shape
+// Trae CN takes (magpie-community/plugins#194).
 func ugHeaders(req *http.Request, c *Creds) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "Trae/"+ideVersion)
+	req.Header.Set("User-Agent", ugUserAgent)
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+c.AccessToken)
 	req.Header.Set("X-User-Region", "CN")
-	if c.DeviceID != "" {
-		req.Header.Set("X-Device-Id", c.DeviceID)
+	if id := ugDeviceID(c.DeviceID, c.UID); id != "" {
+		req.Header.Set("X-Device-Id", id)
 	}
+}
+
+// ugUserAgent is the TRAE SOLO CN Electron shell the growth pages go out
+// with (magpie 0.2.19 ugUA; site.clientVersion 0.1.69).
+const ugUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TRAE-SOLO-CN/0.1.69 Chrome/120.0.6099.291 Electron/28.2.10 Safari/537.36"
+
+// ugDeviceID maps the stored device id onto the shape Trae CN's growth
+// pages accept: an id already in the clients' shape (15–16 digits) passes
+// through; anything else (19 digits from older logins, or nothing at all)
+// is mapped onto a stable 16-digit id derived from the device id and uid.
+// It is the account's own device in the accepted shape — never rotated,
+// never another account's — so a 9095 ("this device is in for today") on
+// it stays the day's answer (magpie 0.2.19 ugDevice, plugins#194).
+func ugDeviceID(deviceID, uid string) string {
+	id := deviceID
+	if len(id) == 15 || len(id) == 16 {
+		digitsOnly := true
+		for _, c := range id {
+			if c < '0' || c > '9' {
+				digitsOnly = false
+				break
+			}
+		}
+		if digitsOnly {
+			return id
+		}
+	}
+	if id == "" && uid == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("trae-cn-device\x00" + id + "\x00" + uid))
+	hexv := hex.EncodeToString(sum[:])[:30]
+	n, _ := new(big.Int).SetString(hexv, 16)
+	if n == nil {
+		return ""
+	}
+	// 1e15 + (n mod 9e15): a 16-digit number, first digit 1-9.
+	n.Mod(n, big.NewInt(9_000_000_000_000_000))
+	n.Add(n, big.NewInt(1_000_000_000_000_000))
+	return n.String()
 }
 
 // Stream implements driver.Driver: OpenAI chat body -> SOLO body, forced
@@ -216,9 +266,60 @@ func (d *Driver) chatOnce(ctx context.Context, creds *Creds, body []byte, call d
 		resp.Body.Close()
 		return nil, classifyHTTP(resp.StatusCode, raw)
 	}
+	// A 200 whose content-type is JSON (not event-stream) is an error in a
+	// 200: classify the business error it carries instead of feeding JSON
+	// into the SSE parser and ending at "no terminal signal" (magpie 0.2.19:
+	// "an answer that isn't a stream is an error in a 200").
+	if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.Contains(ct, "event-stream") && strings.Contains(ct, "json") {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if code, msg, ok := detectError(string(raw)); ok {
+			return nil, classifyBusiness(code, msg)
+		}
+		return nil, uperr.New(uperr.ClassTransport, 200, "trae: non-stream 200 answer: %s", truncate(raw, 200))
+	}
 	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer streamBody.Close()
 	return parseSSE(ctx, streamBody, call, emit)
+}
+
+// traeSessionID derives a stable per-(account, conversation) UUID for the
+// chat body: Trae bills/counts usage per session, so a multi-step
+// conversation without one reads as a fresh session per request on the
+// upstream usage page — which is also what makes our bill unverifiable
+// against theirs (magpie 0.2.19 conversationID; account uid folded in so a
+// failover inside one conversation is not read as another account's).
+// Empty SessionKey (no stable identity) still yields a random UUID.
+func traeSessionID(call driver.ChatCall) string {
+	uid := ""
+	if call.Account != nil {
+		uid = call.Account.UID
+		if uid == "" {
+			uid = call.Account.ID
+		}
+	}
+	seed := uid + "\x00" + call.Request.SessionKey
+	if call.Request.SessionKey == "" {
+		seed = uid + "\x00" + traeRequestID() // unstable: at least unique per attempt
+	}
+	sum := sha256.Sum256([]byte(seed))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	b[6] = (b[6] & 0x0f) | 0x50 // RFC 4122 version 5-shaped
+	b[8] = (b[8] & 0x3f) | 0x80 // variant bits
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// traeRequestID is a fresh random UUID per attempt.
+func traeRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		sum := sha256.Sum256([]byte(time.Now().String()))
+		copy(b[:], sum[:16])
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
 // buildSOLOBody converts the IR request into the SOLO chat body:
@@ -236,8 +337,22 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 		default:
 			var parts []map[string]any
 			for _, p := range m.Content {
-				if p.Kind == "text" {
+				switch {
+				case p.Kind == "text":
 					parts = append(parts, map[string]any{"type": "text", "text": p.Text})
+				case p.Kind == "image" && p.ImageB64 != "":
+					// OpenAI image_url shape, data URI: the multimodal models
+					// take this (magpie 0.2.19 imageOf). Silent drops read as
+					// "the model saw a different image" — a 200 with confident
+					// nonsense nobody could trace (BP-98 TRAE-7).
+					mime := p.ImageMIME
+					if mime == "" {
+						mime = "image/png"
+					}
+					parts = append(parts, map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
+					})
 				}
 			}
 			wire["content"] = parts
@@ -279,10 +394,12 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 		messages = append(messages, wire)
 	}
 	body := map[string]any{
-		"messages": messages,
-		"function": function,
-		"stream":   true, // forced
-		"model":    call.UpstreamModel,
+		"messages":   messages,
+		"function":   function,
+		"stream":     true, // forced
+		"model":      call.UpstreamModel,
+		"request_id": traeRequestID(),
+		"session_id": traeSessionID(call),
 	}
 	if req.Temperature != nil {
 		body["temperature"] = *req.Temperature
@@ -446,9 +563,9 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				if v, ok := fn["name"].(string); ok && v != "" {
 					acc.Name = v
 				}
-				if v, ok := fn["arguments"].(string); ok {
+				if v, ok := fn["arguments"].(string); ok && v != "" {
 					frag = v
-					acc.Arguments += v
+					acc.Arguments = mergeArgs(acc.Arguments, v)
 				}
 			}
 			switch {
@@ -662,53 +779,183 @@ func mapFinish(reason string) ir.StopReason {
 	}
 }
 
+// mergeArgs folds one tool-arguments frame into what has accumulated so far.
+// SOLO sends the arguments as snapshots that grow, not always as fragments:
+// a frame may restate "everything so far" (also re-punctuated), so a blind
+// concatenation welds snapshots into broken JSON and the agent tool turn
+// dies downstream after a 200. Translation of magpie-community/plugins
+// packages/trae 0.2.19 (merge inside parts() + resent() + done()):
+//   - empty / stale (prev already contains next): keep prev;
+//   - next extends prev, or prev is already a whole JSON value: take next;
+//   - next is a whole object re-sending the call under prev's first key
+//     while prev+next is not whole (plugins#24, re-punctuated resend): take next;
+//   - otherwise a true fragment: concatenate.
+func mergeArgs(prev, next string) string {
+	if next == "" || strings.HasPrefix(prev, next) {
+		return prev
+	}
+	if strings.HasPrefix(next, prev) || wholeJSON(prev) {
+		return next
+	}
+	if resentSnapshot(prev, next) {
+		return next
+	}
+	return prev + next
+}
+
+// wholeJSON reports whether s is already a complete JSON value.
+func wholeJSON(s string) bool {
+	if s == "" {
+		return false
+	}
+	return json.Valid([]byte(s))
+}
+
+// resentSnapshot reports whether next is the call's whole arguments sent
+// again after a partial snapshot — not a piece of them: SOLO resends a
+// snapshot whose punctuation is not the first one's, so it does not start
+// with prev. A whole object under the same first key as prev's, which prev
+// and it joined do not make whole (magpie 0.2.19 resent()).
+func resentSnapshot(prev, next string) bool {
+	firstKey := func(s string) string {
+		s = strings.TrimLeftFunc(s, unicode.IsSpace)
+		if !strings.HasPrefix(s, "{") {
+			return ""
+		}
+		var key string
+		dec := json.NewDecoder(strings.NewReader(s))
+		tok, err := dec.Token()
+		if err != nil {
+			return ""
+		}
+		if d, ok := tok.(json.Delim); !ok || d != '{' {
+			return ""
+		}
+		tok, err = dec.Token()
+		if err != nil {
+			return ""
+		}
+		if k, ok := tok.(string); ok {
+			key = k
+		}
+		return key
+	}
+	nt := strings.TrimLeftFunc(next, unicode.IsSpace)
+	if !strings.HasPrefix(nt, "{") || !wholeJSON(nt) || wholeJSON(prev+next) {
+		return false
+	}
+	k := firstKey(prev)
+	return k != "" && k == firstKey(next)
+}
+
 func detectError(payload string) (int, string, bool) {
 	var doc struct {
 		Code    any    `json:"code"`
 		Message string `json:"message"`
+		// The nested shapes below ({error:{code,message}} and the ByteDance
+		// envelope {ResponseMetadata:{Error:{Code,Message}}}) used to fall
+		// into the legacy-chunk parser and end as "stream ended without
+		// terminal signal" — a business refusal scored as a network problem
+		// (BP-98 TRAE-9, magpie 0.2.19 errorOf).
 	}
 	if err := json.Unmarshal([]byte(payload), &doc); err != nil {
 		return 0, "", false
 	}
-	code := 0
-	switch t := doc.Code.(type) {
+	if code, msg, ok := traeCodeOf(doc.Code, doc.Message); ok {
+		return code, msg, true
+	}
+	var nested struct {
+		Error struct {
+			Code    any    `json:"code"`
+			CodeAlt string `json:"Code"`
+			Message string `json:"message"`
+			MsgAlt  string `json:"Message"`
+		} `json:"error"`
+		Meta struct {
+			Error struct {
+				Code    any    `json:"Code"`
+				CodeAlt any    `json:"code"`
+				Message string `json:"Message"`
+				MsgAlt  string `json:"message"`
+			} `json:"Error"`
+		} `json:"ResponseMetadata"`
+	}
+	if err := json.Unmarshal([]byte(payload), &nested); err != nil {
+		return 0, "", false
+	}
+	if nested.Error.Code != nil || nested.Error.CodeAlt != "" {
+		msg := nested.Error.Message
+		if msg == "" {
+			msg = nested.Error.MsgAlt
+		}
+		if code, _, ok := traeCodeOf(nested.Error.Code, msg); ok {
+			return code, msg, true
+		}
+		if code, _, ok := traeCodeOf(nested.Error.CodeAlt, msg); ok {
+			return code, msg, true
+		}
+	}
+	if nested.Meta.Error.Code != nil || nested.Meta.Error.CodeAlt != nil {
+		msg := nested.Meta.Error.Message
+		if msg == "" {
+			msg = nested.Meta.Error.MsgAlt
+		}
+		if code, _, ok := traeCodeOf(nested.Meta.Error.Code, msg); ok {
+			return code, msg, true
+		}
+		if code, _, ok := traeCodeOf(nested.Meta.Error.CodeAlt, msg); ok {
+			return code, msg, true
+		}
+	}
+	return 0, "", false
+}
+
+// traeCodeOf normalizes a business code (number or digit string) and its
+// message; code 0 / absent is not an error.
+func traeCodeOf(raw any, msg string) (int, string, bool) {
+	switch t := raw.(type) {
 	case float64:
-		code = int(t)
+		if int(t) != 0 {
+			return int(t), msg, true
+		}
 	case string:
+		if t == "" {
+			return 0, "", false
+		}
+		code := 0
 		for _, c := range t {
 			if c < '0' || c > '9' {
 				return 0, "", false
 			}
 			code = code*10 + int(c-'0')
 		}
+		if code != 0 {
+			return code, msg, true
+		}
 	}
-	if code == 0 {
-		return 0, "", false
-	}
-	return code, doc.Message, true
+	return 0, "", false
 }
 
 // traeWrongFunction reports whether the failure means "this SOLO function
 // will not take this payload", which is retried on the next function rather
-// than shown to the caller. The upstream uses the same 400 for a model it
-// does not serve on that function (code 4001/4023) and for a plan that cannot
-// use it (1005); neither is the request being invalid everywhere
-// (magpie-community/plugins packages/trae, 2026-10-21).
+// than shown to the caller. Judged on the upstream business code carried in
+// ue.Code (magpie-community/plugins packages/trae 0.2.19:
+// wrongFunction = ["4001","4023","1005"] by code) — the 1005 branch of
+// classifyBusiness words its message "plan entitlement exhausted" without the
+// digits, so a substring scan misses it and 4023 never had a branch at all
+// (BP-98 TRAE-1, red first in ladder_codes_test.go).
 func traeWrongFunction(err error) bool {
 	ue, ok := uperr.As(err)
 	if !ok || ue.Class != uperr.ClassBadRequest && ue.Class != uperr.ClassSoftRate {
 		return false
 	}
-	msg := ue.Message
-	for _, code := range []string{"4001", "4023", "1005"} {
-		if strings.Contains(msg, "code="+code) || strings.Contains(msg, code+":") {
-			return true
-		}
+	if ue.Code != "" {
+		return ue.Code == "4001" || ue.Code == "4023" || ue.Code == "1005"
 	}
 	// A plain "the param is invalid" 400 from this endpoint is the function
 	// refusing the shape more often than not; walking the ladder costs one
 	// cheap request and a wrong guess is still bounded by it.
-	return strings.Contains(strings.ToLower(msg), "param is invalid")
+	return strings.Contains(strings.ToLower(ue.Message), "param is invalid")
 }
 
 func classifyBusiness(code int, msg string) *uperr.Error {
@@ -718,8 +965,13 @@ func classifyBusiness(code int, msg string) *uperr.Error {
 		// rejected (stale/rotated). ClassAuth so Stream can self-heal with a
 		// forced token exchange (ticket 37).
 		return uperr.New(uperr.ClassAuth, 401, "trae: %s", msg)
-	case 1005:
-		e := uperr.New(uperr.ClassSoftRate, 200, "trae: plan entitlement exhausted: %s", msg)
+	case 1005, 4008, 4011:
+		// The plan-entitlement family: 1005 CN/Global, 4008 CN, 4011 Global
+		// (magpie 0.2.19 site tables). SoftRate so the pool cools the account
+		// instead of retrying it; the code rides on ue.Code for the ladder
+		// gate and the panel.
+		e := uperr.New(uperr.ClassSoftRate, 200, "trae: plan entitlement exhausted (code=%d): %s", code, msg)
+		e.Code = fmt.Sprint(code)
 		e.ResetAt = time.Now().Add(12 * time.Hour)
 		return e
 	case 4001:
@@ -730,6 +982,13 @@ func classifyBusiness(code int, msg string) *uperr.Error {
 		// next ladder rung) from a genuinely broken payload.
 		e := uperr.New(uperr.ClassBadRequest, 400, "trae: code=4001 %s", msg)
 		e.Code = "4001"
+		return e
+	case 4023:
+		// "Model not available on this function": the other half of the
+		// function-refusal pair (magpie 0.2.19 wrongFunction). ClassBadRequest
+		// (account is fine) + code on ue.Code so the ladder walks on.
+		e := uperr.New(uperr.ClassBadRequest, 400, "trae: code=4023 %s", msg)
+		e.Code = "4023"
 		return e
 	default:
 		return uperr.New(uperr.ClassInternal, 200, "trae: code=%d %s", code, msg)
@@ -773,8 +1032,10 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 	if err != nil {
 		return false, 0, false, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
-	// Status first.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.ugBase()+"/trae/api/v2/ug/checkin_credits/status", bytes.NewReader([]byte("{}")))
+	// Status first. The growth pages go out with {"req_source":1}, not {}
+	// — every check-in sent with {} came back 9074 even with the IDE's
+	// headers (yetone/magpie#808).
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.ugBase()+"/trae/api/v2/ug/checkin_credits/status", bytes.NewReader(ugBody))
 	if err != nil {
 		return false, 0, false, err
 	}
@@ -795,25 +1056,42 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 		return false, 0, false, uperr.New(uperr.ClassTransport, 0, "trae checkin status: read body: %v", rerr)
 	}
 	var st struct {
-		CheckedIn bool  `json:"checked_in"`
-		Credits   int64 `json:"credits"`
-		Enable    bool  `json:"enable"`
+		Code      any    `json:"code"`
+		Message   string `json:"message"`
+		CheckedIn bool   `json:"checked_in"`
+		Credits   int64  `json:"credits"`
+		Enable    bool   `json:"enable"`
 	}
 	_ = json.Unmarshal(raw, &st)
+	// A 200 with a business code in the status body is not a status answer:
+	// 1001 ("not able to authenticate") used to fall through to
+	// "checked_in=false, enable=false" and the task ledger recorded "ok",
+	// masking a dead credential forever (BP-98 TRAE-3; the chat path's
+	// self-heal from ticket 37 never covered check-in).
+	if code, _, ok := traeBodyCode(st.Code, st.Message); ok {
+		return false, 0, false, classifyBusiness(code, st.Message)
+	}
 	if st.CheckedIn || !st.Enable {
 		// enable=false means the check-in program is unavailable for this
 		// account — reporting it as "already checked in" masked auth failures
 		// (ticket 37); callers now see the distinction.
 		return st.CheckedIn, st.Credits, st.Enable, nil
 	}
-	// Claim. Upstream may answer HTTP 200 with a non-zero business code (e.g.
-	// 9074 "当前参与用户太多"): treat it as a failed claim and retry briefly
-	// before surfacing the error (agentpoints2 parity).
+	// Claim. Retry only what retrying can fix (5xx / transport): a business
+	// refusal is answered again by the same refusal.
 	var lastErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		lastErr = d.claimCheckin(ctx, creds)
 		if lastErr == nil {
 			return true, st.Credits, true, nil
+		}
+		if idempotent, ok := idempotentCheckinErr(lastErr); ok && idempotent {
+			// 9095 "this device has checked in today": the day's success —
+			// no retries, no red task row (magpie 0.2.19: outcome done).
+			return true, st.Credits, true, nil
+		}
+		if !retryableCheckinErr(lastErr) {
+			return false, 0, false, lastErr
 		}
 		if attempt < 3 {
 			select {
@@ -829,9 +1107,24 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 // checkinRetryDelay is a package var so tests can shorten the backoff.
 var checkinRetryDelay = 20 * time.Second
 
+// ugBody is the body every ug growth page is sent with (BP-98 TRAE-2).
+var ugBody = []byte(`{"req_source":1}`)
+
+// checkinCodeErr carries the upstream business code of a failed claim so the
+// caller can tell the day's idempotent answer from a real refusal. The
+// uperr.Error sits in a named field: embedding it would collide with its
+// Error string field.
+type checkinCodeErr struct {
+	ue   *uperr.Error
+	code int
+}
+
+func (e *checkinCodeErr) Error() string { return e.ue.Error() }
+func (e *checkinCodeErr) Unwrap() error { return e.ue }
+
 // claimCheckin performs one claim attempt and verifies the business code.
 func (d *Driver) claimCheckin(ctx context.Context, creds *Creds) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.ugBase()+"/trae/api/v2/ug/checkin_credits/claim", bytes.NewReader([]byte("{}")))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.ugBase()+"/trae/api/v2/ug/checkin_credits/claim", bytes.NewReader(ugBody))
 	if err != nil {
 		return err
 	}
@@ -848,13 +1141,77 @@ func (d *Driver) claimCheckin(ctx context.Context, creds *Creds) error {
 	// A 200 can still carry a business error; an empty or non-JSON body keeps
 	// the historical success semantics (some deployments answer `{}`).
 	var env struct {
-		Code    int    `json:"code"`
+		Code    any    `json:"code"`
 		Message string `json:"message"`
 	}
-	if json.Unmarshal(raw, &env) == nil && env.Code != 0 {
-		return uperr.New(uperr.ClassTransport, 0, "trae checkin claim code=%d: %s", env.Code, env.Message)
+	if json.Unmarshal(raw, &env) == nil {
+		if code, _, ok := traeBodyCode(env.Code, env.Message); ok {
+			// A claim refusal is upstream's answer about today, not a network
+			// problem and not an internal error: ClassBadRequest keeps it out
+			// of the retryable set (a 9074 "check in via the app" answers the
+			// same however often it is asked) and out of the pool's failure
+			// scoring (check-in does not ride the chat pool).
+			e := uperr.New(uperr.ClassBadRequest, 200, "trae checkin claim code=%v: %s", env.Code, env.Message)
+			return &checkinCodeErr{ue: e, code: code}
+		}
 	}
 	return nil
+}
+
+// traeBodyCode extracts a non-zero numeric business code from a 200 body
+// (code arrives as number or digit-string; 0/absent = success).
+func traeBodyCode(raw any, _ string) (int, string, bool) {
+	switch t := raw.(type) {
+	case float64:
+		if int(t) != 0 {
+			return int(t), "", true
+		}
+	case string:
+		code := 0
+		for _, c := range t {
+			if c < '0' || c > '9' {
+				return 0, "", false
+			}
+			code = code*10 + int(c-'0')
+		}
+		if code != 0 {
+			return code, "", true
+		}
+	}
+	return 0, "", false
+}
+
+// idempotentCheckinErr reports whether the claim failure is actually the
+// day's success: 9095 "this device has checked in today" (magpie 0.2.19
+// reads it as outcome "ineligible" on the device / done for the account).
+func idempotentCheckinErr(err error) (bool, bool) {
+	if ce, ok := err.(*checkinCodeErr); ok {
+		if ce.code == 9095 {
+			return true, true
+		}
+		return false, true
+	}
+	return false, false
+}
+
+// retryableCheckinErr reports whether the claim failure is the kind a retry
+// can fix: transport problems and 5xx. Business refusals (9074 "check in
+// via the app" among them) answer the same however often they are asked;
+// retrying them only burned 3×20s per account per slot and made the traffic
+// look scripted (BP-98 TRAE-3).
+func retryableCheckinErr(err error) bool {
+	ue, ok := uperr.As(err)
+	if !ok {
+		return true // unknown error shape: keep the historical retry behavior
+	}
+	switch ue.Class {
+	case uperr.ClassTransport:
+		return true
+	case uperr.ClassInternal:
+		return true
+	default:
+		return false
+	}
 }
 
 // Probe implements driver.Prober: fetch credit balance.
@@ -883,47 +1240,121 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 		log.Printf("trae: usage probe read failed (account=%s, endpoint=ide_user_ent_usage): %v", acc.ID, rerr)
 		return nil, uperr.New(uperr.ClassTransport, 0, "trae usage: read body: %v", rerr)
 	}
-	remain, limit, _, packs, err := ParseEntUsage(raw)
+	remain, limit, _, packs, earliestExpiry, unlimited, err := ParseEntUsageFull(raw)
 	if err != nil {
 		return nil, uperr.New(uperr.ClassInternal, 0, "trae usage parse: %v", err)
 	}
 	_ = packs
 	credits := &model.Credits{Remain: remain, Total: limit, UpdatedAt: time.Now()}
+	if unlimited {
+		// No finite quota: keep the routing floor and the 100% bar honest
+		// instead of reading a full wallet as an empty one (BP-98 TRAE-5).
+		credits.BalanceOnly = true
+		credits.Total = remain
+	}
+	if !earliestExpiry.IsZero() {
+		// Feeds the pool's burn-expiring-first weight (×3); trae never
+		// supplied it before, so that weight silently never fired.
+		credits.Expiring = remain
+		credits.EarliestExpiresAt = earliestExpiry
+	}
 	return &driver.ProbeResult{Credits: credits, Note: "trae credits refreshed"}, nil
 }
 
 // ParseEntUsage aggregates the entitlement pack list: remain = limit - used.
 func ParseEntUsage(raw []byte) (remain, limit, used int64, packs int, err error) {
+	remain, limit, used, packs, _, _, err = ParseEntUsageFull(raw)
+	return remain, limit, used, packs, err
+}
+
+// ParseEntUsageFull is ParseEntUsage with the two fields the pool needs and
+// the old shape dropped (BP-98 TRAE-5, translated from magpie 0.2.19
+// credits()):
+//   - credits_limit === -1 is the UNLIMITED pack, not an empty one. The old
+//     `if l <= 0 { continue }` registered a full account as Remain=0 and the
+//     pool then kept it out of routing (the empty-account mirage); unlimited
+//     callers read as available.
+//   - each pack's end_time / expire_time returns as the earliest future
+//     expiry so the pool can burn soon-to-die credits first.
+func ParseEntUsageFull(raw []byte) (remain, limit, used int64, packs int, earliestExpiry time.Time, unlimited bool, err error) {
 	var resp struct {
 		UserEntitlementPackList []struct {
 			EntitlementBaseInfo struct {
 				Quota struct {
 					CreditsLimit int64 `json:"credits_limit"`
 				} `json:"quota"`
+				EndTime    int64 `json:"end_time"`
+				ExpireTime int64 `json:"expire_time"`
 			} `json:"entitlement_base_info"`
-			Usage struct {
-				CreditsAmount float64 `json:"credits_amount"`
-			} `json:"usage"`
+			EndTime int64           `json:"end_time"`
+			Usage   json.RawMessage `json:"usage"`
+			Extra   map[string]any  `json:"-"`
 		} `json:"user_entitlement_pack_list"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return 0, 0, 0, 0, err
+		return 0, 0, 0, 0, time.Time{}, false, err
 	}
+	const unlimitedPack = -1
 	for _, p := range resp.UserEntitlementPackList {
 		l := p.EntitlementBaseInfo.Quota.CreditsLimit
-		if l <= 0 {
-			continue
+		u := usageCredits(p.Usage)
+		switch {
+		case l == unlimitedPack:
+			// Unlimited: the usage counts as spent, the account stays available.
+			unlimited = true
+			used += u
+			remain += 1<<62 - u // far from empty, without overflowing
+			packs++
+		case l > 0:
+			limit += l
+			used += u
+			remain += l - u
+			packs++
+		default:
+			continue // no quota on this pack
 		}
-		u := int64(p.Usage.CreditsAmount)
-		limit += l
-		used += u
-		remain += l - u
-		packs++
+		if end := normalizePackExpiry(p.EntitlementBaseInfo.EndTime, p.EntitlementBaseInfo.ExpireTime, p.EndTime); !end.IsZero() {
+			if earliestExpiry.IsZero() || end.Before(earliestExpiry) {
+				earliestExpiry = end
+			}
+		}
 	}
 	if remain < 0 {
 		remain = 0
 	}
-	return remain, limit, used, packs, nil
+	return remain, limit, used, packs, earliestExpiry, unlimited, nil
+}
+
+// usageCredits reads the pack's usage.credits_amount (a float on the wire).
+func usageCredits(raw json.RawMessage) int64 {
+	if len(raw) == 0 {
+		return 0
+	}
+	var u struct {
+		CreditsAmount float64 `json:"credits_amount"`
+	}
+	if json.Unmarshal(raw, &u) != nil {
+		return 0
+	}
+	if u.CreditsAmount <= 0 {
+		return 0
+	}
+	return int64(u.CreditsAmount)
+}
+
+// normalizePackExpiry picks the first non-zero of (end_time, expire_time,
+// pack-level end_time) and normalizes ms → s (values above 1e12 are ms).
+func normalizePackExpiry(values ...int64) time.Time {
+	for _, v := range values {
+		if v <= 0 {
+			continue
+		}
+		if v > 1e12 {
+			v /= 1000
+		}
+		return time.Unix(v, 0)
+	}
+	return time.Time{}
 }
 
 // Models returns the curated model list (dynamic discovery uses
@@ -959,8 +1390,19 @@ var traeOAuthHost = "https://api.trae.com.cn"
 
 // traeRefreshSkew: only refresh when the JWT expires within this window (or
 // its expiry is unknown). The reference refreshes daily at hour 3 with a 24h
-// skew; our refresh task runs more often, so the skew gates it.
-const traeRefreshSkew = 24 * time.Hour
+// skew; our refresh task runs hourly, so a 24h skew against the ~24h TTL
+// made EVERY tick re-exchange the token — 24 upstream rotations per account
+// per day, each spending a refresh-token generation (BP-98 TRAE-6). Two
+// hours keeps ~22h between rotations while still refreshing well before
+// expiry.
+const traeRefreshSkew = 2 * time.Hour
+
+// refreshInFlight deduplicates concurrent refreshes of the same account:
+// the refresh token is one-time, and two concurrent ExchangeToken calls on
+// the same lineage make the loser answer 20101 ("refresh token is invalid")
+// — which reads as a dead credential and can disable the account (BP-98
+// TRAE-6). The first caller exchanges; the rest wait and keep their creds.
+var refreshInFlight sync.Map // accountID -> *sync.WaitGroup-style gate
 
 // Refresh rotates the Cloud-IDE JWT through ExchangeToken (refresh token
 // rotates too — reference refreshLocked parity). This used to be a stub that
@@ -969,12 +1411,48 @@ const traeRefreshSkew = 24 * time.Hour
 // on every attempt (ticket 37). Leaves creds untouched on any failure so the
 // old refresh token stays retryable.
 func (d *Driver) Refresh(ctx context.Context, acc *model.Account) error {
+	// Backfill the device identity for accounts imported before BP-98 TRAE-2
+	// (their blobs carry device_id:"" / machine_id:""): derive them from the
+	// uid once, mark dirty, and let the refresh task persist. Without a
+	// device the check-in reads as a script and is answered 9074.
+	if err := backfillTraeDevice(acc); err != nil {
+		return err
+	}
 	return d.refreshToken(ctx, acc, false)
+}
+
+// backfillTraeDevice fills an empty device/machine pair in the credential
+// blob with a per-account stable one. Deterministic on (device_id, uid);
+// for a blob with neither, uid alone seeds it, so it never rotates.
+func backfillTraeDevice(acc *model.Account) error {
+	if acc == nil {
+		return nil
+	}
+	creds, err := ParseCreds(acc.CredsJSON)
+	if err != nil {
+		return nil // let the caller's own parse report the real problem
+	}
+	if creds.DeviceID != "" || creds.UID == "" {
+		return nil
+	}
+	creds.DeviceID = ugDeviceID("", creds.UID)
+	creds.MachineID = ugDeviceID("", creds.UID+"-machine")
+	raw, err := json.Marshal(creds)
+	if err != nil {
+		return nil
+	}
+	acc.CredsJSON = raw
+	acc.CredsDirty = true
+	log.Printf("trae: backfilled device identity for account %s (BP-98 TRAE-2)", acc.ID)
+	return nil
 }
 
 // refreshToken is the shared ExchangeToken core. force=true skips the expiry
 // skew (used by Stream's self-heal after an auth rejection: the stored expiry
-// can look fine while the JWT has been superseded upstream).
+// can look fine while the JWT has been superseded upstream). Concurrent
+// callers on one account share a single exchange (refreshInFlight): the
+// refresh token is one-time, and racing it turned the loser's 20101 into a
+// disabled account.
 func (d *Driver) refreshToken(ctx context.Context, acc *model.Account, force bool) error {
 	creds, err := ParseCreds(acc.CredsJSON)
 	if err != nil {
@@ -982,6 +1460,34 @@ func (d *Driver) refreshToken(ctx context.Context, acc *model.Account, force boo
 	}
 	if !force && creds.ExpiresAt != 0 && time.Until(time.Unix(creds.ExpiresAt, 0)) > traeRefreshSkew {
 		return nil // still fresh — nothing to do
+	}
+	// Single-flight gate: the first caller for this account does the exchange;
+	// the others wait for it and then re-check (a completed rotation makes
+	// their creds fresh, so they return without touching upstream).
+	if acc != nil && acc.ID != "" {
+		for {
+			gate, loaded := refreshInFlight.LoadOrStore(acc.ID, make(chan struct{}))
+			done := gate.(chan struct{})
+			if !loaded {
+				defer func() {
+					close(done)
+					refreshInFlight.Delete(acc.ID)
+				}()
+				break
+			}
+			select {
+			case <-done:
+				nc, perr := ParseCreds(acc.CredsJSON)
+				if perr == nil && !force && (nc.ExpiresAt == 0 || time.Until(time.Unix(nc.ExpiresAt, 0)) <= traeRefreshSkew) {
+					// Still stale after the winner's exchange (it may have
+					// failed): fall through and retry the gate once more.
+					continue
+				}
+				return nil
+			case <-ctx.Done():
+				return uperr.New(uperr.ClassCanceled, 0, "trae refresh: %v", ctx.Err())
+			}
+		}
 	}
 	if strings.TrimSpace(creds.RefreshToken) == "" {
 		return uperr.New(uperr.ClassAuth, 401, "trae: no refresh token (re-login required)")

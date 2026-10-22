@@ -151,6 +151,25 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		req.Messages = repaired
 	}
 
+	// Output ceiling (BP-99): cap max_tokens at the model's real limit before
+	// any driver sees it. Too large a value gets a 400 from some upstreams and
+	// a SILENT truncation from others — and a silent truncation is the worse
+	// outcome, because the client reads a short answer with no hint that the
+	// gateway caused it. Clamped once here rather than per driver so every
+	// channel benefits and no driver can forget.
+	//
+	// The upstream model id is the better key (a canonical name can differ from
+	// what the channel calls it), but the binding is only known after routing,
+	// so the canonical name is used here and the driver-level ceiling in
+	// config covers the mapping.
+	if req.MaxTokens > 0 {
+		if capped, changed := config.ClampOutput(req.MaxTokens, req.Model, bareModel); changed {
+			log.Printf("gateway: clamped max_tokens %d → %d for model %s (output ceiling)",
+				req.MaxTokens, capped, req.Model)
+			req.MaxTokens = capped
+		}
+	}
+
 	var lastErr error
 	// First-byte window: base from config, widened by context size. Large ZCode
 	// conversations can spend >8s in prefill before the first token; a fixed
@@ -492,6 +511,28 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		}
 		started := time.Now()
 		resp, streamErr := drv.Stream(actx, call, attemptEmit)
+		// max_tokens floor repair (BP-99): some upstreams reject a too-small
+		// max_tokens with a 400 whose text carries the minimum they demand
+		// ("max_tokens: 1 is less than the minimum of 16"). A client sending
+		// max_tokens=1 as a liveness probe therefore looks like a broken
+		// gateway. Recover the number and retry ONCE on the same account with a
+		// legal value — nothing reached the client yet, because a bad_request
+		// means the turn never started.
+		if streamErr != nil && !emitted() {
+			if ue, ok := uperr.As(streamErr); ok && ue.Class == uperr.ClassBadRequest {
+				if floor := config.FloorFromMessage(ue.Message); floor > 0 &&
+					(floor > req.MaxTokens || req.MaxTokens <= 0) {
+					raised := *req
+					raised.MaxTokens = floor
+					retryCall := call
+					retryCall.Request = &raised
+					log.Printf("gateway: %s rejected max_tokens=%d, retrying with %d (upstream minimum)",
+						binding.Channel, req.MaxTokens, floor)
+					started = time.Now()
+					resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
+				}
+			}
+		}
 		elapsed := time.Since(started)
 		if cancel != nil {
 			cancel()
@@ -508,6 +549,19 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			// tiers from balance deltas (credit channels only).
 			if binding.Channel == model.ChannelWorkBuddy || binding.Channel == model.ChannelTrae {
 				g.pool.NoteModelUse(lease.Account, binding.UpstreamModel)
+			}
+			// Qoder reports the request's own credits on every answer
+			// (BP-98 Qoder-1): feed the cost observer directly — 0 credits is
+			// a free model (tier 0), a positive amount is paid (tier 2).
+			// Without this the pool read every Qoder model as "unknown" and
+			// free-first routing plus the exhausted-balance floor guard
+			// never fired for the channel.
+			if binding.Channel == model.ChannelQoder && resp != nil && resp.Usage.CreditKnown {
+				tier := 2
+				if resp.Usage.Credit == 0 {
+					tier = 0
+				}
+				g.pool.RecordCostTier(lease.Account, binding.UpstreamModel, tier)
 			}
 			g.persistCreds(lease.Account)
 			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts}

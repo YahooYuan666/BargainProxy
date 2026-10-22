@@ -34,11 +34,26 @@ const (
 	traeConsoleHost = "https://www.trae.cn"
 	traeClientID    = "en1oxy7wnw8j9n" // SOLO stable
 	traeIdeVersion  = "0.1.52"
-	traeOAuthHost   = "https://api.trae.com.cn"
-	traeEpExchange  = "/cloudide/api/v3/trae/oauth/ExchangeToken"
-	traeEpUserInfo  = "/cloudide/api/v3/trae/GetUserInfo"
-	traeClientUA    = "Trae/" + traeIdeVersion
+	// traeOAuthHostDefault is the const; traeOAuthHost is a var so tests can
+	// point the exchange/userinfo endpoints at a mock (parity with the
+	// driver's traeOAuthHost var).
+	traeOAuthHostDefault = "https://api.trae.com.cn"
+	traeEpExchange       = "/cloudide/api/v3/trae/oauth/ExchangeToken"
+	traeEpUserInfo       = "/cloudide/api/v3/trae/GetUserInfo"
+	traeClientUA         = "Trae/" + traeIdeVersion
 )
+
+// traeOAuthHost is the exchange/userinfo base; a var for tests.
+var traeOAuthHost = traeOAuthHostDefault
+
+// TraeOAuthHostOverride points the Trae exchange/userinfo endpoints at a
+// test server (and returns the restore func). Used by panel_test, which
+// cannot reach the unexported var.
+func TraeOAuthHostOverride(u string) (restore func()) {
+	old := traeOAuthHost
+	traeOAuthHost = u
+	return func() { traeOAuthHost = old }
+}
 
 // randomHex32 returns n random bytes hex-encoded (2n chars).
 func randomHex32(n int) string {
@@ -92,6 +107,17 @@ type traeCallbackInfo struct {
 	Nickname     string
 	EnterpriseID string
 	ExpiresAt    int64 // unix seconds, userJwt fallback path only
+}
+
+// Trae login device identity: the ids generated at flow start ride the login
+// URL and must come back into the stored credential blob — the driver sends
+// them as X-Device-Id / X-Machine-Id on every request, and a check-in
+// without them reads as a script and is answered 9074 (yetone/magpie#808).
+// They used to be generated and then thrown away, writing "" into the blob
+// (BP-98 TRAE-2).
+type traeFlowDevice struct {
+	MachineID string
+	DeviceID  string
 }
 
 // traeJSONParam tolerates the double percent-encoding the login redirect
@@ -309,6 +335,7 @@ func (p *Panel) handleTraeStart(w http.ResponseWriter, r *http.Request) {
 	p.putFlow(key, &authFlow{
 		channel: model.ChannelTrae, state: state, status: "pending",
 		expiresAt: time.Now().Add(oauthFlowTTL), server: hs,
+		traeDevice: &traeFlowDevice{MachineID: machineID, DeviceID: deviceID},
 	})
 	time.AfterFunc(oauthFlowTTL, func() { p.expireFlow(key) })
 
@@ -367,13 +394,22 @@ func (p *Panel) handleTraeCallback(w http.ResponseWriter, r *http.Request, key s
 		writeOAuthPage(w, false, "授权失败：回调缺少 uid，无法建立稳定身份")
 		return
 	}
+	// The device pair this flow signed in with rides into the credential
+	// blob: the driver sends it as X-Device-Id / X-Machine-Id, and a check-in
+	// without a device reads as a script and is answered 9074 (BP-98 TRAE-2;
+	// they used to be written as ""). If the flow lost them (older pending
+	// flow), fall back to fresh ids so the blob is never empty again.
+	dev := f.traeDevice
+	if dev == nil {
+		dev = &traeFlowDevice{MachineID: randomHex32(16), DeviceID: randomHex32(16)}
+	}
 	// enterprise is informational only; stash it in the credential blob.
 	credJSON, _ := json.Marshal(map[string]any{
 		"access_token":  creds.accessToken,
 		"refresh_token": creds.refreshToken,
 		"uid":           uid,
-		"device_id":     "",
-		"machine_id":    "",
+		"device_id":     dev.DeviceID,
+		"machine_id":    dev.MachineID,
 		"expires_at":    creds.expiresAt,
 		"enterprise_id": ent,
 	})

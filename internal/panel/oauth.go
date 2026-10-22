@@ -68,6 +68,10 @@ type authFlow struct {
 	// tok is the device-flow token once the upstream has issued it. The token
 	// is single-issue: it must survive across polls (2026-10-21 field bug).
 	tok *wbToken
+	// traeDevice carries the machine/device ids generated at Trae flow start:
+	// the login URL was built from them, and the credential blob must store
+	// the same pair (BP-98 TRAE-2 — they used to be written as "").
+	traeDevice *traeFlowDevice
 }
 
 // wbToken is the WorkBuddy device-flow token triplet.

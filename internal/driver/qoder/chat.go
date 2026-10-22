@@ -6,6 +6,7 @@ package qoder
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -314,13 +315,20 @@ func extractAnyToolCalls(message map[string]interface{}, text string, toolsEnabl
 	return parseToolCallsText(text)
 }
 
-// parseToolCallsText 解析 "Tool calls: [...]" 文本格式（部分模型回退形态）。
+// parseToolCallsText 解析 "Tool calls: [...]" 文本格式（部分模型回退形态），
+// 以及文本形态的工具调用块（BP-98 Qoder-8：<tool_call>{json}</tool_call>
+// 与 XML function/parameter 形——模型偶发把它们写成正文，块就是本轮的
+// tool calls，不是散文；magpie-community/plugins packages/qoder 0.2.30
+// Splitter/parseCall）。
 func parseToolCallsText(text string) []normalizedToolCall {
 	if text == "" {
 		return nil
 	}
 	trimmed := strings.TrimSpace(text)
 	if !strings.HasPrefix(trimmed, "Tool calls:") {
+		if calls, _ := parseToolCallBlocks(text); len(calls) > 0 {
+			return calls
+		}
 		return nil
 	}
 	payload := strings.TrimSpace(trimmed[len("Tool calls:"):])
@@ -337,6 +345,111 @@ func parseToolCallsText(text string) []normalizedToolCall {
 		return nil
 	}
 	return normalizeToolCalls(parsed)
+}
+
+// text-tool-call block markers and shapes (magpie 0.2.30 CALL_OPEN/FUNC/
+// PARAM).
+const tcCallOpen = "<tool_call>"
+const tcCallClose = "</tool_call>"
+
+var tcFuncRe = regexp.MustCompile(`<function=([^>]+)>([\s\S]*?)</function>`)
+var tcParamRe = regexp.MustCompile(`<parameter=([^>]+)>([\s\S]*?)</parameter>`)
+
+// parseToolCallBlocks lifts every <tool_call>…</tool_call> block out of the
+// text and parses it as a call: JSON {name,arguments} first, then the XML
+// function/parameter form (magpie 0.2.30 parseCall). Returns the calls and
+// the remaining text. Guards, both from magpie: a block inside a code fence
+// or an open inline code span is prose ABOUT a call and stays text; a
+// truncated block (stream ended inside) stays text rather than failing the
+// turn — our accumulator re-feeds the whole buffered text, so nothing is
+// lost by keeping it.
+func parseToolCallBlocks(text string) ([]normalizedToolCall, string) {
+	var calls []normalizedToolCall
+	var out strings.Builder
+	rest := text
+	for {
+		i := strings.Index(rest, tcCallOpen)
+		if i < 0 {
+			out.WriteString(rest)
+			break
+		}
+		j := strings.Index(rest[i:], tcCallClose)
+		if j < 0 {
+			// Stream ended inside a block: keep it as text.
+			out.WriteString(rest)
+			break
+		}
+		body := rest[i+len(tcCallOpen) : i+j]
+		blockEnd := i + j + len(tcCallClose) // j is relative to rest[i:]
+		after := rest[blockEnd:]
+		call, ok := parseTextToolCall(body)
+		if !ok || inCodeFence(rest[:i]) {
+			// Unreadable or quoted: prose, keep verbatim.
+			out.WriteString(rest[:blockEnd])
+			rest = after
+			continue
+		}
+		calls = append(calls, call)
+		out.WriteString(rest[:i])
+		rest = after
+	}
+	return calls, out.String()
+}
+
+// parseTextToolCall reads one block body: JSON {name, arguments-object}, or
+// the XML <function=name><parameter=k>v</parameter>… form.
+func parseTextToolCall(body string) (normalizedToolCall, bool) {
+	var call normalizedToolCall
+	call.Type = "function"
+	trimmed := strings.TrimSpace(body)
+	var name, args string
+	var f struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if json.Unmarshal([]byte(trimmed), &f) == nil && strings.TrimSpace(f.Name) != "" && len(f.Arguments) > 0 && json.Valid(f.Arguments) {
+		name = strings.TrimSpace(f.Name)
+		args = string(f.Arguments)
+	} else if m := tcFuncRe.FindStringSubmatch(trimmed); m != nil && strings.TrimSpace(m[1]) != "" {
+		name = strings.TrimSpace(m[1])
+		argsMap := map[string]interface{}{}
+		for _, pm := range tcParamRe.FindAllStringSubmatch(m[2], -1) {
+			key := strings.TrimSpace(pm[1])
+			if key == "" {
+				continue
+			}
+			val := strings.TrimSpace(pm[2])
+			var jv interface{}
+			if json.Unmarshal([]byte(val), &jv) == nil {
+				argsMap[key] = jv
+			} else {
+				argsMap[key] = val
+			}
+		}
+		raw, err := json.Marshal(argsMap)
+		if err != nil {
+			return call, false
+		}
+		args = string(raw)
+	} else {
+		return call, false
+	}
+	call.Function.Name = name
+	call.Function.Arguments = args
+	call.ID = "fc_" + newUUID()
+	return call, true
+}
+
+// inCodeFence says the text before index i ends inside a code fence or an
+// open inline code span — a <tool_call> there is prose about one (magpie
+// 0.2.30 quoted()).
+func inCodeFence(text string) bool {
+	if strings.Count(text, "```")%2 == 1 {
+		return true
+	}
+	line := text[strings.LastIndexByte(text, '\n')+1:]
+	line = strings.ReplaceAll(line, "```", "")
+	return strings.Count(line, "`")%2 == 1
 }
 
 func toolsCallsToMaps(calls []normalizedToolCall) []map[string]interface{} {

@@ -108,6 +108,7 @@ type ChannelSettings struct {
 	Qoder        QoderSettings        `json:"qoder"`
 	OpenAICompat OpenAICompatSettings `json:"openaicompat"`
 	OpenCodeZen  OpenCodeZenSettings  `json:"opencodezen"`
+	Lobster      LobsterSettings      `json:"lobster"`
 }
 
 // AntigravitySettings configures the Google Cloud Code Assist channel.
@@ -218,6 +219,31 @@ type OpenCodeZenSettings struct {
 	BaseURL string `json:"base_url"` // default https://opencode.ai/zen (tests override)
 }
 
+// LobsterSettings configures the NetEase Youdao LobsterAI (有道龙虾) channel
+// (BP-98). It is an unofficial channel: the endpoints below belong to the
+// desktop client's own backend, not to a published developer API, and access
+// requires a user's own login (OAuth authorization code → JWT bearer).
+//
+// ServerBase hosts both surfaces: /api/* is the JSON envelope API
+// ({code,message,data}) used for login, models and quota; /api/proxy/v1 is
+// the OpenAI-shaped inference proxy.
+type LobsterSettings struct {
+	Enabled bool `json:"enabled"`
+	// ServerBase is the API host; PortalBase is the web portal that serves
+	// the login page. Split because the login redirect must point at the
+	// portal while every call goes to the server host.
+	ServerBase  string `json:"server_base"` // default https://lobsterai-server.youdao.com
+	PortalBase  string `json:"portal_base"` // default https://lobsterai.youdao.com
+	MaxInFlight int    `json:"max_in_flight"`
+
+	// ClientVersion / ClientCapabilities are the desktop client's advertised
+	// identity. They are optional (the upstream answers without them) but gate
+	// feature switches such as thinking-level control, so they are sent by
+	// default. Both are the vendor's own public constants, not credentials.
+	ClientVersion      string `json:"client_version"`
+	ClientCapabilities string `json:"client_capabilities"`
+}
+
 // ModelBinding binds one canonical model to one channel's native model id.
 type ModelBinding struct {
 	Canonical     string `json:"canonical"`      // e.g. "glm-5.3"
@@ -303,6 +329,17 @@ func Default() *Config {
 			OpenCodeZen: OpenCodeZenSettings{
 				Enabled: true,
 				BaseURL: "https://opencode.ai/zen",
+			},
+			Lobster: LobsterSettings{
+				// Enabled by default so the panel offers the login flow; the
+				// channel takes no traffic until a model binding is added, so
+				// an enabled-but-unbound pool is inert rather than noisy.
+				Enabled:            true,
+				ServerBase:         "https://lobsterai-server.youdao.com",
+				PortalBase:         "https://lobsterai.youdao.com",
+				MaxInFlight:        2,
+				ClientVersion:      "2026.9.23",
+				ClientCapabilities: "kimi-k3-agentic-v1,thinking-level-control-v1",
 			},
 		},
 		MaxQueueWait:    Duration(120 * time.Second),
@@ -448,6 +485,24 @@ func applyDefaults(cfg *Config) {
 	}
 	if ch.Qoder.DataDir == "" {
 		ch.Qoder.DataDir = cfg.DataDir // device salt lives beside the master key
+	}
+	if ch.Lobster.ServerBase == "" {
+		ch.Lobster.ServerBase = dch.Lobster.ServerBase
+	}
+	if ch.Lobster.PortalBase == "" {
+		ch.Lobster.PortalBase = dch.Lobster.PortalBase
+	}
+	if ch.Lobster.MaxInFlight <= 0 {
+		ch.Lobster.MaxInFlight = dch.Lobster.MaxInFlight
+	}
+	// The client identity headers are optional upstream, but they gate the
+	// thinking-level feature switches, so an empty value means "use the
+	// client version this build was written against", not "send nothing".
+	if ch.Lobster.ClientVersion == "" {
+		ch.Lobster.ClientVersion = dch.Lobster.ClientVersion
+	}
+	if ch.Lobster.ClientCapabilities == "" {
+		ch.Lobster.ClientCapabilities = dch.Lobster.ClientCapabilities
 	}
 	if cfg.MaxQueueWait <= 0 {
 		cfg.MaxQueueWait = d.MaxQueueWait

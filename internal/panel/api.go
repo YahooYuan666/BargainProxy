@@ -18,6 +18,7 @@ import (
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/lobster"
 	"bargainproxy/internal/driver/zcode"
 	"bargainproxy/internal/gateway"
 	"bargainproxy/internal/model"
@@ -98,7 +99,7 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 	for _, ch := range []string{
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae,
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
-		model.ChannelOpenAICompat, model.ChannelOpenCodeZen,
+		model.ChannelOpenAICompat, model.ChannelOpenCodeZen, model.ChannelLobster,
 	} {
 		for _, a := range pl.AccountsLocked(ch) {
 			v := accountView{
@@ -461,6 +462,38 @@ func normalizeImport(channel string, raw json.RawMessage, label string) (*model.
 			ID: model.ChannelQoder + ":" + shortHash(pat), Channel: channel,
 			Nickname: firstNonEmpty(label, strOf(m["name"]), "qoder"), CredsJSON: creds,
 		}, nil
+	case model.ChannelLobster:
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("lobster creds: %w", err)
+		}
+		tok := ""
+		for _, k := range []string{"access_token", "accessToken"} {
+			if v, ok := m[k].(string); ok && v != "" {
+				tok = v
+				break
+			}
+		}
+		if tok == "" {
+			return nil, fmt.Errorf("lobster: access_token missing")
+		}
+		// Stable identity: the JWT's yid/sub claim. Hashing the token would
+		// re-key the account on every refresh.
+		uid := lobster.JWTAudience(tok)
+		if uid == "" {
+			uid = shortHash(tok)
+		}
+		creds, _ := json.Marshal(map[string]any{
+			"access_token":  tok,
+			"refresh_token": firstNonEmpty(strOf(m["refresh_token"]), strOf(m["refreshToken"])),
+			"expires_at":    lobster.JWTExp(tok),
+			"uid":           uid,
+			"nickname":      firstNonEmpty(label, strOf(m["nickname"])),
+		})
+		return &model.Account{
+			ID: model.ChannelLobster + ":" + uid, Channel: channel, UID: uid,
+			Nickname: firstNonEmpty(label, strOf(m["nickname"]), "lobster"), CredsJSON: creds,
+		}, nil
 	case model.ChannelOpenAICompat:
 		var m map[string]any
 		if err := json.Unmarshal(raw, &m); err != nil {
@@ -598,7 +631,7 @@ func (p *Panel) findAccount(id string) *model.Account {
 	for _, ch := range []string{
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae,
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
-		model.ChannelOpenAICompat, model.ChannelOpenCodeZen,
+		model.ChannelOpenAICompat, model.ChannelOpenCodeZen, model.ChannelLobster,
 	} {
 		for _, a := range pl.AccountsLocked(ch) {
 			if a.ID == id {

@@ -21,6 +21,7 @@ import (
 	"bargainproxy/internal/driver"
 	"bargainproxy/internal/driver/antigravity"
 	"bargainproxy/internal/driver/autoclaw"
+	"bargainproxy/internal/driver/lobster"
 	"bargainproxy/internal/driver/openaicompat"
 	"bargainproxy/internal/driver/opencodezen"
 	"bargainproxy/internal/driver/qoder"
@@ -106,6 +107,7 @@ func main() {
 		model.ChannelQoder:        cfg.Channels.Qoder.MaxInFlight,
 		model.ChannelOpenAICompat: 4,
 		model.ChannelOpenCodeZen:  2,
+		model.ChannelLobster:      cfg.Channels.Lobster.MaxInFlight,
 	}
 	var p *pool.Pool
 	onChange := func(acc *model.Account) {
@@ -170,6 +172,12 @@ func main() {
 		// tools). The pool still needs an account to bind to (Execute filters
 		// account-less channels out), so register a synthetic one.
 		accounts = ensureAnonymousZenAccount(p, accounts)
+	}
+	if cfg.Channels.Lobster.Enabled {
+		// No synthetic account: lobster is strictly per-user (every call needs
+		// that user's own JWT), so the pool stays empty until someone logs in
+		// from the panel. An unbound pool is inert, not broken.
+		drivers[model.ChannelLobster] = lobster.New(cfg.Channels.Lobster, nil)
 	}
 	if cfg.Channels.OpenAICompat.Enabled && cfg.Channels.OpenAICompat.BaseURL != "" {
 		drivers[model.ChannelOpenAICompat] = openaicompat.New(cfg.Channels.OpenAICompat, nil)

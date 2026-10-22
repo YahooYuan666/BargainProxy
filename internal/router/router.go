@@ -46,6 +46,7 @@ var channelNames = map[string]bool{
 	model.ChannelQoder:        true,
 	model.ChannelOpenAICompat: true,
 	model.ChannelOpenCodeZen:  true,
+	model.ChannelLobster:      true,
 }
 
 // ValidChannel reports whether name is a known channel identifier.
@@ -65,6 +66,7 @@ func New(cfg *config.Config) *Router {
 			model.ChannelQoder:        cfg.Channels.Qoder.Enabled,
 			model.ChannelOpenAICompat: cfg.Channels.OpenAICompat.Enabled,
 			model.ChannelOpenCodeZen:  cfg.Channels.OpenCodeZen.Enabled,
+			model.ChannelLobster:      cfg.Channels.Lobster.Enabled,
 		},
 	}
 	for _, m := range cfg.Channels.OpenAICompat.Models {

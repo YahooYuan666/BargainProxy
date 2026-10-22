@@ -262,6 +262,13 @@ type Usage struct {
 	// (BP-40).
 	Credit      float64 `json:"credit,omitempty"`
 	CreditKnown bool    `json:"credit_known,omitempty"`
+	// CreditOriginal is the undiscounted price the upstream reports beside
+	// the charged credits (Qoder usage.original_credits — the struck-through
+	// price while a promotion runs, BP-98 Qoder-7c). CreditOriginalKnown
+	// distinguishes "no strike-through" from a 0 value, same discipline as
+	// CreditKnown.
+	CreditOriginal      float64 `json:"credit_original,omitempty"`
+	CreditOriginalKnown bool    `json:"credit_original_known,omitempty"`
 }
 
 // ChatResponse is a fully materialized (non-streamed) response.

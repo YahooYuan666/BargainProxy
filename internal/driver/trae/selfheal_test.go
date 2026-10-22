@@ -79,12 +79,14 @@ func TestStreamSelfHealsRejectedJWT(t *testing.T) {
 }
 
 // TestStreamNoHealOnOtherErrors 非 auth 错误不做刷新重试（不放大上游调用）。
+// 锚点用 429 纯限流（无业务码）：1005/4023 等阶梯码现在会换档重试（BP-98
+// TRAE-1），不能再用它们表达"非 auth"。
 func TestStreamNoHealOnOtherErrors(t *testing.T) {
 	chatHits := 0
 	chatUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		chatHits++
 		w.WriteHeader(429)
-		fmt.Fprint(w, `{"code":1005,"message":"plan entitlement exhausted"}`)
+		fmt.Fprint(w, `{"code":7001,"message":"too many requests"}`)
 	}))
 	t.Cleanup(chatUp.Close)
 	oauthHits := 0

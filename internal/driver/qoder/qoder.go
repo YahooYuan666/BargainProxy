@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -64,6 +65,7 @@ const (
 	defaultQueueWait = 30 * time.Second
 
 	pathJobExchange = "/api/v1/jobToken/exchange"
+	pathJobRefresh  = "/api/v1/jobToken/refresh"
 	pathCheckStatus = "/sash/api/v1/me/daily-check-in/status"
 	pathCheckClaim  = "/sash/api/v1/me/daily-check-in/claim"
 	pathProElig     = "/sash/api/v1/me/pro-upgrade/eligibility"
@@ -119,6 +121,7 @@ func (c *Creds) Marshal() []byte {
 // from the PAT, so a restart simply re-exchanges.
 type runtime struct {
 	mu            sync.Mutex
+	renewing      bool
 	creds         Creds
 	uid           string
 	userType      string
@@ -469,19 +472,7 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	out.Thinking = thinkBuf.String()
 	out.StopReason = mapStop(acc.finalFinishReason())
 	if usageObj != nil {
-		u := ir.Usage{
-			InputTokens:  usageObj.PromptTokens,
-			OutputTokens: usageObj.CompletionTokens,
-			Credit:       usageObj.Credits,
-			CreditKnown:  usageObj.Billable,
-		}
-		if usageObj.PromptTokensDetails != nil {
-			u.CachedInputTokens = usageObj.PromptTokensDetails.CachedTokens
-			u.CacheKnown = true
-		}
-		if usageObj.CompletionTokensDetails != nil {
-			u.ReasoningTokens = usageObj.CompletionTokensDetails.ReasoningTokens
-		}
+		u := irUsageFromUsageObj(usageObj)
 		out.Usage = u
 		if err := emit(ir.StreamEvent{Kind: ir.EvUsage, Usage: &u}); err != nil {
 			return nil, emitted, err
@@ -491,6 +482,32 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 		return nil, emitted, err
 	}
 	return out, emitted, nil
+}
+
+// irUsageFromUsageObj maps the stream's usage frame onto the IR usage
+// (BP-98 Qoder-7c): tokens, charged credits (CreditKnown gates the "no
+// data" vs "0 spent" distinction), and the undiscounted strike-through
+// price (CreditOriginal, gated the same way — a promotion's discount is
+// invisible without it).
+func irUsageFromUsageObj(uo *usage) ir.Usage {
+	u := ir.Usage{
+		InputTokens:  uo.PromptTokens,
+		OutputTokens: uo.CompletionTokens,
+		Credit:       uo.Credits,
+		CreditKnown:  uo.Billable,
+	}
+	if uo.OriginalCredits > 0 {
+		u.CreditOriginal = uo.OriginalCredits
+		u.CreditOriginalKnown = true
+	}
+	if uo.PromptTokensDetails != nil {
+		u.CachedInputTokens = uo.PromptTokensDetails.CachedTokens
+		u.CacheKnown = true
+	}
+	if uo.CompletionTokensDetails != nil {
+		u.ReasoningTokens = uo.CompletionTokensDetails.ReasoningTokens
+	}
+	return u
 }
 
 func mapStop(reason string) ir.StopReason {
@@ -611,6 +628,12 @@ func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCata
 	effort, effErr := resolveReasoningEffort(payload)
 	if effErr != nil {
 		return nil, "", "", false, "", uperr.New(uperr.ClassBadRequest, 400, "qoder: %v", effErr)
+	}
+	// Snap the requested effort to the nearest level the model names
+	// (BP-98 Qoder-9): an unsupported level passed through is ignored or
+	// refused upstream, silently drifting from what the caller asked.
+	if caps := cat.Caps[qoderKey]; caps != nil && len(caps.Efforts) > 0 && effort != "" && effort != "none" {
+		effort = fitEffort(effort, caps.Efforts)
 	}
 	params, perr := buildParameters(payload, effort, cat.maxOutputTokens(qoderKey))
 	if perr != nil {
@@ -783,21 +806,136 @@ func (rt *runtime) needsRefreshLocked() bool {
 	if rt.expireTimeMs == 0 {
 		return time.Since(rt.refreshedAt) > 30*time.Minute
 	}
-	return time.Now().UnixMilli() > rt.expireTimeMs-2*3600*1000
+	// 30-minute lead (BP-98 Qoder-5): the renewal endpoint grants 2h, so the
+	// old 2h lead made a refreshed session read as stale immediately and
+	// every caller renewed again — the one-time refresh token spent per
+	// request. 30min keeps the renewal ahead of expiry without eating the
+	// whole grant.
+	return time.Now().UnixMilli() > rt.expireTimeMs-30*60*1000
+}
+
+// ensureFresh serializes session renewal per runtime: the refresh token is
+// one-time, so two renewals would spend it twice (magpie 0.2.30: "a refresh
+// token is spent once, so two refreshes would spend it twice"). Renewals
+// chain on renMu; a caller that acquires the lock after a completed renewal
+// re-checks and finds the session fresh.
+func ensureFresh(rt *runtime, fn func() error) error {
+	rt.mu.Lock()
+	for rt.renewing {
+		// Another caller is renewing right now: wait for it and re-check.
+		// A completed renewal makes the session fresh, so the waiter returns
+		// nil without touching upstream (the refresh token is one-time —
+		// racing it spends it twice, magpie 0.2.30 "a refresh token is spent
+		// once, so two refreshes would spend it twice").
+		rt.mu.Unlock()
+		time.Sleep(2 * time.Millisecond)
+		rt.mu.Lock()
+		if rt.bootstrapped && !rt.needsRefreshLocked() {
+			rt.mu.Unlock()
+			return nil
+		}
+	}
+	rt.renewing = true
+	rt.mu.Unlock()
+	defer func() {
+		rt.mu.Lock()
+		rt.renewing = false
+		rt.mu.Unlock()
+	}()
+	return fn()
 }
 
 func (d *Driver) ensureFreshSession(ctx context.Context, rt *runtime) error {
-	rt.mu.Lock()
-	need := !rt.bootstrapped || rt.needsRefreshLocked()
-	rt.mu.Unlock()
-	if !need {
-		return nil
-	}
-	jt, err := d.exchangeJobToken(ctx, &rt.creds)
+	return ensureFresh(rt, func() error {
+		rt.mu.Lock()
+		need := !rt.bootstrapped || rt.needsRefreshLocked()
+		stale := need
+		refresh := rt.refreshToken
+		rt.mu.Unlock()
+		if !need {
+			return nil
+		}
+		// Renew first through the client's own endpoint (BP-98 Qoder-5,
+		// magpie-community/plugins packages/qoder 0.2.30 refreshJob/renew):
+		// a PAT exchange is a fresh sign-in and reads as one to upstream
+		// risk control, while /api/v1/jobToken/refresh is the ordinary
+		// renewal.
+		if stale && rt.bootstrapped && refresh != "" {
+			if err := d.refreshJobToken(ctx, rt, refresh); err == nil {
+				return nil
+			} else if ue, ok := uperr.As(err); ok && ue.Class != uperr.ClassAuth {
+				// A transient refresh failure (network, 5xx): the PAT
+				// exchange below is the fallback, not a reason to fail.
+				log.Printf("qoder: job token refresh failed (%v); falling back to PAT exchange", err)
+			}
+			// An auth-class refresh refusal (lapsed refresh token) falls
+			// through to the PAT exchange — the PAT lasts a year, the
+			// refresh two days.
+		}
+		jt, err := d.exchangeJobToken(ctx, &rt.creds)
+		if err != nil {
+			return err
+		}
+		return d.applyJobToken(ctx, rt, jt)
+	})
+}
+
+// refreshJobToken renews the job token pair through the openapi refresh
+// endpoint (magpie 0.2.30 refreshJob): {token, refresh_token, expires_in},
+// both halves required — a partial pair would orphan the next renewal. The
+// renewed pair replaces the identity's tokens and the COSY session is
+// rebuilt from it (the info blob embeds securityOauthToken/refreshToken).
+func (d *Driver) refreshJobToken(ctx context.Context, rt *runtime, refreshToken string) error {
+	body, _ := json.Marshal(map[string]any{"refresh_token": refreshToken})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.openAPIBase()+pathJobRefresh, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	return d.applyJobToken(ctx, rt, jt)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := d.rpc.Do(req)
+	if err != nil {
+		return uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "qoder job token refresh: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return uperr.New(uperr.ClassAuth, resp.StatusCode, "qoder: refresh token lapsed: %s", clip(string(raw), 160))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return uperr.New(uperr.ClassTransport, resp.StatusCode, "qoder job token refresh: status %d: %s", resp.StatusCode, clip(string(raw), 160))
+	}
+	var out struct {
+		Token     string `json:"token"`
+		Refresh   string `json:"refresh_token"`
+		ExpiresIn int64  `json:"expires_in"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return fmt.Errorf("qoder job token refresh: decode: %w", err)
+	}
+	if out.Token == "" || out.Refresh == "" {
+		return fmt.Errorf("qoder job token refresh: incomplete token pair")
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.securityOauth = out.Token
+	rt.refreshToken = out.Refresh
+	if out.ExpiresIn > 0 {
+		rt.expireTimeMs = time.Now().UnixMilli() + out.ExpiresIn*1000
+	} else {
+		rt.expireTimeMs = time.Now().Add(24 * time.Hour).UnixMilli()
+	}
+	rt.refreshedAt = time.Now()
+	// Rebuild the COSY session from the renewed identity.
+	sess, err := newSession(authIdentity{
+		Name: rt.creds.Name, Aid: rt.uid, UID: rt.uid, UserType: rt.userType,
+		SecurityOauthToken: out.Token, RefreshToken: out.Refresh,
+	}, rt.creds.MachineID, rt.creds.MachineToken, rt.creds.MachineType)
+	if err != nil {
+		return err
+	}
+	rt.sess = sess
+	return nil
 }
 
 func (d *Driver) applyJobToken(ctx context.Context, rt *runtime, jt map[string]any) error {
@@ -1044,19 +1182,47 @@ func deriveCheckinID(uid, salt string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func checkinHeaders(bearer, uid string) map[string]string {
-	return map[string]string{
+// checkinHeaders builds the campaigns/check-in header set. machineToken and
+// machineType come from the account's derived device triple (BP-98 Qoder-2).
+func checkinHeaders(bearer, uid, machineToken, machineType string) map[string]string {
+	h := map[string]string{
 		"Content-Type":  "application/json",
 		"Accept":        "application/json, text/plain, */*",
-		"User-Agent":    "Go-http-client/2.0",
+		"User-Agent":    campaignUserAgent,
 		"Authorization": "Bearer " + bearer,
 		"X-Request-ID":  deriveCheckinID(uid, "req") + fmt.Sprintf("-%06d", time.Now().UnixNano()%1e6),
 		"X-Machine-ID":  deriveCheckinID(uid, "machine"),
 		"X-Session-ID":  deriveCheckinID(uid, "session"),
 		"Origin":        "https://qoder.com.cn",
 		"Referer":       "https://qoder.com.cn/",
+		// Device identity on the Cosy header family (BP-98 Qoder-2,
+		// magpie-community/plugins packages/qoder 0.2.30 campaignCall):
+		// Qoder CN moved the daily 100 credits to the desktop benefit center
+		// and the campaigns list omits the CLAIM_BENEFIT entry unless the
+		// request carries the account's device identity.
+		"Cosy-ClientType": "10",
 	}
+	if machineToken != "" {
+		h["Cosy-MachineToken"] = machineToken
+	}
+	if machineType != "" {
+		h["Cosy-MachineType"] = machineType
+	}
+	return h
 }
+
+// campaignUserAgent reads as the client, not as a Go script (magpie 0.2.30
+// campaignCall sends "Qoder"; a bare UA on the campaigns page reads as
+// tooling).
+const campaignUserAgent = "Qoder"
+
+// campaignPath is where Qoder lists the account's campaigns — the daily
+// credits among them (actionType CLAIM_BENEFIT) — and claims one
+// (magpie 0.2.30 CAMPAIGNS).
+const (
+	campaignPath  = "/sash/api/v1/me/campaigns"
+	campaignClaim = "/sash/api/v1/me/campaigns/%s/claim"
+)
 
 func (d *Driver) checkinJSON(ctx context.Context, method, url string, body []byte, uid, bearer string) (map[string]any, error) {
 	var rd io.Reader
@@ -1067,7 +1233,8 @@ func (d *Driver) checkinJSON(ctx context.Context, method, url string, body []byt
 	if err != nil {
 		return nil, err
 	}
-	for k, v := range checkinHeaders(bearer, uid) {
+	mt, mty := d.machineIdentityFor(uid)
+	for k, v := range checkinHeaders(bearer, uid, mt, mty) {
 		req.Header.Set(k, v)
 	}
 	resp, err := d.rpc.Do(req)
@@ -1091,7 +1258,23 @@ func (d *Driver) checkinJSON(ctx context.Context, method, url string, body []byt
 	return out, nil
 }
 
+// machineIdentityFor returns the Cosy device-identity pair for the account's
+// derived virtual device (the same triple the chat calls sign with), or two
+// empty strings when no salt is configured — the headers are then omitted
+// and the campaigns list may omit the daily entry (BP-98 Qoder-2).
+func (d *Driver) machineIdentityFor(uid string) (token, typ string) {
+	m := deriveMachineIDs(patFingerprint(uid), d.machineSalt())
+	return m.machineToken, m.machineType
+}
+
 // Checkin implements the daily check-in task (idempotent upstream).
+//
+// Two paths (BP-98 Qoder-2): the legacy daily-check-in endpoints first; when
+// they stop describing the daily credit (Qoder CN moved it to the desktop
+// benefit center — the 0.2.30 clients read it from the campaigns page), the
+// campaigns list claims the CLAIM_BENEFIT campaign instead. A campaign
+// already claimed is the day's done, one not active is inactive — never an
+// error worth retrying.
 func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn bool, credits int64, enable bool, err error) {
 	rt, err := d.runtimeFor(acc)
 	if err != nil {
@@ -1133,8 +1316,71 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 		}
 		return false, reward, true, nil
 	default:
-		return false, 0, true, nil
+		// The legacy endpoint no longer describes the daily credit: read the
+		// campaigns page the current client uses.
+		return d.checkinCampaigns(ctx, uid, bearer)
 	}
+}
+
+// checkinCampaigns claims the daily credits through the campaigns page the
+// current Qoder client uses (magpie-community/plugins packages/qoder 0.2.30
+// checkin): list /sash/api/v1/me/campaigns, find the active CLAIM_BENEFIT
+// campaign, claim it. CLAIMED = the day's done; no active campaign =
+// inactive (not an error).
+func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool, int64, bool, error) {
+	list, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+campaignPath, nil, uid, bearer)
+	if err != nil {
+		return false, 0, false, qoderError(err)
+	}
+	rawList, _ := list["campaigns"].([]any)
+	now := time.Now().Unix()
+	var claimable map[string]any
+	for _, it := range rawList {
+		c, ok := it.(map[string]any)
+		if !ok || toString(c["actionType"]) != "CLAIM_BENEFIT" {
+			continue
+		}
+		start := toInt64(c["startAt"])
+		end := toInt64(c["endAt"])
+		active := (start == 0 || start <= now) && (end == 0 || end > now)
+		switch toString(c["claimStatus"]) {
+		case "CLAIMABLE":
+			if active {
+				claimable = c
+			}
+		case "CLAIMED":
+			if active {
+				return true, toInt64(c["benefit.amount"]), true, nil
+			}
+		}
+	}
+	if claimable == nil {
+		return false, 0, true, nil // no active campaign: inactive, not an error
+	}
+	id := toString(claimable["id"])
+	if id == "" {
+		return false, 0, true, fmt.Errorf("qoder campaigns: CLAIM_BENEFIT campaign without id")
+	}
+	claim, err := d.checkinJSON(ctx, http.MethodPost, d.openAPIBase()+fmt.Sprintf(campaignClaim, id), []byte("{}"), uid, bearer)
+	if err != nil {
+		return false, 0, false, qoderError(err)
+	}
+	if toString(claim["result"]) == "ALREADY_CLAIMED" {
+		return true, 0, true, nil
+	}
+	if succ, ok := claim["success"].(bool); ok && !succ {
+		return false, 0, false, fmt.Errorf("qoder campaigns claim rejected: %s", clip(marshalCompact(claim), 160))
+	}
+	reward := toInt64(claim["rewardCredits"])
+	if reward == 0 {
+		reward = toInt64(claimable["benefit.amount"])
+	}
+	// A fresh campaigns claim IS the day's check-in done: the task ledger
+	// must record it as ok/checked-in so the next slot does not re-run it
+	// (the legacy path returned false here because its status endpoint
+	// reports CLAIMED the next time; the campaigns page has no such
+	// re-read in the same day).
+	return true, reward, true, nil
 }
 
 // CatalogMap returns the live display-name -> upstream-key catalogue
@@ -1244,6 +1490,15 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, uperr.New(uperr.ClassTransport, 0, "qoder: quota decode: %v", err)
 	}
+	return probeCreditsFromDoc(doc), nil
+}
+
+// probeCreditsFromDoc maps the quota document onto the balance: plan remain/
+// total, addon + org + dedicated packages as Bonus (BP-98 Qoder-7b — the
+// dedicatedResourcePackages array used to be dropped, so an account with a
+// dedicated pack read as poorer than it is; magpie 0.2.30 parseUsage adds
+// every package under "Dedicated credits").
+func probeCreditsFromDoc(doc map[string]any) *driver.ProbeResult {
 	remain := toInt64(doc["plan_remaining"])
 	total := toInt64(doc["plan_total"])
 	addon := toInt64(doc["addon_remaining"])
@@ -1265,9 +1520,21 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 			bonus += toInt64(oq["remaining"])
 		}
 	}
+	dedicated := int64(0)
+	if pkgs, ok := doc["dedicatedResourcePackages"].([]any); ok {
+		for _, it := range pkgs {
+			if pkg, ok := it.(map[string]any); ok {
+				dedicated += toInt64(pkg["remaining"])
+			}
+		}
+	}
+	if dedicated > 0 {
+		bonus += dedicated
+		note += fmt.Sprintf(", dedicated %d", dedicated)
+	}
 	return &driver.ProbeResult{Credits: &model.Credits{
 		Remain: remain, Total: total, Bonus: bonus, UpdatedAt: time.Now(),
-	}, Note: note}, nil
+	}, Note: note}
 }
 
 // LoginPAT validates a personal access token and builds the account
@@ -1299,10 +1566,71 @@ func (d *Driver) LoginPAT(ctx context.Context, pat, label string) (*model.Accoun
 
 // --- helpers ---
 
+// quotaCodes are the codes Qoder's own client counts as a plan's usage or
+// credits used up (magpie-community/plugins packages/qoder 0.2.30
+// QUOTA_CODES, read from the app's qoder-agent-sdk worker): a 429-class
+// exhaustion — without this split they landed in bad_request and the pool
+// kept hammering an empty account instead of cooling it to the daily reset.
+var quotaCodes = map[string]bool{
+	"110": true, "112": true, "113": true, "114": true, "115": true,
+	"116": true, "117": true, "118": true, "119": true, "122": true,
+}
+
+// requestCodes refuse THIS request, not the account: sensitive content, not
+// supported, input too long, too many media, a custom model's service
+// (magpie 0.2.30 REQUEST_CODES). bad_request stays right for these.
+var requestCodes = map[string]bool{
+	"406": true, "416": true, "430": true, "80411": true, "80412": true,
+	"100400": true, "100401": true, "100403": true,
+}
+
+// upstreamFailedRe is Qoder saying the model's own vendor behind it failed:
+// "Error in upstream response", which Qoder sends as a 400 (magpie 0.2.30
+// UPSTREAM_FAILED, SlouchyQuill507 on Discord). Nothing is wrong with the
+// request or the account — it is a transport failure the pool may retry
+// elsewhere, not a bad request that ends the turn as the client's fault.
+var upstreamFailedRe = regexp.MustCompile(`(?i)\berror in upstream response\b`)
+
+// qoderBodyCode extracts the top-level business code from a Qoder body
+// (number or digit string).
+func qoderBodyCode(body string) string {
+	var env struct {
+		Code any `json:"code"`
+	}
+	if json.Unmarshal([]byte(body), &env) != nil {
+		return ""
+	}
+	switch t := env.Code.(type) {
+	case float64:
+		return fmt.Sprint(int(t))
+	case string:
+		return t
+	}
+	return ""
+}
+
 func classifyQoder(status int, body string) *uperr.Error {
 	text := clip(body, 300)
 	if strings.Contains(body, busyCode) || status == http.StatusTooManyRequests {
 		return uperr.New(uperr.ClassSoftRate, status, "qoder: %s", text)
+	}
+	// The business code inside the body decides before the HTTP status does.
+	code := qoderBodyCode(body)
+	switch {
+	case quotaCodes[code]:
+		e := uperr.New(uperr.ClassHardCredit, 429, "qoder: usage limit reached (%s): %s", code, text)
+		e.Code = code
+		return e
+	case upstreamFailedRe.MatchString(body):
+		e := uperr.New(uperr.ClassTransport, 502, "qoder: upstream vendor failed: %s", text)
+		if code != "" {
+			e.Code = code
+		}
+		return e
+	case requestCodes[code]:
+		e := uperr.New(uperr.ClassBadRequest, 400, "qoder: refused the request (%s): %s", code, text)
+		e.Code = code
+		return e
 	}
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:

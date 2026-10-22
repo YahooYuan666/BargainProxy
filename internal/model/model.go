@@ -59,6 +59,13 @@ const (
 	// ChannelOpenCodeZen is the OpenCode Zen anonymous free-model channel
 	// (OpenAI wire upstream; free-tier gated — BP-54).
 	ChannelOpenCodeZen = "opencodezen"
+	// ChannelLobster is NetEase Youdao's LobsterAI (有道龙虾) desktop-agent
+	// backend. OpenAI-shaped wire, but three quirks keep it from being just
+	// another openai-compat: it always answers with SSE even when
+	// stream=false, it reports errors as `event: error` inside an HTTP 200
+	// stream, and its thinking gears ride a private `lobsterai_options`
+	// field rather than reasoning_effort (BP-98).
+	ChannelLobster = "lobster"
 )
 
 // Window is a quota window snapshot (antigravity 5h / weekly windows).

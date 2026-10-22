@@ -154,8 +154,8 @@ var routedSpecs = map[string]tierRow{
 	"qoder|Kimi-K3":                             {Billing: "x1.4", ContextLen: 1048576, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"autoclaw|zaicoding_glm-5.3":                {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 307200, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"autoclaw|glm-5.3-flash":                    {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
-	"autoclaw|tdpsk_deepseek-v4-pro-202606":     {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "关闭 + high/max", ToolCall: true, Structured: true},
-	"autoclaw|tdpsk_deepseek-v4.1-flash-202606": {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
+	// autoclaw 的 tdpsk_deepseek-* 两条已移除：CN 加速网关对本账号三个候选 id
+	// 全部回 400「非法模型」，而同刻 glm-5.3-flash 可用（2026-10-23 实测）。
 	// Trae 免费用户折扣表：glm-5.3-flash 未单列，取客户端截图 0.06x（无折扣标签）。
 	"trae|glm-5.3-flash": {Billing: "x0.06", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	// Trae 的 4.1-flash 折扣表（docs.trae.cn「内置模型限时折扣」）：免费忙时 x0.12 /

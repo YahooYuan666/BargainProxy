@@ -234,6 +234,10 @@ func TestCheckinFlow(t *testing.T) {
 	}
 }
 
+// BP-98 TRAE-3: a business refusal is upstream's answer about today — 9074
+// ("check in via the app") answers the same however often it is asked, so it
+// fails on the FIRST claim; the retry loop is for 5xx/transport only
+// (yetone/magpie#808: three 20s waits per account per slot bought nothing).
 func TestCheckinClaimBusinessCodeRetriesThenFails(t *testing.T) {
 	old := checkinRetryDelay
 	checkinRetryDelay = time.Millisecond
@@ -260,8 +264,8 @@ func TestCheckinClaimBusinessCodeRetriesThenFails(t *testing.T) {
 	if checked {
 		t.Fatal("checkedIn must be false when the claim is rejected")
 	}
-	if claims != 3 {
-		t.Fatalf("claim attempts = %d, want 3", claims)
+	if claims != 1 {
+		t.Fatalf("claim attempts = %d, want 1 (a refusal is not retryable)", claims)
 	}
 	if !strings.Contains(err.Error(), "9074") {
 		t.Fatalf("error should name the business code: %v", err)

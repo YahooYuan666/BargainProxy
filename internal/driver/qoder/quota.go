@@ -17,18 +17,19 @@ import (
 
 // QuotaDetail is the panel payload for one Qoder account.
 type QuotaDetail struct {
-	Account      string        `json:"account,omitempty"`
-	UserType     string        `json:"user_type,omitempty"`
-	Unit         string        `json:"unit,omitempty"`
-	PlanRemain   int64         `json:"plan_remaining"`
-	PlanTotal    int64         `json:"plan_total"`
-	PlanUsed     int64         `json:"plan_used"`
-	AddonRemain  int64         `json:"addon_remaining"`
-	OrgRemain    int64         `json:"org_remaining"`
-	Exceeded     bool          `json:"exceeded"`
-	ExpiresAtMs  int64         `json:"expires_at,omitempty"`
-	Checkin      *CheckinState `json:"checkin,omitempty"`
-	CheckinError string        `json:"checkin_error,omitempty"`
+	Account         string        `json:"account,omitempty"`
+	UserType        string        `json:"user_type,omitempty"`
+	Unit            string        `json:"unit,omitempty"`
+	PlanRemain      int64         `json:"plan_remaining"`
+	PlanTotal       int64         `json:"plan_total"`
+	PlanUsed        int64         `json:"plan_used"`
+	AddonRemain     int64         `json:"addon_remaining"`
+	OrgRemain       int64         `json:"org_remaining"`
+	DedicatedRemain int64         `json:"dedicated_remaining,omitempty"` // 专属资源包合计 (BP-98 Qoder-7b)
+	Exceeded        bool          `json:"exceeded"`
+	ExpiresAtMs     int64         `json:"expires_at,omitempty"`
+	Checkin         *CheckinState `json:"checkin,omitempty"`
+	CheckinError    string        `json:"checkin_error,omitempty"`
 }
 
 // CheckinState is the daily check-in status without claiming.
@@ -72,6 +73,16 @@ func parseQuotaDetail(doc map[string]any) *QuotaDetail {
 	if oq, ok := doc["orgResourcePackage"].(map[string]any); ok {
 		if avail, _ := oq["available"].(bool); avail {
 			out.OrgRemain = toInt64(oq["remaining"])
+		}
+	}
+	// Dedicated packages (BP-98 Qoder-7b): every package's remaining credits,
+	// summed — the array used to be dropped entirely (magpie 0.2.30
+	// parseUsage "Dedicated credits").
+	if pkgs, ok := doc["dedicatedResourcePackages"].([]any); ok {
+		for _, it := range pkgs {
+			if pkg, ok := it.(map[string]any); ok {
+				out.DedicatedRemain += toInt64(pkg["remaining"])
+			}
 		}
 	}
 	out.Exceeded, _ = doc["isQuotaExceeded"].(bool)

@@ -19,6 +19,7 @@ import (
 
 	"bargainproxy/internal/driver"
 	"bargainproxy/internal/driver/autoclaw"
+	"bargainproxy/internal/driver/lobster"
 	"bargainproxy/internal/driver/qoder"
 	"bargainproxy/internal/driver/trae"
 	"bargainproxy/internal/driver/workbuddy"
@@ -39,6 +40,7 @@ const (
 	TaskCheckinTrae       = "checkin_trae"
 	TaskCheckinAutoClaw   = "checkin_autoclaw"
 	TaskCheckinQoder      = "checkin_qoder"
+	TaskCheckinLobster    = "checkin_lobster"
 	TaskProbeAll          = "probe_all"
 	TaskRefreshTokens     = "refresh_tokens"
 	TaskGrowthWorkBuddy   = "growth_workbuddy"
@@ -307,7 +309,7 @@ func (s *Scheduler) accountWait(ctx context.Context, offset time.Duration) {
 func (s *Scheduler) TaskTypes() []string {
 	return []string{
 		TaskCheckinWorkBuddy, TaskGrowthWorkBuddy, TaskCheckinTrae,
-		TaskCheckinAutoClaw, TaskCheckinQoder,
+		TaskCheckinAutoClaw, TaskCheckinQoder, TaskCheckinLobster,
 		TaskActivityWorkBuddy, TaskTravelWorkBuddy, TaskBlackcatWorkBuddy,
 		TaskProbeAll, TaskRefreshTokens,
 	}
@@ -805,6 +807,8 @@ func (s *Scheduler) RunTask(ctx context.Context, taskType, accountID string) (st
 		return s.runPerAccount(ctx, taskType, accountID, model.ChannelAutoClaw, s.checkinAutoClaw)
 	case TaskCheckinQoder:
 		return s.runPerAccount(ctx, taskType, accountID, model.ChannelQoder, s.checkinQoder)
+	case TaskCheckinLobster:
+		return s.runPerAccount(ctx, taskType, accountID, model.ChannelLobster, s.checkinLobster)
 	case TaskProbeAll:
 		return s.probeAll(ctx, accountID)
 	case TaskRefreshTokens:
@@ -889,7 +893,8 @@ func (s *Scheduler) runPerAccount(
 		}
 		_ = s.st.UpsertTaskRun(&model.TaskRun{
 			AccountID: acc.ID, TaskType: taskType, RunDate: today,
-			Status: status, Detail: detail, StartedAt: started, FinishedAt: fin,
+			Status: status, Detail: detail, Credits: taskRunCredits(detail),
+			StartedAt: started, FinishedAt: fin,
 		})
 		if status == "ok" {
 			notes = append(notes, fmt.Sprintf("%s: %s", label(acc), detail))
@@ -913,6 +918,26 @@ func (s *Scheduler) accountsOf(channel string) []*model.Account {
 	accts := s.pl.Accounts(channel)
 	sort.SliceStable(accts, func(i, j int) bool { return accts[i].ID < accts[j].ID })
 	return accts
+}
+
+// taskRunCredits lifts the credit reward a task's detail states so it lands
+// in TaskRun.Credits (BP-98 Qoder-7a): the check-in tasks phrase their
+// reward as "+100 credits …" and the ledger column used to stay zero, so
+// 签到收益 could not be tracked from task_runs alone. No stated reward → 0.
+func taskRunCredits(detail string) int64 {
+	const marker = "+"
+	if !strings.HasPrefix(detail, marker) {
+		return 0
+	}
+	end := strings.Index(detail, " credits")
+	if end <= 1 {
+		return 0
+	}
+	var n int64
+	if _, err := fmt.Sscanf(detail[1:end], "%d", &n); err != nil {
+		return 0
+	}
+	return n
 }
 
 func label(a *model.Account) string {
@@ -1065,10 +1090,17 @@ func (s *Scheduler) checkinTrae(ctx context.Context, acc *model.Account) (string
 	if err != nil {
 		return "trae checkin failed: " + err.Error(), err
 	}
-	// Refresh balance.
+	// Refresh balance, then release the cooldown the balance just disproved
+	// (BP-98 TRAE-8): a 1005 plan-entitlement rest lifts as soon as the
+	// check-in/probe shows credits came back — without this the account
+	// waits out the full 12h while the quota sits at zero-balance-refilled.
+	// A disabled account stays disabled (only cooldowns lift).
 	if prober, ok := s.gw.Driver(model.ChannelTrae).(driver.Prober); ok {
 		if res, err := prober.Probe(ctx, acc); err == nil {
 			s.gw.ApplyProbe(acc, res)
+			if res.Credits != nil {
+				s.gw.Pool().ReleaseOnCredits(acc, res.Credits.Remain)
+			}
 			_ = s.st.SaveAccount(acc)
 		}
 	}
@@ -1083,6 +1115,42 @@ func (s *Scheduler) checkinTrae(ctx context.Context, acc *model.Account) (string
 		// (ticket 37).
 		return "trae checkin not available (enable=false)", nil
 	}
+}
+
+// checkinLobster claims the 每日积分礼 (+100 credits, one per day). The
+// upstream reports an already-claimed day as state, not as an error, so a
+// second scheduled run in the same day is a no-op rather than a failure.
+func (s *Scheduler) checkinLobster(ctx context.Context, acc *model.Account) (string, error) {
+	drv, ok := s.gw.Driver(model.ChannelLobster).(*lobster.Driver)
+	if !ok {
+		return "", fmt.Errorf("lobster driver not installed")
+	}
+	res, err := drv.Checkin(ctx, acc)
+	if err != nil {
+		// A dead access token must not fail the whole day's task: refresh once
+		// and retry, same discipline as the other channels.
+		if ue, ok := uperr.As(err); ok && (ue.Status == 401 || ue.Class == uperr.ClassAuth) {
+			if rerr := drv.Refresh(ctx, acc); rerr == nil {
+				_ = s.st.SaveAccount(acc)
+				res, err = drv.Checkin(ctx, acc)
+			}
+		}
+		if err != nil {
+			return "lobster checkin failed: " + err.Error(), err
+		}
+	}
+	// Refresh the balance so the panel shows the new credits immediately.
+	if prober, ok := s.gw.Driver(model.ChannelLobster).(driver.Prober); ok {
+		if pr, perr := prober.Probe(ctx, acc); perr == nil {
+			s.gw.ApplyProbe(acc, pr)
+			_ = s.st.SaveAccount(acc)
+		}
+	}
+	if res.AlreadyClaimed {
+		return fmt.Sprintf("already checked in today (day %d/%d)", res.ClaimedDays, res.TotalDays), nil
+	}
+	return fmt.Sprintf("checkin ok: +%d credits (day %d/%d, period %s)",
+		res.CreditsGranted, res.ClaimedDays, res.TotalDays, res.PeriodKey), nil
 }
 
 func (s *Scheduler) checkinAutoClaw(ctx context.Context, acc *model.Account) (string, error) {
@@ -1324,7 +1392,7 @@ func (s *Scheduler) probeAll(ctx context.Context, accountID string) (string, err
 	channels := []string{
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae,
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
-		model.ChannelOpenAICompat,
+		model.ChannelOpenAICompat, model.ChannelLobster,
 	}
 	probed, failed, skipped := 0, 0, 0
 	var firstErr error
@@ -1396,7 +1464,7 @@ func (s *Scheduler) probeAll(ctx context.Context, accountID string) (string, err
 func (s *Scheduler) refreshTokens(ctx context.Context) (string, error) {
 	channels := []string{
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae, model.ChannelZCode,
-		model.ChannelAutoClaw, model.ChannelQoder,
+		model.ChannelAutoClaw, model.ChannelQoder, model.ChannelLobster,
 	}
 	refreshed, failed := 0, 0
 	var firstErr error

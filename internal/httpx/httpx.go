@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -105,7 +106,43 @@ func ClassifyTransportErr(ctx context.Context, err error) string {
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
 		return uperr.ClassUpstreamTimeout
 	}
+	if IsPersistentTransportErr(err) {
+		return uperr.ClassTransportDead
+	}
 	return uperr.ClassTransport
+}
+
+// persistentTransportMarkers are failures that retrying cannot fix. They are
+// properties of the egress path (proxy credentials, DNS, routing), not of one
+// account or one request, so every account of the channel fails identically.
+//
+// Field motivation: an expired SOCKS5 proxy subscription made every request
+// hard-fail; without this split the gateway kept re-entering an 80s backoff
+// loop forever and never reported the real cause (BP-99, sub2api parity).
+var persistentTransportMarkers = []string{
+	"proxy authentication required", // 407 from the proxy
+	"proxyconnect",                  // proxy handshake failure
+	"no such host",                  // DNS cannot resolve
+	"no route to host",              // routing table / wrong gateway
+	"network is unreachable",        // adapter down / no default route
+	"connection refused",            // nothing listening (dead local relay)
+	"authentication failed",         // egress auth in general
+}
+
+// IsPersistentTransportErr reports whether a transport error is of the kind
+// that will not heal by retrying. Callers use it to park the channel instead of
+// walking the pool.
+func IsPersistentTransportErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, m := range persistentTransportMarkers {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // IdleBody wraps a streaming response body with an idle watchdog: when no

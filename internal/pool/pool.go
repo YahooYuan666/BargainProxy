@@ -846,8 +846,30 @@ func (p *Pool) SetWaitParams(maxQueueWait, sessionTTL, costTTL time.Duration) {
 	p.mu.Unlock()
 }
 
+// ReleaseOnCredits ends a plan-entitlement cooldown when a check-in has
+// demonstrably refilled the balance (BP-98 TRAE-8, agentpoints
+// scheduler.ReenableIfCredits parity): check in → re-read credits →
+// credits > 0 releases the rest, instead of letting a 1005-cooled account
+// wait out its full 12h after the quota came back at midnight. A disabled
+// account stays disabled — restriction is upstream's verdict, a cooldown is
+// just our wait; a zero balance releases nothing.
+func (p *Pool) ReleaseOnCredits(a *model.Account, remain int64) {
+	if remain <= 0 || a == nil || a.Disabled {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.params.Now()
+	if !now.Before(a.AccountCooldownUntil) {
+		return // not cooling
+	}
+	a.AccountCooldownUntil = time.Time{}
+	a.AccountCooldownReason = ""
+	a.AccountCooldownBy = ""
+	p.changedLocked(a)
+}
+
 // ApplyResult folds an upstream result into the account state machine. Call
-// after every upstream attempt. Success clears failure counters.
 // restAccount records an account-level rest together with WHY and WHAT set the
 // deadline. Keeping the two beside the timestamp is what lets the panel say
 // "rate limit, back at 21:05" instead of just "cooling down" (2026-10-22).
@@ -916,6 +938,24 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// 429 renderers and Retry-After can point at the next attempt.
 		upstreamErr.HoldUntil = until
 	case uperr.ClassHardCredit:
+		// A channel whose allowances are counted per model (AutoClaw: one
+		// route's free allowance running out says nothing about the account's
+		// other routes — field-verified, one model answers 200 while another
+		// answers 810000 at the same moment) can say so by setting Model. Then
+		// only that model rests; the rest of the account keeps serving.
+		//
+		// Everything else keeps the old account-wide behaviour: a plain balance
+		// is spent for every model at once.
+		if upstreamErr.Model != "" {
+			reason := "out of credit"
+			if upstreamErr.Code != "" {
+				reason = upstreamErr.Code + " model allowance used up"
+			}
+			until := p.setModelCooldown(a, upstreamErr.Model, time.Time{}, reason, upstreamErr.Message, now)
+			upstreamErr.HoldUntil = until
+			a.BreakerFails = 0
+			break
+		}
 		p.restAccount(a, NextDay4AM(now), "out of credit", "upstream", now)
 		a.BreakerFails = 0
 	case uperr.ClassAuth:
@@ -955,6 +995,16 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 	case uperr.ClassTransport:
 		a.ConsecutiveFails++
 		p.restAccount(a, now.Add(backoffTransport(a.ConsecutiveFails)), "transport error", "backoff", now)
+	case uperr.ClassTransportDead:
+		// A transport failure that retrying cannot fix (dead proxy credential,
+		// unresolvable host, refused connection). Every account of the channel
+		// fails identically, so charging them one at a time just walks the pool
+		// through an 80s backoff loop that can never succeed. Park the CHANNEL
+		// briefly and leave the accounts untouched (BP-99).
+		if d := p.params.EdgeBlockPause; d > 0 {
+			p.markChannelBusyLocked(a.Channel, model, now.Add(d))
+		}
+		return
 	case uperr.ClassBadRequest, uperr.ClassContentBlocked, uperr.ClassSentinel:
 		// No account penalty: the account is fine, the payload was not.
 		return
@@ -1048,6 +1098,40 @@ func (p *Pool) RecordCredits(a *model.Account, c model.Credits) {
 	defer p.mu.Unlock()
 	if c.UpdatedAt.IsZero() {
 		c.UpdatedAt = p.params.Now()
+	}
+	// Observe the billing tier from the balance delta. This is the only place
+	// the truth is available for channels that do not report a per-request
+	// charge (AutoClaw among them): a lower balance than the last snapshot means
+	// the models used since then were paid for; an unchanged one means they were
+	// free.
+	//
+	// Before this existed nothing ever wrote CostTiers outside the tests, so
+	// costTierLocked always answered "unknown" and the floor guard —
+	// "do not pick an account whose balance is spent" — could never fire for any
+	// credit channel (BP-100).
+	if !a.Credits.UpdatedAt.IsZero() && !c.UpdatedAt.Before(a.Credits.UpdatedAt) {
+		prev, next := a.Credits.Remain, c.Remain
+		tier := -1
+		switch {
+		case next < prev:
+			tier = 2 // something was billed
+		case next > prev:
+			tier = -1 // a top-up, not a spend: says nothing about the models
+		default:
+			tier = 0 // the balance held: nothing was billed
+		}
+		if tier >= 0 {
+			now := p.params.Now()
+			for _, m := range p.uses[a.ID] {
+				if m == "" {
+					continue
+				}
+				if a.CostTiers == nil {
+					a.CostTiers = map[string]model.CostObservation{}
+				}
+				a.CostTiers[m] = model.CostObservation{Tier: tier, ObservedAt: now}
+			}
+		}
 	}
 	a.Credits = c
 	a.UpdatedAt = p.params.Now()
@@ -1484,7 +1568,13 @@ func (p *Pool) pickLocked(channel, modelName string, candidates []*model.Account
 	switch channel {
 	case model.ChannelAntigravity:
 		return p.pickGreedyLocked(candidates, now)
-	case model.ChannelWorkBuddy, model.ChannelTrae, model.ChannelZCode:
+	case model.ChannelWorkBuddy, model.ChannelTrae, model.ChannelZCode,
+		// AutoClaw is a credit pool like the three above: it has a points
+		// balance, expiring packs and a per-route allowance. Serving it by
+		// least-recently-used ignored both the balance and the expiry pressure,
+		// so an account about to run dry could be picked ahead of a full one
+		// (BP-100).
+		model.ChannelAutoClaw:
 		return p.pickCreditLocked(modelName, candidates, now)
 	default:
 		return p.pickLRULocked(candidates)

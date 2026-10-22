@@ -26,7 +26,13 @@ const (
 	// the account a strike turns one edge rule into a dead pool (sub2api
 	// e0fa4b94f, 2026-10-21). The pool pauses the channel briefly instead.
 	ClassEdgeBlock = "edge_block"
-	ClassTransport      = "transport"       // network/5xx; short cooldown, retry then rotate
+	ClassTransport = "transport" // network/5xx; short cooldown, retry then rotate
+	// ClassTransportDead: a transport failure that will NOT heal by retrying —
+	// a dead proxy credential, an unresolvable host, a refused connection. Such
+	// a failure hits every account of the channel identically, so walking the
+	// pool on an 80s backoff loop can never succeed; the pool parks the channel
+	// for longer instead (BP-99; sub2api's persistent-transport split).
+	ClassTransportDead = "transport_dead"
 	// ClassUpstreamTimeout: the upstream accepted the connection but stalled —
 	// header watchdog, idle watchdog, or an explicit deadline. Not the
 	// account's fault: another account hits the same slow upstream, so the
@@ -137,7 +143,8 @@ func New(class string, status int, format string, args ...any) *Error {
 func Rotatable(class string) bool {
 	switch class {
 	case ClassBadRequest, ClassContentBlocked, ClassSentinel, ClassUpstreamBusy,
-		ClassUpstreamTimeout, ClassCanceled, ClassNotFound, ClassEdgeBlock:
+		ClassUpstreamTimeout, ClassCanceled, ClassNotFound, ClassEdgeBlock,
+		ClassTransportDead:
 		return false
 	default:
 		return true
