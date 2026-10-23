@@ -7,8 +7,11 @@ import (
 
 // TestParseWBAccountShapes pins both shapes the device-flow account endpoint
 // returns. The flat shape is the CN edge; the accounts-list shape is the
-// international edge (field capture 2026-10-22, uid c71ff2d7…): the flat-only
-// decoder read nothing there, so the panel polled forever.
+// international edge (field capture 2026-10-22): the flat-only decoder read
+// nothing there, so the panel polled forever.
+//
+// Identity fields are placeholders: this repository is public, and the shape
+// is the contract, not the account it was captured from.
 func TestParseWBAccountShapes(t *testing.T) {
 	flat := json.RawMessage(`{"uid":"u-flat","nickname":"国内号","enterpriseId":"ent-1"}`)
 	if got := parseWBAccount(flat); got.UID != "u-flat" || got.Nickname != "国内号" || got.EnterpriseID != "ent-1" {
@@ -17,10 +20,10 @@ func TestParseWBAccountShapes(t *testing.T) {
 
 	list := json.RawMessage(`{"accounts":[
 		{"uid":"u-old","nickname":"旧号","lastLogin":false},
-		{"uid":"c71ff2d7-9d95-41c6-a0b6-3351eeb56343","nickname":"y200901152022@gmail.com","lastLogin":true,"accountType":""}
+		{"uid":"00000000-0000-4000-8000-000000000000","nickname":"user@example.com","lastLogin":true,"accountType":""}
 	]}`)
 	got := parseWBAccount(list)
-	if got.UID != "c71ff2d7-9d95-41c6-a0b6-3351eeb56343" || got.Nickname != "y200901152022@gmail.com" {
+	if got.UID != "00000000-0000-4000-8000-000000000000" || got.Nickname != "user@example.com" {
 		t.Fatalf("list must pick the lastLogin account, got %+v", got)
 	}
 

@@ -79,8 +79,8 @@ const (
 	// this is the honest answer instead of queueing silently (2026-10-20,
 	// user requirement: "并行数量超发").
 	ClassConcurrencyExceeded = "concurrency_exceeded"
-	ClassSentinel          = "sentinel" // HTTP 200 body is a known rejection sentinel
-	ClassInternal          = "internal" // gateway bug or unclassified
+	ClassSentinel            = "sentinel" // HTTP 200 body is a known rejection sentinel
+	ClassInternal            = "internal" // gateway bug or unclassified
 )
 
 // Error is the normalized upstream failure.

@@ -28,12 +28,23 @@ func TestCooldownCarriesReasonAndBasis(t *testing.T) {
 		t.Fatalf("by = %q, want upstream (the vendor stated the reset)", a.AccountCooldownBy)
 	}
 
-	// A transport failure is a backoff, not an upstream-stated moment.
+	// A dropped connection (ClassTransport) is no longer an account rest at
+	// all — BP-101: one transient `unexpected EOF` used to give the account a
+	// 5s backoff rest, and that rest's expiry put it in the 2-minute
+	// sticky-only band, so a single dropped socket cost two minutes of "no
+	// available account". The account must stay clean AND the channel must NOT
+	// be parked: ClassTransport stays rotatable, so the attempt loop retries
+	// this same healthy account immediately, which is what actually recovers
+	// the request (field: the very next try answered 200 in 2-4s).
 	b := mkAccount("wb-b", model.ChannelWorkBuddy)
 	p.Upsert(b)
-	p.ApplyResult(b, "glm-5.3", &uperr.Error{Class: uperr.ClassTransport, Message: "dial tcp: refused"})
-	if b.AccountCooldownReason != "transport error" || b.AccountCooldownBy != "backoff" {
-		t.Fatalf("transport rest = %q/%q", b.AccountCooldownReason, b.AccountCooldownBy)
+	p.ApplyResult(b, "glm-5.3", &uperr.Error{Class: uperr.ClassTransport, Message: "unexpected EOF"})
+	if !b.AccountCooldownUntil.IsZero() || b.AccountCooldownReason != "" {
+		t.Fatalf("transport must not rest the account: until=%v reason=%q",
+			b.AccountCooldownUntil, b.AccountCooldownReason)
+	}
+	if _, paused := p.ChannelBusyUntil(model.ChannelWorkBuddy, "glm-5.3", now); paused {
+		t.Fatal("transport must not park the channel: the next attempt is the fix")
 	}
 
 	// A successful call after the rest expired clears the explanation.

@@ -58,8 +58,18 @@ func main() {
 	turns := flag.Int("turns", 5, "how many turns of conversation history to build")
 	toolTurns := flag.Bool("tools", true, "declare bash/read tools and include tool rounds in the history")
 	promptPrefix := flag.String("prefix", "", "extra system text merged BEFORE the AutoClaw line (probes the prompt gate)")
+	prefixFile := flag.String("prefix-file", "", "read the prefix from a file (a 13k prefix exceeds the Windows command line limit)")
 	sysMode := flag.String("system", "ours", "system prompt shape: ours (prefix merged) | exact (AutoClaw line only) | user (system moved into the first user turn) | none (no system message)")
+	padTokens := flag.Int("pad", 0, "pad the history to roughly this many prompt tokens (chars/2), to reproduce a long ZCode session")
 	flag.Parse()
+
+	if *prefixFile != "" {
+		b, err := os.ReadFile(*prefixFile)
+		if err != nil {
+			log.Fatalf("prefix-file: %v", err)
+		}
+		*promptPrefix = string(b)
+	}
 
 	sec := *secret
 	if sec == "" {
@@ -87,9 +97,12 @@ func main() {
 	}
 
 	for i := 0; i < *runs; i++ {
-		st, body, elapsed, err := one(context.Background(), v, sec, tok, *model, *turns, *toolTurns, *promptPrefix, *sysMode)
+		st, body, elapsed, err := one(context.Background(), v, sec, tok, *model, *turns, *toolTurns, *promptPrefix, *sysMode, *padTokens)
 		if err != nil {
-			fmt.Printf("run %d: TRANSPORT %v\n", i+1, err)
+			// Elapsed matters: a drop at a near-constant wall time is a
+			// server-side cap, not network jitter (2026-10-23: the gateway's
+			// autoclaw leg kept dying at ~30.4s).
+			fmt.Printf("run %d: TRANSPORT after %s: %v\n", i+1, elapsed.Round(time.Millisecond), err)
 			continue
 		}
 		fmt.Printf("run %d: HTTP %d  %s  %s\n", i+1, st, elapsed.Round(time.Millisecond), firstLine(body, 160))
@@ -209,8 +222,8 @@ func base(h http.Header, tok, secret, routeModel string) {
 
 // one sends one request and returns the status plus the first bytes of the
 // reply (or of the first SSE frame).
-func one(ctx context.Context, v variant, secret, tok, model string, turns int, tools bool, promptPrefix, sysMode string) (int, string, time.Duration, error) {
-	body := buildBody(model, turns, tools, promptPrefix, sysMode)
+func one(ctx context.Context, v variant, secret, tok, model string, turns int, tools bool, promptPrefix, sysMode string, padTokens int) (int, string, time.Duration, error) {
+	body := buildBody(model, turns, tools, promptPrefix, sysMode, padTokens)
 	h := http.Header{}
 	v.apply(h, body, tok, secret, model, true)
 
@@ -218,6 +231,7 @@ func one(ctx context.Context, v variant, secret, tok, model string, turns int, t
 	if err != nil {
 		return 0, "", 0, err
 	}
+	fmt.Printf("  request: %d bytes (~%dk prompt tokens by chars/2)\n", len(raw), len(raw)/2/1000)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+chatPth, bytes.NewReader(raw))
 	if err != nil {
 		return 0, "", 0, err
@@ -243,7 +257,7 @@ func one(ctx context.Context, v variant, secret, tok, model string, turns int, t
 // buildBody makes a realistic multi-turn conversation: system + alternating
 // user/assistant turns, optionally with tool call rounds, ending in a short
 // user question. This is the shape the "long conversation" A/B needs.
-func buildBody(model string, turns int, tools bool, promptPrefix, sysMode string) map[string]any {
+func buildBody(model string, turns int, tools bool, promptPrefix, sysMode string, padTokens int) map[string]any {
 	system := sysLine
 	if promptPrefix != "" {
 		system = promptPrefix + "\n\n" + sysLine
@@ -337,6 +351,9 @@ func buildBody(model string, turns int, tools bool, promptPrefix, sysMode string
 		}
 	}
 	msgs = append(msgs, map[string]any{"role": "user", "content": "用一句话总结前面的内容。"})
+	if padTokens > 0 {
+		msgs = padHistory(msgs, padTokens)
+	}
 
 	body := map[string]any{"model": model, "messages": msgs, "stream": true}
 	if tools {
@@ -356,6 +373,33 @@ func buildBody(model string, turns int, tools bool, promptPrefix, sysMode string
 		}
 	}
 	return body
+}
+
+// padHistory grows the conversation to roughly padTokens prompt tokens by
+// appending long assistant turns. A real ZCode session reaches the gateway
+// with 100k+ input tokens; the field failures were all on those, so the probe
+// has to reproduce the size, not just the shape.
+func padHistory(msgs []any, padTokens int) []any {
+	// Roughly 2 chars per token; one filler turn of ~8k chars ≈ 4k tokens.
+	const chunk = 8000
+	need := padTokens * 2
+	filler := strings.Repeat("这段文字用于模拟真实会话中的长上下文内容，不包含任何指令。", chunk/33)
+	for need > 0 {
+		n := chunk
+		if need < n {
+			n = need
+		}
+		text := filler
+		if n < len(filler) {
+			text = filler[:n]
+		}
+		msgs = append(msgs,
+			map[string]any{"role": "user", "content": "补充一段上下文。"},
+			map[string]any{"role": "assistant", "content": text},
+		)
+		need -= n
+	}
+	return msgs
 }
 
 // loadCreds reads the autoclaw account row and decrypts it.

@@ -24,15 +24,23 @@ func Test406IsBadRequest(t *testing.T) {
 	}
 }
 
-// TestSystemAsUserMovesThePrompt pins BP-99: the retry carries the caller's own
-// system text inside <instructions> in the first user turn, with a neutral
-// system line first (the gateway refuses a request whose first message is not
-// a system message).
-func TestSystemAsUserMovesThePrompt(t *testing.T) {
+// TestScrubRemovesOnlyTheRefusedClaim pins the 2026-10-23 replacement for
+// BP-99's whole-prompt move: the retry deletes ONLY the sentence that asserts a
+// refused identity, and keeps every other instruction the caller gave.
+//
+// Field matrix (scripts/acprobe2, 2 runs each): "You are Claude Code…",
+// "you are claude code.", "You are ZCode…" and "You are Codex…" all answer 406
+// in ~100ms, while "You are Claude.", "You are Cursor…", "You are Windsurf.",
+// "You are Gemini CLI…" and "Claude Code is the assistant…" (no "you are")
+// answer 200. So the trigger is a second-person claim naming a competing
+// agent, and the surgical fix is to drop just that claim.
+func TestScrubRemovesOnlyTheRefusedClaim(t *testing.T) {
+	const kept = "Tone and style: be concise and direct. Prefer dedicated tools over shell."
 	req := &ir.ChatRequest{
 		Model: "glm-5.3-flash",
 		Messages: []ir.Message{
-			{Role: ir.RoleSystem, Content: []ir.ContentPart{{Kind: "text", Text: "You are Claude Code."}}},
+			{Role: ir.RoleSystem, Content: []ir.ContentPart{{Kind: "text",
+				Text: "You are Claude Code, Anthropic's official CLI for Claude. " + kept}}},
 			{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hello"}}},
 		},
 	}
@@ -49,69 +57,64 @@ func TestSystemAsUserMovesThePrompt(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(doc.Messages) < 2 {
-		t.Fatalf("got %d messages", len(doc.Messages))
+	if len(doc.Messages) != 2 {
+		t.Fatalf("message count = %d, want 2 (a scrub must not add or drop turns)", len(doc.Messages))
 	}
 	if doc.Messages[0].Role != "system" {
-		t.Fatalf("first role = %q, want system", doc.Messages[0].Role)
+		t.Fatalf("first role = %q, want system (the gateway refuses a non-system first message)", doc.Messages[0].Role)
 	}
-	if s, _ := doc.Messages[0].Content.(string); s != instructionsLead {
-		t.Fatalf("lead = %q, want the neutral default", s)
+	sys, _ := doc.Messages[0].Content.(string)
+	if strings.Contains(strings.ToLower(sys), "claude code") {
+		t.Fatalf("the refused claim survived: %q", sys)
 	}
-	user, _ := doc.Messages[1].Content.(string)
-	if user == "" {
-		t.Fatalf("user turn content is not a string: %v", doc.Messages[1].Content)
+	if !strings.Contains(sys, kept) {
+		t.Fatalf("the caller's other instructions were lost: %q", sys)
 	}
-	// Field A/B 2026-10-23 (scripts/acprobe2, long conversations, 3 runs each):
-	// the gateway refuses the text in a system message in every shape, and
-	// accepts it as plain user prose. An <instructions> wrapper was refused too,
-	// so the text must go in unwrapped.
-	if want := "You are Claude Code.\n\nhello"; user != want {
-		t.Fatalf("user turn = %q, want %q", user, want)
-	}
-	if strings.Contains(user, "<instructions>") {
-		t.Fatalf("user turn must not be wrapped: %q", user)
+	// The user turn is untouched: the retry no longer moves prompt text there.
+	if user, _ := doc.Messages[1].Content.(string); user != "hello" {
+		t.Fatalf("user turn = %q, want the original %q", user, "hello")
 	}
 	// The caller's IR must be untouched: a later attempt (another account, the
 	// relay path) still needs the original system message.
-	if len(req.Messages) != 2 || req.Messages[0].Role != ir.RoleSystem {
+	if !strings.Contains(ir.TextOf(req.Messages[0].Content), "Claude Code") {
 		t.Fatalf("the original request was mutated: %+v", req.Messages)
 	}
 }
 
-// TestSystemAsUserKeepsLateSystemMessages pins that a system message further
-// down becomes a user message in place rather than being dropped.
-func TestSystemAsUserKeepsLateSystemMessages(t *testing.T) {
-	req := &ir.ChatRequest{
-		Model: "glm-5.3-flash",
-		Messages: []ir.Message{
-			{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}},
-			{Role: ir.RoleSystem, Content: []ir.ContentPart{{Kind: "text", Text: "later rule"}}},
-		},
-	}
-	raw, err := buildBodySystemAsUser(driver.ChatCall{UpstreamModel: "m", Request: req})
-	if err != nil {
-		t.Fatalf("build: %v", err)
-	}
-	var doc struct {
-		Messages []struct {
-			Role    string `json:"role"`
-			Content any    `json:"content"`
-		} `json:"messages"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	found := false
-	for _, m := range doc.Messages {
-		if m.Role == "user" {
-			if s, _ := m.Content.(string); s == "later rule" {
-				found = true
-			}
+// TestScrubLeavesAllowedIdentitiesAlone: a system prompt naming a product the
+// gateway accepts must be sent verbatim — scrubbing it would silently change
+// the agent's behaviour for no reason.
+func TestScrubLeavesAllowedIdentitiesAlone(t *testing.T) {
+	for _, text := range []string{
+		"You are Claude.",
+		"You are Cursor, an AI code editor.",
+		"You are Windsurf.",
+		"You are Gemini CLI, Google's coding agent.",
+		"You are an AI assistant helping with software engineering.",
+		"Claude Code is the assistant in this session.",
+	} {
+		if got := scrubRefusedIdentity(text); got != text {
+			t.Errorf("scrubbed an accepted prompt: %q → %q", text, got)
 		}
 	}
-	if !found {
-		t.Fatalf("the late system message was dropped: %+v", doc.Messages)
+}
+
+// TestScrubHandlesTheFieldShapes: the three refused products, any casing, and
+// a claim buried mid-prompt (the field failure had ~13k tokens of instructions
+// around it).
+func TestScrubHandlesTheFieldShapes(t *testing.T) {
+	cases := map[string]string{
+		"You are Claude Code.":                                              "",
+		"you are claude code.":                                              "",
+		"You are ZCode, a coding agent.":                                    "",
+		"You are Codex, OpenAI's coding agent.":                             "",
+		"You are Claude Code an interactive CLI tool.":                      "",
+		"Preamble line. You are Claude Code, a CLI tool. Tail instruction.": "Preamble line. Tail instruction.",
+	}
+	for in, want := range cases {
+		if got := scrubRefusedIdentity(in); got != want {
+			t.Errorf("scrub(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

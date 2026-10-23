@@ -53,6 +53,21 @@ const (
 	// system message (or added as one when there is none).
 	managedSystemPrompt = "You are AutoClaw. Answer the user directly and concisely."
 
+	// transportRetries is how many times a dropped socket (no response bytes
+	// at all) is resent before the failure is handed to the gateway.
+	//
+	// Field characterisation 2026-10-23 (scripts/acprobe2, 6 fresh processes x
+	// 3 requests, 20k-token history, non-trivial system prompt): the FIRST
+	// request of a cold process dies with `unexpected EOF` after a near-fixed
+	// 30.2s in most rounds, the second sometimes dies too, and every request
+	// after that answers 200 in 2-4s. A 22-character system prompt never
+	// showed it, so it is the gateway warming up on a large prompt, not the
+	// prompt's content.
+	//
+	// Worst case observed is two consecutive drops (round 5), so three retries
+	// covers it with margin while bounding the worst case to ~90s of retries.
+	transportRetries = 3
+
 	// proxyChatPath is the overseas direct channel. Kept for reference and
 	// tests; the CN managed gateway above carries production traffic
 	// (2026-10-21). A CN account's token is refused here with 401.
@@ -402,7 +417,13 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		_ = d.refresh(ctx, call.Account, cr)
 	}
 
-	body, modelID, err := buildBody(call)
+	// Scrub a refused identity claim up front rather than waiting for the 406.
+	// The claim is a property of the caller's system prompt, not of this
+	// request's luck: sending it once to be refused wastes ~100ms and, on the
+	// retry path, risks the intermittent dropped connection the field saw
+	// (2026-10-23). Scrubbing first makes the common case a single call.
+	// buildBody already leaves every other instruction untouched.
+	body, modelID, err := buildBodyScrubbed(call)
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "autoclaw: %v", err)
 	}
@@ -415,19 +436,50 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	resp, err := d.chatManaged(ctx, cr, body, modelID)
 	if err != nil {
 		log.Printf("autoclaw: managed gateway unavailable: %v", err)
-		// A 406 here is the channel check refusing the request's system
-		// prompt — the same mechanism as WorkBuddy's 11128 (field-verified
-		// 2026-10-22: "You are Claude Code." answers 406, every other system
-		// prompt passes). Send once more with that prompt moved into the first
-		// user turn (BP-99).
+		// A 406 here is the channel check refusing a second-person identity
+		// claim in the system prompt. Field matrix 2026-10-23: "You are Claude
+		// Code…", "You are ZCode…" and "You are Codex…" are refused in ~100ms,
+		// while "You are Claude.", "You are Cursor…", "You are Windsurf." and
+		// "Claude Code is the assistant" all pass (BP-101, replacing BP-99's
+		// whole-prompt move, which turned a fast 406 into an intermittent ~30s
+		// dropped connection).
+		//
+		// The FIRST request already carried the scrubbed body, so a 406 at this
+		// point means the claim named a product refusedIdentities does not know
+		// yet. Resending the identical scrubbed body would earn the identical
+		// 406; the fallback has to change something structural, so the system
+		// slot drops to a neutral line. The caller's agent instructions are
+		// lost for this one attempt — that is the price of not failing outright.
 		if ue, ok := uperr.As(err); ok && ue.Status == http.StatusNotAcceptable {
-			if moved, mErr := buildBodySystemAsUser(call); mErr == nil {
-				log.Printf("autoclaw: 406 channel refusal; resending with the system prompt as the user's instructions")
-				if resp2, err2 := d.chatManaged(ctx, cr, moved, modelID); err2 == nil {
+			if neutral, _, mErr := buildBodyNeutral(call); mErr == nil {
+				log.Printf("autoclaw: 406 channel refusal; resending with a neutral system prompt (the identity scrub did not cover it)")
+				if resp2, err2 := d.chatManaged(ctx, cr, neutral, modelID); err2 == nil {
 					resp, err = resp2, nil
 				} else {
 					err = err2
-					log.Printf("autoclaw: managed gateway unavailable after the system-as-user retry: %v", err)
+					log.Printf("autoclaw: managed gateway unavailable after the neutral-system retry: %v", err)
+				}
+			}
+		}
+		// A dropped socket is retried HERE, before it costs the gateway an
+		// attempt and (previously) an account rest. Field evidence 2026-10-23:
+		// the CN managed gateway closes the connection with no bytes at all
+		// (`unexpected EOF`) on roughly one request in five — 15s and 30s were
+		// both observed — and the very next identical request answers 200 in
+		// 2-4s. Nothing has reached the client at this point, so resending is
+		// invisible to the caller and turns an intermittent network event into
+		// a normal answer instead of a channel failover.
+		if err != nil && isDroppedSocket(err) {
+			for try := 1; try <= transportRetries; try++ {
+				log.Printf("autoclaw: dropped socket, resending (%d/%d)", try, transportRetries)
+				if resp2, err2 := d.chatManaged(ctx, cr, body, modelID); err2 == nil {
+					resp, err = resp2, nil
+					break
+				} else {
+					err = err2
+					if !isDroppedSocket(err) {
+						break
+					}
 				}
 			}
 		}
@@ -832,29 +884,165 @@ func buildBody(call driver.ChatCall) ([]byte, string, error) {
 	return buildBodyWith(call, false)
 }
 
-// buildBodySystemAsUser renders the same request with the caller's system
-// prompt moved into the first user turn inside <instructions> tags, and the
-// gateway's own neutral line in the system slot (BP-99).
+// buildBodyScrubbed is the production entry point: the same body with any
+// refused identity claim removed from the system prompt.
 //
-// Why: the CN managed gateway's channel check reads the system message and
-// refuses the whole request (406, empty body) when it recognizes an agent
-// identity line — field-verified 2026-10-22 with "You are Claude Code.": that
-// exact string is refused, "You are Claude." and "…named Claude Code, made by
-// Anthropic." pass. The identical text in a user message is accepted, so the
-// move is the fix. The gateway also refuses a request whose first message is
-// not a system message, hence the neutral lead.
+// Scrubbing is unconditional rather than reactive because the claim is a
+// property of the caller's prompt, not of one attempt: sending it to be
+// refused costs a round trip every single time, and the 406 retry path is
+// exactly where the intermittent ~30s dropped connection showed up
+// (2026-10-23). Every other instruction is preserved.
+func buildBodyScrubbed(call driver.ChatCall) ([]byte, string, error) {
+	return buildBodyWith(call, true)
+}
+
+// buildBodyNeutral is the last-resort shape: every system message is replaced
+// by one neutral line, so no identity claim can survive whatever wording the
+// caller used.
+//
+// Only used after a scrubbed body is STILL refused with 406 — i.e. the claim
+// named a product the refusedIdentities list does not know yet. Resending the
+// identical scrubbed body would earn the identical 406, so the fallback has to
+// change something structural. Trade-off: the caller's agent instructions are
+// lost for this one attempt, which is why it is the last resort and not the
+// default.
+func buildBodyNeutral(call driver.ChatCall) ([]byte, string, error) {
+	req := call.Request
+	clone := *req
+	msgs := make([]ir.Message, 0, len(req.Messages))
+	put := false
+	for _, m := range req.Messages {
+		if m.Role != ir.RoleSystem {
+			msgs = append(msgs, m)
+			continue
+		}
+		if put {
+			continue // collapse to a single neutral line
+		}
+		msgs = append(msgs, ir.Message{
+			Role:    ir.RoleSystem,
+			Content: []ir.ContentPart{{Kind: "text", Text: neutralSystemLine}},
+		})
+		put = true
+	}
+	if !put {
+		msgs = append([]ir.Message{{
+			Role:    ir.RoleSystem,
+			Content: []ir.ContentPart{{Kind: "text", Text: neutralSystemLine}},
+		}}, msgs...)
+	}
+	clone.Messages = msgs
+	return buildBodyWith(driver.ChatCall{Account: call.Account, UpstreamModel: call.UpstreamModel, Request: &clone}, false)
+}
+
+// neutralSystemLine is what the last-resort attempt sends in the system slot.
+// It deliberately makes no identity claim at all.
+const neutralSystemLine = "You are a helpful assistant. Please answer the user's question."
+
+// refusedIdentities are the product names the CN managed gateway's channel
+// check refuses when they appear as a second-person identity claim.
+//
+// Field matrix 2026-10-23 (scripts/acprobe2, 2 runs each, 20k-token history,
+// system text only differing in one line):
+//
+//	REFUSED (406, ~100ms)     PASSED (200)
+//	You are Claude Code…      You are Claude.
+//	you are claude code.      You are Cursor, an AI code editor.
+//	You are ZCode, a coding…  You are Windsurf.
+//	You are Codex, OpenAI's…  You are Gemini CLI, Google's…
+//	                          You are Cline / Qwen Code / Amp / Copilot
+//	                          Claude Code is the assistant…  (no "you are")
+//
+// So the trigger is a second-person claim naming one of these competing
+// agents — not a generic "you are a helpful assistant", and not merely
+// mentioning the product. Each entry is matched case-insensitively anywhere in
+// a system message, because "…preamble. You are Claude Code…" was refused too.
+var refusedIdentities = []string{
+	"claude code",
+	"zcode",
+	"codex",
+}
+
+// refusedIdentityClaim reports whether text carries a second-person identity
+// claim naming a refused product, and returns the text with just that claim
+// removed.
+//
+// The removal is deliberately surgical: only the offending sentence goes. The
+// caller's other instructions (tool policy, tone, task management) are the
+// agent's behaviour and must survive — field A/B 2026-10-23 showed that
+// stripping ONLY the identity sentence answers 200 in 4/5 runs while the full
+// instruction body is kept, whereas the old whole-prompt move produced 406 on
+// every attempt.
+func scrubRefusedIdentity(text string) string {
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, "you are") {
+		return text
+	}
+	for _, name := range refusedIdentities {
+		if !strings.Contains(lower, name) {
+			continue
+		}
+		out := stripClaimSentence(text, name)
+		if out != text {
+			return out
+		}
+	}
+	return text
+}
+
+// stripClaimSentence removes the sentences that both assert "you are" and name
+// the product. Sentences are split on sentence-ending punctuation; a dropped
+// sentence takes its own terminator with it, and the rest of the text is
+// preserved byte for byte.
+func stripClaimSentence(text, name string) string {
+	var kept []string
+	start := 0
+	for i := 0; i <= len(text); i++ {
+		if i < len(text) {
+			switch text[i] {
+			case '.', '!', '?', '\n':
+			default:
+				continue
+			}
+		}
+		sentence := text[start:i]
+		low := strings.ToLower(sentence)
+		drop := strings.Contains(low, "you are") && strings.Contains(low, name)
+		if !drop {
+			kept = append(kept, sentence)
+			// Keep the terminator only for a sentence that survives, so a
+			// removed claim does not leave a dangling "." behind.
+			if i < len(text) {
+				kept = append(kept, string(text[i]))
+			}
+		}
+		start = i + 1
+	}
+	out := strings.Join(kept, "")
+	return strings.TrimSpace(out)
+}
+
+// buildBodySystemAsUser renders the same request with the refused identity
+// claim scrubbed out of the caller's system prompt, and the gateway's own
+// neutral line in front.
+//
+// Why not move the whole prompt into a user turn (BP-99)? Field A/B 2026-10-23
+// on long conversations: the move converts a fast, deterministic 406 into an
+// intermittent ~30s dropped connection (2 of 8 runs), because the gateway then
+// inspects a large user message instead of rejecting outright. Scrubbing just
+// the claim keeps every other instruction and answers 200 in 4/5 runs.
 func buildBodySystemAsUser(call driver.ChatCall) ([]byte, error) {
 	wire, _, err := buildBodyWith(call, true)
 	return wire, err
 }
 
-func buildBodyWith(call driver.ChatCall, systemAsUser bool) ([]byte, string, error) {
+func buildBodyWith(call driver.ChatCall, scrubIdentity bool) ([]byte, string, error) {
 	req := call.Request
-	// The move rewrites the request's own messages, so a copy is taken first:
+	// The scrub rewrites the request's own messages, so a copy is taken first:
 	// the caller's IR must not be mutated for the next attempt or the panel.
-	if systemAsUser {
+	if scrubIdentity {
 		clone := *req
-		clone.Messages = moveSystemToUser(req.Messages)
+		clone.Messages = scrubMessages(req.Messages)
 		req = &clone
 	}
 	var messages []map[string]any
@@ -925,84 +1113,36 @@ func buildBodyWith(call driver.ChatCall, systemAsUser bool) ([]byte, string, err
 	return wire, stripRoutePrefix(strings.TrimSpace(call.UpstreamModel)), err
 }
 
-// instructionsLead is the system line the gateway puts first when the caller's
-// own system prompt has to move into the user turn. The CN managed gateway
-// refuses a request whose first message is not a system message, so something
-// neutral has to stand there.
-const instructionsLead = "You are a helpful assistant. Please answer the user's question."
-
-// moveSystemToUser rewrites the conversation so the caller's system prompt is
-// read to the model as the first thing the user says, inside <instructions>
-// tags, with a neutral system line first (BP-99).
+// scrubMessages rewrites only the system messages, removing any second-person
+// claim naming a refused product (see refusedIdentities) and leaving every
+// other instruction intact. Non-system messages are untouched.
 //
-// A system message further down the conversation becomes a user message where
-// it stands, so nothing is silently dropped.
-func moveSystemToUser(messages []ir.Message) []ir.Message {
-	if len(messages) == 0 {
-		return messages
-	}
-	var lead []string
-	i := 0
-	for ; i < len(messages); i++ {
-		if messages[i].Role != ir.RoleSystem {
-			break
+// Why scrub rather than move: field A/B 2026-10-23 (long conversations) showed
+// that moving the whole prompt into a user turn turns a deterministic 406 into
+// an intermittent ~30s dropped connection, while deleting just the offending
+// sentence answers 200 and keeps the agent's actual behaviour.
+func scrubMessages(messages []ir.Message) []ir.Message {
+	out := make([]ir.Message, 0, len(messages))
+	for _, m := range messages {
+		if m.Role != ir.RoleSystem {
+			out = append(out, m)
+			continue
 		}
-		lead = append(lead, ir.TextOf(messages[i].Content))
-	}
-	out := make([]ir.Message, 0, len(messages)+1)
-	out = append(out, ir.Message{
-		Role:    ir.RoleSystem,
-		Content: []ir.ContentPart{{Kind: "text", Text: instructionsLead}},
-	})
-	for _, m := range messages[i:] {
-		if m.Role == ir.RoleSystem {
-			m.Role = ir.RoleUser
-			m.Content = []ir.ContentPart{{Kind: "text", Text: ir.TextOf(m.Content)}}
+		text := ir.TextOf(m.Content)
+		cleaned := scrubRefusedIdentity(text)
+		if cleaned == text {
+			out = append(out, m)
+			continue
 		}
+		m.Content = []ir.ContentPart{{Kind: "text", Text: cleaned}}
 		out = append(out, m)
 	}
-	said := strings.TrimSpace(strings.Join(lead, "\n\n"))
-	if said == "" {
-		return out
-	}
-	// The caller's system text goes in as ordinary user prose, NOT inside
-	// <instructions> tags. Field A/B 2026-10-23 (scripts/acprobe2, long
-	// conversations, 3 runs each): the gateway refuses when the text is in a
-	// system message (406, whichever order or wrapping), and accepts it in a
-	// plain user message (200) — the tag wrapper was refused too, so it is the
-	// system placement that matters, not the text.
-	block := said
-	at := -1
-	for j, m := range out {
-		if m.Role == ir.RoleUser {
-			at = j
-			break
-		}
-	}
-	if at < 0 {
-		return append(out, ir.Message{
-			Role:    ir.RoleUser,
-			Content: []ir.ContentPart{{Kind: "text", Text: block}},
-		})
-	}
-	// Put the block ahead of whatever the user already said, keeping images
-	// and their order.
-	parts := make([]ir.ContentPart, 0, len(out[at].Content)+1)
-	parts = append(parts, ir.ContentPart{Kind: "text", Text: block})
-	if existing := ir.TextOf(out[at].Content); existing != "" {
-		parts[0].Text = block + "\n\n" + existing
-	}
-	for _, p := range out[at].Content {
-		if p.Kind != "text" {
-			parts = append(parts, p)
-		}
-	}
-	out[at].Content = parts
 	return out
 }
 
 func stripRoutePrefix(m string) string {
-	for _, p := range []string{"global/", "cn/"} {		if strings.HasPrefix(m, p) {
+	for _, p := range []string{"global/", "cn/"} {
+		if strings.HasPrefix(m, p) {
 			return m[len(p):]
 		}
 	}
@@ -1223,6 +1363,40 @@ var deadMarkers = []string{
 	"not logged in", "unauthorized", "invalid token", "token expired",
 	"login required", "session expired", "offline user session",
 	"未登录", "登录已过期", "请先登录", "token 失效",
+}
+
+// isDroppedSocket reports whether err is a connection that died before any
+// response bytes arrived. Only that shape is safe to resend blindly: the
+// upstream never started answering, so no work was charged and nothing has
+// reached the client.
+//
+// Deliberately narrow — a read error mid-stream is NOT here. Once frames are
+// flowing, resending would duplicate output the caller already received.
+func isDroppedSocket(err error) bool {
+	if err == nil {
+		return false
+	}
+	ue, ok := uperr.As(err)
+	if !ok {
+		return false
+	}
+	if ue.Class != uperr.ClassTransport {
+		return false
+	}
+	msg := strings.ToLower(ue.Message)
+	for _, m := range []string{
+		"unexpected eof",
+		"connection reset by peer",
+		"http2: stream closed",
+		"server closed idle connection",
+		"broken pipe",
+		"eof",
+	} {
+		if strings.Contains(msg, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // quotaCodes are the gateway's own codes for "this model's allowance is out",

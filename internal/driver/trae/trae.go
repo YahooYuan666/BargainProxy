@@ -188,7 +188,7 @@ func ugDeviceID(deviceID, uid string) string {
 // Stream implements driver.Driver: OpenAI chat body -> SOLO body, forced
 // stream, upstream SSE parsed into IR events.
 func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	creds, err := ParseCreds(call.Account.CredsJSON)
+	creds, err := ParseCreds(call.Account.Credentials())
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -226,7 +226,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		log.Printf("trae: chat auth rejected (acct=%s), forcing token refresh and retrying once", call.Account.ID)
 		if rerr := d.refreshToken(ctx, call.Account, true); rerr == nil {
 			log.Printf("trae: token refresh ok (acct=%s), retrying chat", call.Account.ID)
-			if nc, perr := ParseCreds(call.Account.CredsJSON); perr == nil {
+			if nc, perr := ParseCreds(call.Account.Credentials()); perr == nil {
 				body, berr := buildSOLOBody(call, lastFn)
 				if berr != nil {
 					return nil, err
@@ -1028,7 +1028,7 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 
 // Checkin performs the daily checkin (idempotent upstream-side).
 func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn bool, credits int64, enable bool, err error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return false, 0, false, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -1216,7 +1216,7 @@ func retryableCheckinErr(err error) bool {
 
 // Probe implements driver.Prober: fetch credit balance.
 func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeResult, error) {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
@@ -1428,7 +1428,7 @@ func backfillTraeDevice(acc *model.Account) error {
 	if acc == nil {
 		return nil
 	}
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return nil // let the caller's own parse report the real problem
 	}
@@ -1441,7 +1441,7 @@ func backfillTraeDevice(acc *model.Account) error {
 	if err != nil {
 		return nil
 	}
-	acc.CredsJSON = raw
+	acc.SetCredentials(raw)
 	acc.CredsDirty = true
 	log.Printf("trae: backfilled device identity for account %s (BP-98 TRAE-2)", acc.ID)
 	return nil
@@ -1454,7 +1454,7 @@ func backfillTraeDevice(acc *model.Account) error {
 // refresh token is one-time, and racing it turned the loser's 20101 into a
 // disabled account.
 func (d *Driver) refreshToken(ctx context.Context, acc *model.Account, force bool) error {
-	creds, err := ParseCreds(acc.CredsJSON)
+	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return err
 	}
@@ -1477,7 +1477,7 @@ func (d *Driver) refreshToken(ctx context.Context, acc *model.Account, force boo
 			}
 			select {
 			case <-done:
-				nc, perr := ParseCreds(acc.CredsJSON)
+				nc, perr := ParseCreds(acc.Credentials())
 				if perr == nil && !force && (nc.ExpiresAt == 0 || time.Until(time.Unix(nc.ExpiresAt, 0)) <= traeRefreshSkew) {
 					// Still stale after the winner's exchange (it may have
 					// failed): fall through and retry the gate once more.
@@ -1553,8 +1553,7 @@ func (d *Driver) refreshToken(ctx context.Context, acc *model.Account, force boo
 	if err != nil {
 		return err
 	}
-	acc.CredsJSON = rawCreds
-	acc.CredsDirty = true // persisted by the refresh task / gateway after success
+	acc.SetCredentials(rawCreds) // persisted by the refresh task / gateway after success
 	return nil
 }
 

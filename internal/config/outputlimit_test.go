@@ -7,12 +7,12 @@ import "testing"
 // upstreams and a silent truncation from others; the silent case is worse
 // because the client cannot tell the gateway caused it (BP-99).
 func TestClampOutputCapsAboveCeiling(t *testing.T) {
-	got, changed := ClampOutput(100000, "deepseek-v4.1-flash", "")
+	got, changed := ClampOutput(900000, "deepseek-v4.1-flash", "")
 	if !changed {
-		t.Fatal("100000 on a 32000-ceiling model must be clamped")
+		t.Fatal("900000 on a 393216-ceiling model must be clamped")
 	}
-	if got != 32000 {
-		t.Fatalf("got %d, want 32000", got)
+	if got != 393216 {
+		t.Fatalf("got %d, want 393216", got)
 	}
 }
 
@@ -22,7 +22,7 @@ func TestClampOutputLeavesLegalValues(t *testing.T) {
 	if got, changed := ClampOutput(4096, "deepseek-v4.1-flash", ""); changed || got != 4096 {
 		t.Fatalf("got %d changed=%v, want 4096/false", got, changed)
 	}
-	if got, changed := ClampOutput(32000, "deepseek-v4.1-flash", ""); changed || got != 32000 {
+	if got, changed := ClampOutput(393216, "deepseek-v4.1-flash", ""); changed || got != 393216 {
 		t.Fatalf("exact ceiling must not change: got %d changed=%v", got, changed)
 	}
 }
@@ -47,8 +47,8 @@ func TestClampOutputUnsetUntouched(t *testing.T) {
 func TestClampOutputFallsBackToCanonical(t *testing.T) {
 	// "deepseek-flash" (upstream) and "deepseek-v4.1-flash" (canonical) are both
 	// in the table, so use an upstream id that is NOT, and rely on canonical.
-	got, changed := ClampOutput(99999, "some-upstream-alias", "glm-5.3")
-	if !changed || got != 32000 {
+	got, changed := ClampOutput(999999, "some-upstream-alias", "glm-5.3")
+	if !changed || got != 131072 {
 		t.Fatalf("canonical fallback failed: got %d changed=%v", got, changed)
 	}
 }
@@ -84,8 +84,52 @@ func TestFloorFromMessageVariants(t *testing.T) {
 // ceiling to something absurd.
 func TestOutputLimitTableSane(t *testing.T) {
 	for name, limit := range outputLimits {
-		if limit < 1024 || limit > 200000 {
+		// Upper bound covers the largest verified ceiling (kimi-k3 1048576).
+		if limit < 1024 || limit > 1048576 {
 			t.Errorf("implausible ceiling for %q: %d", name, limit)
+		}
+	}
+}
+
+// TestOutputLimitsMatchTheTierPage pins the review's P3 requirement: the
+// clamp table and the tier page must not disagree, because a mismatch means
+// either the gateway silently cuts a legal budget or the page advertises a
+// ceiling the gateway will never allow.
+//
+// Only models present in BOTH places are compared; the tier page carries
+// per-source rows (trae/zcode/qoder/autoclaw) while the clamp table is keyed
+// by canonical model name, so the comparison is on the canonical id.
+func TestOutputLimitsMatchTheTierPage(t *testing.T) {
+	// Values the panel advertises, kept here as the contract (the panel package
+	// imports config, not the other way round).
+	tierPage := map[string]int{
+		"glm-5.3":             131072,
+		"glm-5.3-flash":       131072,
+		"glm-5.3-flashx":      131072,
+		"glm-5.2":             131072,
+		"deepseek-v4-pro":     393216,
+		"deepseek-v4-flash":   393216,
+		"deepseek-v4.1-flash": 393216,
+		"kimi-k3":             1048576,
+		"kimi-k2.7":           262144,
+		"kimi-k2.6":           262144,
+		"minimax-m3":          512000,
+		"qwen3.8-max":         131072,
+		"qwen3.8-flash":       131072,
+	}
+	for id, advertised := range tierPage {
+		got, ok := OutputLimit(id)
+		if !ok {
+			t.Errorf("%s is advertised on the tier page but has no clamp entry", id)
+			continue
+		}
+		// The clamp value must not be LOWER than what the page advertises:
+		// lower means we silently cut a budget the page promised. Higher is
+		// acceptable only when the clamp follows the vendor entry and the page
+		// is the conservative one — but a gap either way is worth failing on
+		// so the two lists are forced to be reviewed together.
+		if got != advertised {
+			t.Errorf("%s: clamp=%d, tier page=%d — the two must agree (review P3)", id, got, advertised)
 		}
 	}
 }

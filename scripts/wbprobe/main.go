@@ -31,6 +31,7 @@ func main() {
 	modelName := flag.String("model", "deepseek-v4.1-flash", "workbuddy upstream model id")
 	prompt := flag.String("prompt", "ping", "user prompt")
 	maxTok := flag.Int("max-tokens", 16, "max output tokens")
+	timeout := flag.Duration("timeout", 90*time.Second, "overall deadline; raise it to measure long generations")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -45,7 +46,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("cryptox: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 	st, err := store.OpenPostgres(ctx, cfg.Database, box)
 	if err != nil {

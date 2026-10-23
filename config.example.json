@@ -50,6 +50,18 @@
       "base_url": "",
       "api_key": "",
       "models": []
+    },
+    "opencodezen": {
+      "enabled": true,
+      "base_url": "https://opencode.ai/zen"
+    },
+    "lobster": {
+      "enabled": true,
+      "max_in_flight": 2,
+      "server_base": "https://lobsterai-server.youdao.com",
+      "portal_base": "https://lobsterai.youdao.com",
+      "client_version": "2026.9.23",
+      "client_capabilities": "kimi-k3-agentic-v1,thinking-level-control-v1"
     }
   },
   "models": [

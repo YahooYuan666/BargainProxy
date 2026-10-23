@@ -993,8 +993,23 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 	case uperr.ClassWAF:
 		p.restAccount(a, now.Add(60*time.Second), "edge blocked", "fixed", now)
 	case uperr.ClassTransport:
-		a.ConsecutiveFails++
-		p.restAccount(a, now.Add(backoffTransport(a.ConsecutiveFails)), "transport error", "backoff", now)
+		// A dropped connection (unexpected EOF / connection reset) is the
+		// egress path or the vendor's own edge closing the socket — not a
+		// property of the account. Field evidence 2026-10-23 on AutoClaw's CN
+		// managed gateway: the same 100k-token request answered 200 in 2-4s on
+		// 16 consecutive tries, yet 2 of the first 8 died with `unexpected
+		// EOF` after ~30s. Charging the account a strike there produced a 5s
+		// rest, and the expiry of that rest put the account into the 2-minute
+		// sticky-only band (StickyGrace) — so ONE transient EOF cost TWO
+		// MINUTES of "no available account on channel autoclaw" for every new
+		// conversation, which is what made a healthy pool look dead.
+		//
+		// No account penalty: ClassTransport stays rotatable, so the attempt
+		// loop immediately re-enters Acquire and retries the same (still
+		// healthy) account, which is exactly the right answer for a dropped
+		// socket. A genuinely unfixable egress failure is ClassTransportDead,
+		// handled separately below.
+		return
 	case uperr.ClassTransportDead:
 		// A transport failure that retrying cannot fix (dead proxy credential,
 		// unresolvable host, refused connection). Every account of the channel
@@ -1421,18 +1436,6 @@ func (p *Pool) softRateBase(breakerFails int) time.Duration {
 	}
 	if d > time.Hour {
 		d = time.Hour
-	}
-	return d
-}
-
-// backoffTransport is the transport-failure backoff: 5s,10s,20s… capped 80s.
-func backoffTransport(fails int) time.Duration {
-	d := 5 * time.Second
-	for i := 1; i < fails && d < 80*time.Second; i++ {
-		d *= 2
-	}
-	if d > 80*time.Second {
-		d = 80 * time.Second
 	}
 	return d
 }

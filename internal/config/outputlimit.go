@@ -28,43 +28,71 @@ import (
 )
 
 // outputLimits maps a canonical or upstream model id to its maximum output
-// tokens. Values follow the vendor's published limits / models.dev entries.
+// tokens.
+//
+// SOURCE OF TRUTH: the vendor's published ceiling as registered on models.dev,
+// taken from the official provider entry (zai/zhipuai for GLM, deepseek for
+// DeepSeek, moonshotai for Kimi, alibaba for Qwen). Verified 2026-10-23 against
+// models.dev api.json (5.87 MB) AND against the upstream itself, because a
+// catalogue number and the wall the upstream enforces are two different facts:
+//
+//   - Parameter acceptance (scripts/wbprobe, direct to workbuddy):
+//     glm-5.3 accepted max_tokens=131072 / 200000 / 500000, all 200;
+//     deepseek-v4.1-flash accepted 393216 / 50000 / 32000, all 200.
+//   - Real long generation (scripts/wbprobe -timeout, so the probe's own 90s
+//     deadline does not cut it): glm-5.3 produced 18743 output tokens under
+//     max_tokens=60000 and ended stop=stop; the request log holds a
+//     39050-token deepseek-v4.1-flash answer from 2026-10-16.
+//
+// The previous table said 32000 for nearly everything. That number was not the
+// upstream's wall — it was silently cutting legal output budgets (review
+// finding P3, 2026-10-23: the live log was rewriting 131072 -> 32000 on
+// requests the model could serve).
+//
+// Discipline unchanged: a value is listed only when the ceiling is known. An
+// unlisted model is left untouched rather than given an invented limit
+// (不拉满伪装).
 var outputLimits = map[string]int{
-	// DeepSeek: 8k default, 32k ceiling on the V4 family (the 32000 wall this
-	// gateway has hit in the field is exactly this).
-	"deepseek-v4-pro":     32000,
-	"deepseek-v4-flash":   32000,
-	"deepseek-v4.1-flash": 32000,
-	"deepseek-flash":      32000,
+	// DeepSeek V4 family. models.dev official `deepseek` entries give 393216
+	// for v4-pro and v4-flash; v4.1-flash has no `deepseek` entry but the
+	// high-fidelity resellers (cortecs/requesty/neuralwatt) all register
+	// 393216 too, so the family shares one ceiling.
+	"deepseek-v4-pro":     393216,
+	"deepseek-v4-flash":   393216,
+	"deepseek-v4.1-flash": 393216,
+	"deepseek-flash":      393216,
 
-	// GLM.
-	"glm-5.3":        32000,
-	"glm-5.3-flash":  32000,
-	"glm-5.3-flashx": 32000,
-	"glm-5.2":        32000,
-	"glm-5.1":        32000,
+	// GLM-5.3 family: 131072 across every official entry (zai, zhipuai,
+	// zai-coding-plan, zhipuai-coding-plan, alibaba-cn, ...).
+	"glm-5.3":        131072,
+	"glm-5.3-flash":  131072,
+	"glm-5.3-flashx": 131072,
+	"glm-5.2":        131072,
+	"glm-5.1":        131072,
 
-	// Kimi.
-	"kimi-k3":   32000,
-	"kimi-k2.7": 32000,
-	"kimi-k2.6": 32000,
-	"kimi-k2.5": 32000,
+	// Kimi K3: moonshotai / moonshotai-cn register 1048576; the many resellers
+	// cap at 131072. Use the vendor's own figure.
+	"kimi-k3":   1048576,
+	"kimi-k2.7": 262144,
+	"kimi-k2.6": 262144,
+	"kimi-k2.5": 262144,
 
-	// Qwen.
-	"qwen3.8-max":   32000,
-	"qwen3.8-flash": 32000,
-	"qwen3.5-plus":  32000,
-	"qwen3.6-plus":  32000,
-	"qwen3.7-max":   32000,
-	"qwen3.7-plus":  32000,
+	// Qwen 3.8: 131072 on alibaba / alibaba-cn (the vendor entries).
+	"qwen3.8-max":   131072,
+	"qwen3.8-flash": 131072,
+	"qwen3.5-plus":  131072,
+	"qwen3.6-plus":  131072,
+	"qwen3.7-max":   131072,
+	"qwen3.7-plus":  131072,
 
-	// Doubao.
-	"doubao-seed-2-1-pro":   32000,
-	"doubao-seed-2-1-turbo": 32000,
+	// Doubao: the tier page records 128000 for the turbo entry.
+	"doubao-seed-2-1-pro":   128000,
+	"doubao-seed-2-1-turbo": 128000,
 
-	// MiniMax.
-	"minimax-m3":   32000,
-	"minimax-m2.7": 32000,
+	// MiniMax M3: 512000 on the vendor-aligned entries (aihubmix, boundless,
+	// kenari, llmgateway, volcengine-coding-plan).
+	"minimax-m3":   512000,
+	"minimax-m2.7": 512000,
 
 	// Google: Gemini's output ceiling is much higher than the CN models.
 	"gemini-3.8-flash":         65536,

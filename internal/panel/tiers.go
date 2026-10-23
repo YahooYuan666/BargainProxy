@@ -80,7 +80,7 @@ func domesticCatalog() []tierRow {
 		{Source: "workbuddy", ID: "deepseek-v4-pro", Billing: "x0.51（夜间折扣）", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "关闭 + high/max", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "deepseek-v4-flash", Billing: "x0.11 · 已被 4.1 淘汰", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + high", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "deepseek-v4.1-flash", Billing: "x0.11（夜间折扣）", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
-		{Source: "workbuddy", ID: "kimi-k3", Billing: "x1.62", ContextLen: 1048576, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+		{Source: "workbuddy", ID: "kimi-k3", Billing: "x1.62", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "kimi-k2.7", Billing: "x0.25（倍率待复核）", ContextLen: 262144, MaxOutput: 262144, InputModes: m("text", "image", "video"), Reasoning: "关闭（Moonshot 官方仅 toggle）", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "kimi-k2.6", Billing: "x0.20（倍率待复核）", ContextLen: 262144, MaxOutput: 262144, InputModes: m("text", "image", "video"), Reasoning: "关闭（Moonshot 官方仅 toggle）", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "minimax-m3", Billing: "x0.15（倍率待复核）", ContextLen: 1048576, MaxOutput: 512000, InputModes: m("text", "image", "video"), Reasoning: "关闭（MiniMax 官方仅 toggle）", ToolCall: true, Structured: true},
@@ -99,7 +99,7 @@ func domesticCatalog() []tierRow {
 		{Source: "trae", ID: "deepseek-v4-flash", Billing: "忙时 x0.20 / 空闲 x0.10（5 折）", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + high", ToolCall: true, Structured: true},
 		{Source: "trae", ID: "deepseek-v4.1-flash", Billing: "免费忙时 x0.12 / 空闲 x0.06；付费会员全时段 x0.06", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
 		{Source: "trae", ID: "doubao-seed-2.1-pro", Billing: "高级包 约30-50/次", ContextLen: 256000, MaxOutput: 128000, InputModes: m("text", "image", "video"), Reasoning: "官方 turbo 口径 关闭 + low/high（pro 未单列）", ToolCall: true, Structured: true},
-		{Source: "trae", ID: "kimi-k3", Billing: "x1.83", ContextLen: 1048576, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+		{Source: "trae", ID: "kimi-k3", Billing: "x1.83", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 		// ZCode（Z.AI Coding Plan 计划内额度；提供 GLM 系模型，无 Claude）
 		{Source: "zcode", ID: "glm-5.3", Billing: "计划内额度", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	}
@@ -145,15 +145,15 @@ var routedSpecs = map[string]tierRow{
 	// GLM-5.3 0.8 / GLM-5.3-Flash 0.1 / Qwen3.8-Flash 0（免费）/
 	// Qwen3.8-Max 0.5（错峰 22:00-08:00 打 4 折）/ DeepSeek-V4-Pro 0.5 /
 	// DeepSeek-Flash 0.1 / Kimi-K3 1.4。
-	"qoder|GLM-5.3":                             {Billing: "x0.8", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
-	"qoder|GLM-5.3-Flash":                       {Billing: "x0.1", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
-	"qoder|Qwen3.8-Flash":                       {Billing: "免费（折前 x0.1）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "关闭 + low/medium/xhigh", ToolCall: true, Structured: true},
-	"qoder|Qwen3.8-Max":                         {Billing: "x0.5（错峰 22:00-08:00 → x0.2）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "关闭 + low/medium/xhigh", ToolCall: true, Structured: true},
-	"qoder|DeepSeek-V4-Pro":                     {Billing: "x0.5", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "关闭 + high/max", ToolCall: true, Structured: true},
-	"qoder|DeepSeek-Flash":                      {Billing: "x0.1", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
-	"qoder|Kimi-K3":                             {Billing: "x1.4", ContextLen: 1048576, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
-	"autoclaw|zaicoding_glm-5.3":                {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 307200, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
-	"autoclaw|glm-5.3-flash":                    {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	"qoder|GLM-5.3":              {Billing: "x0.8", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	"qoder|GLM-5.3-Flash":        {Billing: "x0.1", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	"qoder|Qwen3.8-Flash":        {Billing: "免费（折前 x0.1）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "关闭 + low/medium/xhigh", ToolCall: true, Structured: true},
+	"qoder|Qwen3.8-Max":          {Billing: "x0.5（错峰 22:00-08:00 → x0.2）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "关闭 + low/medium/xhigh", ToolCall: true, Structured: true},
+	"qoder|DeepSeek-V4-Pro":      {Billing: "x0.5", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "关闭 + high/max", ToolCall: true, Structured: true},
+	"qoder|DeepSeek-Flash":       {Billing: "x0.1", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
+	"qoder|Kimi-K3":              {Billing: "x1.4", ContextLen: 1048576, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	"autoclaw|zaicoding_glm-5.3": {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 307200, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	"autoclaw|glm-5.3-flash":     {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	// autoclaw 的 tdpsk_deepseek-* 两条已移除：CN 加速网关对本账号三个候选 id
 	// 全部回 400「非法模型」，而同刻 glm-5.3-flash 可用（2026-10-23 实测）。
 	// Trae 免费用户折扣表：glm-5.3-flash 未单列，取客户端截图 0.06x（无折扣标签）。
