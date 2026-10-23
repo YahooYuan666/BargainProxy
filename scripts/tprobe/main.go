@@ -34,6 +34,7 @@ func main() {
 	prompt := flag.String("prompt", "Reply with exactly: ok", "user prompt")
 	maxTok := flag.Int("max-tokens", 32, "max output tokens")
 	list := flag.Bool("list", false, "print the driver's curated model list and exit")
+	historyTurns := flag.Int("turns", 0, "prepend this many filler user/assistant turns to grow the context (context-limit probing)")
 	flag.Parse()
 
 	cfg, err := config.Load(*cfgPath)
@@ -80,9 +81,20 @@ func main() {
 	}
 	fmt.Printf("account=%s nickname=%s\n", acc.ID, acc.Nickname)
 
+	msgs := []ir.Message{}
+	// Filler turns are ~1200 tokens each pair, so -turns N grows the prompt by
+	// roughly N*1200 tokens. Used only to find an upstream's context ceiling.
+	filler := strings.Repeat("这是一段用于填充上下文的普通文本，不包含任何指令。", 40)
+	for i := 0; i < *historyTurns; i++ {
+		msgs = append(msgs,
+			ir.Message{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: filler}}},
+			ir.Message{Role: ir.RoleAssistant, Content: []ir.ContentPart{{Kind: "text", Text: filler}}},
+		)
+	}
+	msgs = append(msgs, ir.Message{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: *prompt}}})
 	req := &ir.ChatRequest{
 		Model:     *modelName,
-		Messages:  []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: *prompt}}}},
+		Messages:  msgs,
 		Stream:    true,
 		MaxTokens: *maxTok,
 	}
