@@ -336,41 +336,11 @@ func concurrencyError(channel, who string) *uperr.Error {
 	return ue
 }
 
-// estimatePromptTokens is a coarse size estimate (chars/3 for text, a flat
-// per-image allowance, tool schema included) used only to widen the
-// first-byte window; exact accounting stays with the upstream usage. Tool
-// definitions were left out before BP-72: a ZCode session ships a large tool
-// schema, so the window stayed at the floor while the real prompt was already
-// tens of thousands of tokens.
+// estimatePromptTokens forwards to ir.EstimatePromptTokens (moved there for
+// BP-103: the lobster driver gates its context ceiling with the same
+// estimate, and drivers must not import the gateway package).
 func estimatePromptTokens(req *ir.ChatRequest) int {
-	if req == nil {
-		return 0
-	}
-	chars := 0
-	images := 0
-	for _, m := range req.Messages {
-		for _, p := range m.Content {
-			switch p.Kind {
-			case "text":
-				chars += len(p.Text)
-			case "image":
-				// Prefill cost of an image is roughly fixed per tile; the
-				// base64 size is not a token count and must not be used.
-				images++
-			}
-		}
-		for _, th := range m.Thinking {
-			chars += len(th.Text)
-		}
-	}
-	toolChars := 0
-	for _, td := range req.Tools {
-		toolChars += len(td.Name) + len(td.Description)
-		if td.Parameters != nil {
-			toolChars += len(fmt.Sprint(td.Parameters))
-		}
-	}
-	return (chars+toolChars)/2 + images*1500
+	return ir.EstimatePromptTokens(req)
 }
 
 // fbWindowCeiling is the default first-byte window cap for every channel

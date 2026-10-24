@@ -52,6 +52,20 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "lobster: build body: %v", err)
 	}
+	// Upstream hard ceilings (BP-103, probed 2026-10-24): the proxy kills any
+	// request whose JSON body exceeds ~5 MB, and any prompt over 1,048,576
+	// tokens (2^20; the catalog's contextWindow says 1000000). Both come back
+	// the same lying way — 17-67s of silence, then HTTP 500 with an EMPTY
+	// body — which the gateway can only read as a transport failure and the
+	// client reads as "channel dead". Probes that separate the two axes:
+	// 20 MB of "aaaa" (few tokens) still dies, so the byte limit is real; a
+	// CJK ladder read back prompt_tokens=1048263 → 200 while the next step
+	// died, so the token limit is 2^20. Gate here, before the socket opens,
+	// and reject as bad_request: not rotatable within the pool (every account
+	// hits the same ceiling) but cascading to another channel continues.
+	if err := rejectOversize(body, ir.EstimatePromptTokens(call.Request)); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatURL(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -196,6 +210,37 @@ const (
 	optionsField   = "lobsterai_options"
 	optionsVersion = 1
 )
+
+// Hard upstream ceilings probed on 2026-10-24 (BP-103). The proxy returns an
+// empty 500 after 17-67s for requests over either limit, so both are gated
+// before the socket opens. The byte margin is generous (4 MB gate vs a
+// measured death at 5 MB and survival at 4.5 MB) because the true edge sits
+// somewhere in between and the cost of a false rejection is one skipped
+// channel while the cost of a miss is a minute of dead air. The token gate
+// mirrors the measured 2^20 with the same headroom.
+const (
+	maxBodyBytes = 4 << 20   // measured: 4.5 MB survives, 5 MB dies
+	maxPromptEst = 1_000_000 // measured ceiling: 1,048,576 (2^20)
+)
+
+// rejectOversize reports whether the request would be killed by the proxy's
+// body-size ceiling or the model's context ceiling. estTokens is the shared
+// ir.EstimatePromptTokens heuristic (chars/2 — an upper bound for CJK, lower
+// for repetitive ASCII), deliberately conservative: this gate decides "try
+// another channel", not "fail the turn".
+func rejectOversize(body []byte, estTokens int) error {
+	if len(body) > maxBodyBytes {
+		return uperr.New(uperr.ClassBadRequest, 413,
+			"lobster: request body of %d bytes exceeds the proxy ceiling of %d bytes; upstream answers an empty 500 after a long hang, try another channel",
+			len(body), maxBodyBytes)
+	}
+	if estTokens > maxPromptEst {
+		return uperr.New(uperr.ClassBadRequest, 413,
+			"lobster: estimated prompt of %d tokens exceeds the context ceiling of %d; upstream answers an empty 500 after a long hang, try another channel",
+			estTokens, maxPromptEst)
+	}
+	return nil
+}
 
 // thinkingGear decides whether to send the private thinking field and which
 // gear to use. It returns ok=false when the caller asked for nothing, so the

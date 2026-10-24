@@ -143,6 +143,15 @@ open http://127.0.0.1:13140/panel/
 
 模型名用**规范化裸名**（`glm-5.3`、`gemini-3-pro`、`deepseek-v4-flash`…），渠道选择是网关内部决策；`GET /v1/models` 可看全部可用模型及其渠道绑定。密钥：config 里 `api_key` 非空时要求 `Authorization: Bearer <key>`（默认本地不鉴权）。
 
+### WorkBuddy 桌面版接入（一键）
+
+本机装有 [WorkBuddy](https://www.workbuddy.cn) 桌面版时，网关模型可以直接登记进它的自定义模型列表：
+
+- **面板**：设置页 →「登记模型进 WorkBuddy」→ 点一下即可（可先「预览」）。你自己手动加过的模型不会被覆盖；网关路由变动后重新点一次同步。
+- **命令行**（等价）：`go run .\scripts\wbmodels -write`（不带 `-write` 只预览）。
+
+登记后 WorkBuddy 的模型选择里会出现网关的全部可用模型（chat 协议，带上下文/最大输出/识图/思考档位规格），请求走本机网关、由网关统一选号与降级。写入前自动备份 `models.json`，WorkBuddy 约 1 秒内自动加载，无需重启。
+
 ## 添加账号
 
 面板 → 「添加账号」，直接粘贴凭据 JSON（面板会自动识别各来源格式）：
@@ -151,9 +160,10 @@ open http://127.0.0.1:13140/panel/
 - **workbuddy**：workbuddy2api-panel 的 `auths/workbuddy-*.json` 原格式（`{account, auth}`）或扁平格式
 - **trae**：`{"access_token": ..., "uid": ..., "device_id": ...}`
 - **zcode**：`{"jwt": "...", "device_mid": "..."}`
-- **autoclaw**：面板「添加账号 → AutoClaw」走登录流程；或粘贴 z.ai 客户端抓到的 token（账号以钱包身份为准）。
+- **autoclaw**：面板「添加账号 → AutoClaw」→ **「从本机客户端自动导入」**（推荐）。先用官方 AutoClaw 桌面客户端登录一次（国内版 / 国际版均可），点一下按钮即可：网关自己扫描客户端目录、解密凭据并入库，按来源自动区分国内区 / 国际区两条线路，不需要找文件或粘贴任何内容。也支持面板短信登录（仅国内区）。
   > 登录/签到/钱包等接口需要 `config.json` 里 `channels.autoclaw.app_secret`（官方客户端内置的签名常量）。
   > **源码不随附该常量**，请从你使用的客户端版本自行提取后填入；未配置时这几个接口会报明确的配置错误，聊天转发不受影响。
+  > 国际区（autoglm.ai）与国内区是**两套独立账号与积分**，国际区应用内授权已被上游边缘防护关闭，只能靠本机客户端导入；导入后在「设置」里开启「国际版账号」开关才会参与调度。
 - **qoder**：`{"pat": "pt-..."}`（Qoder 个人设置 → 服务集成 → 个人访问令牌）
 - **openaicompat**：`{"api_key": "..."}`（配合 config 里 `openaicompat.base_url`）
 
@@ -168,6 +178,7 @@ open http://127.0.0.1:13140/panel/
 - **Antigravity（窗口型）**：按「剩余配额 / 距重置秒数」的贪婪系数排序，优先烧即将重置的窗口；单号并发 3，会话粘性强绑定，429 按上游给出的精确重置时间冷却。
 - **WorkBuddy / Trae / ZCode（积分型）**：健康过滤 → 成本分层（实测限免 > 未知 > 实测收费，ε-greedy 定期探索未知档）→ 快过期积分加权 → Top5 洗牌加权随机 → 0.1s 并发避让；6004 模型级冷却只屏蔽该模型，402 冷却至次日 04:00（北京时间）。
 - **跨渠道**：同名模型绑定多个渠道时按「能力 → 免积分 → 渠道优先序 → 会话粘性」选择；渠道忙/冷却时自动降级并回写 `X-BP-Served-Channel`。
+- **Trae 两条通道**：带 tools 的请求走 `llm_utils_chat`（上限 262,144 token，工具可正常往返）；不带 tools 且超过 262,144 的请求自动切 `chat_sessions`（上限 1,000,000，但那条路上游跑自己的 agent、不认请求里的 tools）；带 tools 又超限的请求在发出去之前就判定本渠道装不下、直接交给下一个渠道，不再白等必然的 4026。
 - **不轮换的情形**：内容级拒绝（含 HTTP 200 哨兵正文、`first_buddy` 类业务门槛）不换号，直接按协议返回错误。
 
 ## 任务中心
@@ -193,6 +204,7 @@ internal/driver       antigravity / workbuddy / trae / zcode / autoclaw / qoder 
 internal/gateway      请求编排（路由→取号→驱动→降级→记账）
 internal/server       HTTP 端点（四协议 + /v1/models + /healthz）
 internal/panel        管理面板（embed 单页）
+internal/wbregister   把网关模型登记进本机 WorkBuddy 桌面版（面板按钮与 CLI 共用）
 internal/tasks        任务中心（签到/成长/探测/刷新/清理）
 internal/store        PostgreSQL / 内存存储
 internal/cryptox      AES-256-GCM 凭据信封
@@ -202,6 +214,15 @@ internal/cryptox      AES-256-GCM 凭据信封
 
 - [跨国外网出口与 BBR2 调优](docs/跨国外网出口与BBR2调优.md)：Google / OpenCode 两条出境链路慢的根因与三步调优（BBR2、分流规则、DoH/QUIC），含回滚与验证流程。国模走国内直连，不要放进代理。
 - [ZCode 同步插件](plugins/bargainproxy-opencode/README.md)：把网关模型同步进 ZCode 的 9 个个人供应商。
+
+## 换电脑 / 重装时怎么把调好的设置带过去
+
+模型路由表（哪些模型走哪些渠道、优先级）和调度参数都存在本机数据库里，`git clone` 带不走；`config.json` 里还有本机密钥，本来就不入库。所以换机器后要么用模板默认值，要么搬一次设置：
+
+1. 老机器：面板「设置 → 设置迁移 → 导出设置文件」，得到 `bargainproxy-settings.json`（含路由表、模型目录白名单、并发/冷却/首字窗口/任务时点等调度参数；**不含**账号凭据、面板密码、登录态、请求日志）。
+2. 新机器：`scripts\start-all.cmd` 起来，面板「设置 → 设置迁移 → 选择文件 → 导入并立即生效」。
+
+`config.example.json` 里固化的就是本机这套路由与显示白名单，所以新机器不导入也能得到一致的模型清单；导入用于覆盖你在老机器上后来调整过的部分。
 
 ## 许可与声明
 

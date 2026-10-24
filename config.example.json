@@ -66,40 +66,16 @@
   },
   "models": [
     {
-      "canonical": "gemini-3-pro",
-      "channel": "antigravity",
-      "upstream_model": "gemini-pro-agent",
-      "priority": 0
+      "canonical": "beam-free",
+      "channel": "opencodezen",
+      "upstream_model": "beam-free",
+      "priority": 5
     },
     {
-      "canonical": "gemini-3.1-pro-preview",
-      "channel": "antigravity",
-      "upstream_model": "gemini-pro-agent",
-      "priority": 0
-    },
-    {
-      "canonical": "gemini-3.5-flash-high",
-      "channel": "antigravity",
-      "upstream_model": "gemini-3.5-flash-high",
-      "priority": 0
-    },
-    {
-      "canonical": "glm-5.3",
-      "channel": "workbuddy",
-      "upstream_model": "glm-5.3",
-      "priority": 0
-    },
-    {
-      "canonical": "glm-5.2",
-      "channel": "workbuddy",
-      "upstream_model": "glm-5.2",
-      "priority": 0
-    },
-    {
-      "canonical": "deepseek-v4-flash",
-      "channel": "workbuddy",
-      "upstream_model": "deepseek-v4-flash",
-      "priority": 0
+      "canonical": "big-pickle",
+      "channel": "opencodezen",
+      "upstream_model": "big-pickle",
+      "priority": 5
     },
     {
       "canonical": "deepseek-v4-pro",
@@ -108,10 +84,154 @@
       "priority": 0
     },
     {
-      "canonical": "kimi-k2.6",
+      "canonical": "deepseek-v4-pro",
+      "channel": "qoder",
+      "upstream_model": "DeepSeek-V4-Pro",
+      "priority": 1
+    },
+    {
+      "canonical": "deepseek-v4-pro",
+      "channel": "lobster",
+      "upstream_model": "deepseek-v4-pro",
+      "priority": 9
+    },
+    {
+      "canonical": "deepseek-v4.1-flash",
       "channel": "workbuddy",
-      "upstream_model": "kimi-k2.6",
+      "upstream_model": "deepseek-v4.1-flash",
       "priority": 0
+    },
+    {
+      "canonical": "deepseek-v4.1-flash",
+      "channel": "trae",
+      "upstream_model": "deepseek-v4.1-flash",
+      "priority": 1
+    },
+    {
+      "canonical": "deepseek-v4.1-flash",
+      "channel": "qoder",
+      "upstream_model": "DeepSeek-Flash",
+      "priority": 2
+    },
+    {
+      "canonical": "deepseek-v4.1-flash",
+      "channel": "lobster",
+      "upstream_model": "deepseek-flash",
+      "priority": 9
+    },
+    {
+      "canonical": "deepseek-v4.1-flash-free",
+      "channel": "opencodezen",
+      "upstream_model": "deepseek-v4.1-flash-free",
+      "priority": 5
+    },
+    {
+      "canonical": "flint-40b-free",
+      "channel": "opencodezen",
+      "upstream_model": "flint-40b-free",
+      "priority": 5
+    },
+    {
+      "canonical": "gemini-3.8-flash-high",
+      "channel": "antigravity",
+      "upstream_model": "gemini-3.8-flash-high",
+      "priority": 0
+    },
+    {
+      "canonical": "gemini-claude-opus-4-6-thinking",
+      "channel": "antigravity",
+      "upstream_model": "gemini-claude-opus-4-6-thinking",
+      "priority": 0
+    },
+    {
+      "canonical": "gemini-claude-sonnet-4-6",
+      "channel": "antigravity",
+      "upstream_model": "gemini-claude-sonnet-4-6",
+      "priority": 0
+    },
+    {
+      "canonical": "glm-5.3",
+      "channel": "zcode",
+      "upstream_model": "glm-5.3",
+      "priority": 0
+    },
+    {
+      "canonical": "glm-5.3",
+      "channel": "autoclaw",
+      "upstream_model": "zaicoding_glm-5.3",
+      "priority": 1
+    },
+    {
+      "canonical": "glm-5.3",
+      "channel": "workbuddy",
+      "upstream_model": "glm-5.3",
+      "priority": 2
+    },
+    {
+      "canonical": "glm-5.3",
+      "channel": "qoder",
+      "upstream_model": "GLM-5.3",
+      "priority": 3
+    },
+    {
+      "canonical": "glm-5.3",
+      "channel": "lobster",
+      "upstream_model": "glm-5.3",
+      "priority": 9
+    },
+    {
+      "canonical": "glm-5.3-flash",
+      "channel": "zcode",
+      "upstream_model": "glm-5.3-flash",
+      "priority": 0
+    },
+    {
+      "canonical": "glm-5.3-flash",
+      "channel": "autoclaw",
+      "upstream_model": "zai_glm-5.3-flash",
+      "priority": 1
+    },
+    {
+      "canonical": "glm-5.3-flash",
+      "channel": "workbuddy",
+      "upstream_model": "glm-5.3-flash",
+      "priority": 2
+    },
+    {
+      "canonical": "glm-5.3-flash",
+      "channel": "qoder",
+      "upstream_model": "GLM-5.3-Flash",
+      "priority": 3
+    },
+    {
+      "canonical": "glm-5.3-flash",
+      "channel": "trae",
+      "upstream_model": "glm-5.3-flash",
+      "priority": 4
+    },
+    {
+      "canonical": "glm-5.3-flash",
+      "channel": "lobster",
+      "upstream_model": "glm-5.3-flash",
+      "priority": 9
+    },
+    {
+      "canonical": "glm-5.3-flash-free",
+      "channel": "opencodezen",
+      "upstream_model": "glm-5.3-flash-free",
+      "priority": 5
+    },
+    {
+      "canonical": "glm-5.3-flashx",
+      "channel": "trae",
+      "upstream_model": "glm-5.3-flashx",
+      "priority": 0
+    },
+    {
+      "canonical": "glm-5.3-flashx",
+      "channel": "lobster",
+      "upstream_model": "glm-5.3-flashx",
+      "priority": 9
     },
     {
       "canonical": "kimi-k3",
@@ -126,16 +246,71 @@
       "priority": 1
     },
     {
-      "canonical": "minimax-m3",
-      "channel": "workbuddy",
-      "upstream_model": "minimax-m3",
+      "canonical": "kimi-k3",
+      "channel": "lobster",
+      "upstream_model": "kimi-k3",
+      "priority": 9
+    },
+    {
+      "canonical": "mimo-v2.6-flash-free",
+      "channel": "opencodezen",
+      "upstream_model": "mimo-v2.6-flash-free",
+      "priority": 5
+    },
+    {
+      "canonical": "nemotron-3.5-lightning-free",
+      "channel": "opencodezen",
+      "upstream_model": "nemotron-3.5-lightning-free",
+      "priority": 5
+    },
+    {
+      "canonical": "nemotron-3.5-super-vl-free",
+      "channel": "opencodezen",
+      "upstream_model": "nemotron-3.5-super-vl-free",
+      "priority": 5
+    },
+    {
+      "canonical": "qwen3.8-flash",
+      "channel": "qoder",
+      "upstream_model": "Qwen3.8-Flash",
       "priority": 0
     },
     {
-      "canonical": "claude-sonnet-4-6",
-      "channel": "zcode",
-      "upstream_model": "claude-sonnet-4-6",
+      "canonical": "qwen3.8-flash",
+      "channel": "trae",
+      "upstream_model": "qwen3.8-flash",
+      "priority": 1
+    },
+    {
+      "canonical": "qwen3.8-flash",
+      "channel": "lobster",
+      "upstream_model": "qwen3.8-flash",
+      "priority": 9
+    },
+    {
+      "canonical": "qwen3.8-max",
+      "channel": "qoder",
+      "upstream_model": "Qwen3.8-Max",
       "priority": 0
+    },
+    {
+      "canonical": "qwen3.8-max",
+      "channel": "lobster",
+      "upstream_model": "qwen3.8-max",
+      "priority": 9
     }
+  ],
+  "primary_models": [
+    "gemini-3.8-flash-high",
+    "gemini-claude-sonnet-4-6",
+    "gemini-claude-opus-4-6-thinking",
+    "glm-5.3",
+    "glm-5.3-flash",
+    "deepseek-v4.1-flash",
+    "deepseek-v4-pro",
+    "kimi-k3",
+    "qwen3.8-flash",
+    "qwen3.8-max",
+    "glm-5.3-flashx"
   ]
 }

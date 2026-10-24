@@ -59,7 +59,7 @@ func TestStreamManagedSSE(t *testing.T) {
 			if first, ok := msgs[0].(map[string]any); ok {
 				if str, ok2 := first["content"].(string); ok2 {
 					gotSystem = str
-					gotToolsAny = strings.HasPrefix(str, managedSystemPrompt)
+					gotToolsAny = strings.HasPrefix(str, harnessMarker) && strings.Contains(str, managedSystemPrompt)
 				}
 			}
 		}
@@ -108,8 +108,12 @@ func TestStreamManagedSSE(t *testing.T) {
 	if gotChannel != managedChannel || gotVersion != managedVersion {
 		t.Fatalf("channel=%q version=%q", gotChannel, gotVersion)
 	}
+	// The gateway's prompt gate needs BOTH: the harness marker verbatim at the
+	// head, and a persona that is not a competing product's name (BP-103,
+	// field A/B 2026-10-24 — the marker alone answers 200, but a marker plus
+	// "You are ZCode…" is refused again).
 	if !gotToolsAny {
-		t.Fatalf("official system prompt missing, got %q", gotSystem)
+		t.Fatalf("harness marker + official persona missing, got %q", gotSystem)
 	}
 	if gotMaxTokens {
 		t.Fatal("max_tokens must be stripped: the CN gateway refuses it")

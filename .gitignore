@@ -1,5 +1,6 @@
 # 本机真实配置与凭据（模板见 config.example.json）
 /config.json
+/config.json.bak*
 /data/
 *.key
 

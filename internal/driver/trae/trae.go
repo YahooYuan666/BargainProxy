@@ -44,6 +44,19 @@ const (
 	osVersion      = "Windows 11 Pro"
 	functionSOLO   = "solo_work_lite"
 
+	// traeToolInputCeiling is the measured input ceiling of the tool-bearing
+	// surface (llm_utils_chat). Field evidence 2026-10-23: binary search shows
+	// 261623 tokens pass and ~264000 answer 4026 "context length has exceeded
+	// the maximum limit"; the same wall holds for every model (glm-5.3-flash
+	// and deepseek-v4.1-flash both stop at the same number), and the vendor
+	// catalogue reports exactly this value as context_window_tokens.dev.
+	//
+	// A tool-carrying prompt above it can never succeed on this channel, so the
+	// driver refuses it before dispatch rather than burning a leg on a certain
+	// 4026 (measured: the refusal takes ~4s and often ~2 minutes on big
+	// prompts).
+	traeToolInputCeiling = 262144
+
 	// functionsTrae is the ladder of SOLO functions, tried in order. A model
 	// or tool set that one function refuses is often taken by the next: the
 	// upstream answers 400 with a business code (4001/4023/1005) rather than
@@ -191,6 +204,36 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	creds, err := ParseCreds(call.Account.Credentials())
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
+	}
+	// The channel has two surfaces with different ceilings (see sessions.go):
+	// llm_utils_chat serves our tools but stops at 262144; chat_sessions reaches
+	// 1M but runs the vendor's own agent and ignores our tool declarations.
+	//
+	// llm_utils_chat stays the DEFAULT because it is the only surface that
+	// speaks our protocol (tool calls round-trip, sampling params, the function
+	// ladder). The session surface is entered only when the request cannot fit
+	// the ladder — that is the sole thing it can do better, and using it for
+	// ordinary traffic would silently change how every answer is produced.
+	est := estimateInputTokens(call.Request)
+	hasTools := len(call.Request.Tools) > 0
+	switch {
+	case est <= traeToolInputCeiling:
+		// Fits the ladder: unchanged behaviour.
+	case hasTools:
+		// A tool-carrying prompt above the ceiling can never succeed here
+		// (sessions would drop every tool). Fail before dispatch so the router
+		// cascades instead of paying a guaranteed 4026 — measured at ~4s, and
+		// minutes on large prompts.
+		return nil, uperr.New(uperr.ClassModelUnavailable, 400,
+			"trae: %d-token prompt with tools exceeds this channel's %d-token tool ceiling; another channel is required",
+			est, traeToolInputCeiling)
+	case est > chatSessionMaxInput:
+		return nil, uperr.New(uperr.ClassModelUnavailable, 400,
+			"trae: %d-token prompt exceeds the %d-token session ceiling; another channel is required",
+			est, chatSessionMaxInput)
+	default:
+		// Tool-free and too large for the ladder: the session surface serves it.
+		return d.streamViaSessions(ctx, call, emit)
 	}
 	// Walk the SOLO function ladder: an upstream 400 whose business code says
 	// "this function does not take this payload" is retried on the next

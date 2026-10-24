@@ -224,6 +224,8 @@ tr:last-child td{border-bottom:none}
           <span class="note" id="accNote"></span>
         </header>
         <div class="note" id="deadNote" style="display:none;padding:8px 12px;color:#e0a03a"></div>
+        <!-- 渠道能力说明（目前只有 Trae 需要，见 renderChannelNotice） -->
+        <div class="note" id="chanNotice" style="display:none;padding:10px 12px;line-height:1.7"></div>
         <div class="tbl-wrap">
           <table id="accounts"><thead><tr>
             <th>状态</th><th>账号</th><th>渠道</th><th>额度 / 窗口</th><th>冷却</th><th>在途</th><th style="width:190px">操作</th>
@@ -425,6 +427,14 @@ tr:last-child td{border-bottom:none}
         </div>
       </div>
       <div class="box">
+        <header><h3>把模型接进 WorkBuddy 桌面版</h3></header>
+        <div style="padding:14px 16px;display:grid;gap:10px">
+          <div class="small">本机装有 <b>WorkBuddy 桌面版</b>时，到「设置 → 登记模型进 WorkBuddy」点一下按钮，网关的全部可用模型就会出现在 WorkBuddy 的自定义模型列表里（走本机网关选号，账号额度统一由网关管理）。</div>
+          <div class="small">要点：① 你在 WorkBuddy 里手动加过的模型<b>不会被覆盖</b>；② 网关路由变动后<b>再点一次按钮</b>即同步；③ 写入前自动备份，WorkBuddy 约 1 秒自动加载，不用重启。</div>
+          <div class="small">命令行等价：<span class="mono">go run .\scripts\wbmodels -write</span>（不带 <span class="mono">-write</span> 只预览）。</div>
+        </div>
+      </div>
+      <div class="box">
         <header><h3>出境链路：Google / OpenCode 慢怎么办</h3>
           <span class="grow"></span>
           <button class="xs" onclick="copyNetGuide()">复制文档地址</button></header>
@@ -618,6 +628,29 @@ tr:last-child td{border-bottom:none}
         </div>
       </div>
       <div class="box">
+        <header><h3>登记模型进 WorkBuddy（本机装有 WorkBuddy 桌面版时用）</h3></header>
+        <div style="padding:14px 16px;display:grid;gap:12px">
+          <div class="hint">把网关当前可用的模型一键写进本机 WorkBuddy 的自定义模型列表（chat 协议，带完整规格：上下文/最大输出/识图/思考档位）。你自己手动加过的模型不会被覆盖；网关模型变动后重新点一次即可同步。写入前自动备份，WorkBuddy 约 1 秒内自动加载，无需重启。</div>
+          <div class="row" style="gap:8px;align-items:center">
+            <button class="primary" onclick="registerWorkBuddy(false)">登记进 WorkBuddy</button>
+            <button class="xs" onclick="registerWorkBuddy(true)">先预览不写入</button>
+            <span class="hint" id="wbRegResult"></span>
+          </div>
+        </div>
+      </div>
+      <div class="box">
+        <header><h3>设置迁移（换电脑 / 重装时用）</h3></header>
+        <div style="padding:14px 16px;display:grid;gap:12px">
+          <div class="hint">把这台机器上调好的东西——模型路由表、模型目录白名单、调度参数（并发/冷却/首字窗口/任务时点等）——打成一份 JSON 文件，拿到另一台机器的面板导入，两台机器的模型显示与路由就一致了。<b>不包含</b>：账号凭据、面板密码、登录态、请求日志——这些留在本机。</div>
+          <div class="row" style="gap:8px">
+            <button class="primary" onclick="exportSettings()">导出设置文件</button>
+            <label class="chk" style="width:auto">选择文件 <input type="file" id="importSettingsFile" accept=".json,application/json" style="max-width:220px"></label>
+            <button class="primary" onclick="importSettings()">导入并立即生效</button>
+          </div>
+          <div class="hint" id="xferResult"></div>
+        </div>
+      </div>
+      <div class="box">
         <header><h3>排队与容灾（改后需重启服务生效；scripts\stop-all.cmd → start-all.cmd）</h3></header>
         <div style="padding:14px 16px;display:grid;gap:12px">
           <div class="row">
@@ -727,7 +760,7 @@ tr:last-child td{border-bottom:none}
       </div>
       <!-- AutoClaw 短信登录 -->
       <div id="addTabAutoclaw" class="tabp" hidden>
-        <div class="hint" style="margin-bottom:8px">智谱 AutoClaw（国内区）：输入手机号获取短信验证码，登录后自动入库。</div>
+        <div class="hint" style="margin-bottom:8px">智谱 AutoClaw（<b>国内区</b>）：输入手机号获取短信验证码，登录后自动入库。</div>
         <div class="row" style="margin-bottom:8px">
           <input id="acPhone" placeholder="手机号">
           <button class="xs" onclick="acSendCode()">发送验证码</button>
@@ -737,6 +770,19 @@ tr:last-child td{border-bottom:none}
           <input id="acLabel" placeholder="备注名（可选）">
         </div>
         <button class="primary" onclick="acLogin()">登录并添加</button>
+
+        <hr style="margin:18px 0;border:none;border-top:1px solid #2a2f3a">
+        <div class="hint" style="margin-bottom:8px">
+          <b>国际区（autoglm.ai）</b>：与国内区是<b>两个独立账号、两套独立积分</b>（国内 token 打国际网关会 401）。
+          国际区只能用<b>邮箱</b>注册，新号送 10000 积分分 7 天到账。
+        </div>
+        <div class="hint" style="margin-bottom:8px">
+          国际区的应用内授权被上游边缘防护关掉了，所以这里不能直接登录。
+          <b>做法：用官方 AutoClaw 客户端登录一次（国内版或国际版都行），然后点下面的按钮自动读取。</b>
+          不需要找文件、不需要粘贴任何东西——网关会自己解密本机客户端留下的凭据。
+        </div>
+        <button class="primary" onclick="acImportLocal()">从本机客户端自动导入</button>
+        <div class="hint" style="margin-top:8px">会同时扫描国内版和国际版两个客户端目录，按来源自动区分线路。导入后需在「设置」里开启「国际版账号」开关，国际区账号才会参与调度。</div>
       </div>
       <!-- Qoder PAT -->
       <div id="addTabQoder" class="tabp" hidden>
@@ -1679,8 +1725,33 @@ function accState(a){
   return {cls:'ok', txt:'就绪'};
 }
 
+// Channel capability notes. Only Trae needs one today: it is the single
+// upstream that cannot carry a caller's tool declarations through its
+// long-context surface, which is invisible from the outside and would
+// otherwise read as "the model forgot my tools".
+const chanNotices = {
+  trae: {
+    title: 'Trae 的两条通道（能力不同，2026-10-24 实测）',
+    lines: [
+      '普通对话 / 带工具的请求 → <b>llm_utils_chat</b>：支持你传入的全部工具（MCP 工具可正常往返），但上下文上限只有 <b>262,144 token</b>，超了上游直接报 code 4026。',
+      '超长对话（> 262,144）→ <b>chat_sessions</b>：上下文能到 <b>1,000,000 token</b>（实测 30 万 / 60 万 / 90 万均通过），但这条路上游跑的是 Trae 自己的 agent，<b>不接受请求里传的 tools</b>；它的工具靠账号级 MCP 注册，不跟随单次请求。',
+      '因此本网关的做法：超长请求若<b>不带工具</b>，自动走 chat_sessions 拿到 1M；若<b>带工具</b>，直接判定本渠道装不下并交给下一个渠道，不再白等 4 秒的必然失败。',
+      '<span style="color:#e0a03a">待解决：</span>把请求里的 tools 动态注册成 MCP server，让 1M 通道也能带工具（Trae 的工具入口是账号级 MCP 注册，不是请求里的 tools 字段）。',
+    ],
+  },
+};
+
+function renderChannelNotice(){
+  const el = document.getElementById('chanNotice');
+  const n = chanNotices[currentChan];
+  if (!n) { el.style.display = 'none'; el.innerHTML = ''; return; }
+  el.style.display = '';
+  el.innerHTML = `<b>${n.title}</b><br>` + n.lines.map(t => '· ' + t).join('<br>');
+}
+
 function renderAccounts(){
   const tb = document.querySelector('#accounts tbody'); tb.innerHTML='';
+  renderChannelNotice();
   accountRows = allAccounts.filter(a => a.channel === currentChan);
   document.getElementById('accNote').textContent = accountRows.length ? `${accountRows.length} 个账号` : '暂无账号，点右上角「添加账号」';
   accountRows.forEach((a, i) => {
@@ -2236,6 +2307,27 @@ async function acLogin(){
     onboardOk('已添加：' + (r.id || ''));
   } catch(e){ onboardFail('登录失败：' + e.message); }
 }
+// AutoClaw one-click import: read the official desktop clients' credential
+// stores (CN and/or overseas) and import everything found. The operator signs
+// in with the client once; this button does the rest — no file paths, no pasted
+// JSON. The lane (cn/global) is decided by which client directory the account
+// came from.
+async function acImportLocal(){
+  try {
+    const r = await api('accounts/autoclaw/import-local', {method:'POST', body: JSON.stringify({})});
+    if (!r.ok) {
+      onboardFail(r.error || '没有找到可导入的账号');
+      if ((r.notes||[]).length) toast(r.notes.join('；'), true);
+      return;
+    }
+    const parts = [];
+    if ((r.imported||[]).length) parts.push('新增 ' + r.imported.length + ' 个：' + r.imported.join('、'));
+    if ((r.updated||[]).length) parts.push('更新 ' + r.updated.length + ' 个：' + r.updated.join('、'));
+    if ((r.failed||[]).length) parts.push('失败 ' + r.failed.length + ' 个：' + r.failed.join('；'));
+    onboardOk('导入完成。' + parts.join('；'));
+    if ((r.notes||[]).length) console.info('[autoclaw import]', r.notes.join('；'));
+  } catch(e){ onboardFail('导入失败：' + e.message); }
+}
 // Qoder PAT onboarding.
 async function addQoder(){
   const pat = document.getElementById('qdPat').value.trim();
@@ -2366,6 +2458,45 @@ function savePrimaryModels(){
   const lines = document.getElementById('cfgPrimaryModels').value.split('\n')
     .map(s => s.trim()).filter(Boolean);
   saveDynamic({primary_models: lines}, '模型目录已更新');
+}
+
+/* ── 设置迁移（BP-103） ── */
+async function registerWorkBuddy(dryRun){
+  const el = document.getElementById('wbRegResult');
+  el.textContent = dryRun ? '预览中…' : '写入中…';
+  try {
+    const r = await api('workbuddy/register', {method:'POST', body: JSON.stringify({dry_run: dryRun})});
+    el.textContent = r.summary || (dryRun ? '预览完成' : '已写入');
+    if (!dryRun) toast('已登记进 WorkBuddy：' + (r.generated||0) + ' 个网关模型');
+  } catch(e){ el.textContent = ''; toast(dryRun ? '预览失败：' : '登记失败：' + e.message, true); }
+}
+async function exportSettings(){
+  try {
+    const r = await fetch('/panel/api/settings/export');
+    if (!r.ok) throw new Error(r.status);
+    const blob = await r.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'bargainproxy-settings.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    document.getElementById('xferResult').textContent = '已导出 bargainproxy-settings.json（含路由表/白名单/调度参数，不含账号与密码）';
+  } catch(e){ toast('导出失败：' + e.message, true); }
+}
+async function importSettings(){
+  const f = document.getElementById('importSettingsFile').files[0];
+  if (!f) return toast('先选择导出的 JSON 文件', true);
+  let bundle;
+  try { bundle = JSON.parse(await f.text()); }
+  catch(e){ return toast('文件不是合法 JSON', true); }
+  if (!confirm('导入将覆盖本机的模型路由表、白名单与调度参数（立即生效）。继续？')) return;
+  try {
+    const r = await api('settings/import', {method:'POST', body: JSON.stringify(bundle)});
+    const applied = (r.applied||[]).join('、') || '无';
+    document.getElementById('xferResult').textContent = '导入成功，已应用：' + applied;
+    toast('设置已导入并立即生效');
+    refresh();
+  } catch(e){ toast('导入失败：' + e.message, true); }
 }
 async function toggleRoutesEditor(){
   const ed = document.getElementById('routesEditor');

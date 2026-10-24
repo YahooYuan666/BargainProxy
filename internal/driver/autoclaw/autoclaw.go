@@ -48,10 +48,63 @@ const (
 	// this gateway serves; a mismatch is refused.
 	managedChannel = "AutoClaw26"
 	managedVersion = "2.1.0"
+
+	// The OVERSEAS lane (autoglm.ai) speaks the older 1.x contract, a
+	// different dialect from the CN acceleration gateway above:
+	//
+	//   - X-Channel is "zai" (not "AutoClaw26");
+	//   - X-Version must be FOUR segments (1.18.5.851). The gateway checks it
+	//     and reports a mismatch as 401 "Invalid token", so a three-segment
+	//     version reads as a dead credential (apmengzi/autoclaw-switch hit the
+	//     same trap: "1.18.5 -> 401, 1.18.5.851 -> 200");
+	//   - the token rides a lower-case "authorization" header;
+	//   - no OpenAI SDK fingerprint headers, no X-Session-Id.
+	//
+	// The two lanes are separate credential universes: a CN token against the
+	// overseas host answers 401 {"error":"Invalid token"} (verified live
+	// 2026-10-24), which is what makes the overseas pool a genuinely separate
+	// quota pool rather than another door into the same one.
+	overseasChannel = "zai"
+	// overseasVersion follows the installed client (2.2.2 at the time of
+	// measurement). The gateway checks it, and reports a mismatch as 401
+	// "Invalid token", so it must be bumped when the client is.
+	overseasVersion = "2.2.2"
+	overseasHost    = "https://autoglm-api.autoglm.ai"
+	// overseasChatPath has a /v1 segment the CN gateway does not. Measured
+	// 2026-10-24 against the real overseas account:
+	//   .../autoclaw/chat/completions     -> 405 (Alibaba edge block page)
+	//   .../autoclaw/v1/chat/completions  -> 200 with the same credential
+	// so the /v1 segment is load-bearing, not cosmetic.
+	overseasChatPath = "/autoclaw-proxy/proxy/autoclaw/v1/chat/completions"
+	// realmOverseas is the Account.Realm value for that lane.
+	realmOverseas = "global"
 	// managedSystemPrompt is mandatory: the gateway checks that the caller
 	// speaks for the official client. It is prefixed onto the caller's own
 	// system message (or added as one when there is none).
 	managedSystemPrompt = "You are AutoClaw. Answer the user directly and concisely."
+
+	// harnessMarker is the exact line the official desktop client puts at the
+	// head of its own system prompt, and the managed gateway's prompt gate
+	// requires it verbatim. Field A/B 2026-10-24 (scripts/probe/gate_probe.go,
+	// same account, same body, one variable changed per run):
+	//
+	//	marker only                       200
+	//	no marker ("You are a helpful…")  406
+	//	lower-cased marker                406
+	//	truncated marker                  406
+	//	"Extra preamble. " + marker       200   (position is NOT the gate)
+	//	marker + benign instructions      200
+	//	marker + "You are ZCode…"         406   (second gate, see below)
+	//
+	// So the gate is the marker's PRESENCE, not its position, and it is
+	// case- and byte-exact. The reference project reached the same conclusion
+	// from the other direction (apmengzi/autoclaw-switch, applyHarnessMarker:
+	// "41 chars -> 406; 42 -> 200; all lower-case -> 406").
+	//
+	// This is a SEPARATE gate from the competing-agent identity check: a prompt
+	// can carry the marker and still be refused for saying "You are ZCode…".
+	// Both conditions have to hold at once.
+	harnessMarker = "OpenClaw plugin-injected system context. This block is not workspace file content."
 
 	// transportRetries is how many times a dropped socket (no response bytes
 	// at all) is resent before the failure is handed to the gateway.
@@ -234,9 +287,37 @@ func userapiHeaders(token, secret string) http.Header {
 // mandatory (without it the gateway answers 401 "Invalid token"), and the
 // channel/version must name the 2.1.0 build this gateway serves.
 func managedChatHeaders(token, secret, model string) http.Header {
+	return managedChatHeadersFor(token, secret, model, false)
+}
+
+// managedChatHeadersFor builds the header family for one lane.
+//
+// The overseas lane differs from the CN one in the channel name, the client
+// version, and the absence of the CN gateway's client headers (Origin, Referer,
+// X-Client-Type, X-Agent-Id). The auth header is the SAME on both:
+// X-Authorization. Verified live 2026-10-24 with a real overseas account.
+func managedChatHeadersFor(token, secret, model string, overseas bool) http.Header {
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
+	if overseas {
+		h.Set("Accept", "*/*")
+		h.Set("User-Agent", "AutoClaw/"+overseasVersion+" (win-amd64)")
+		h.Set("X-Version", overseasVersion)
+		h.Set("X-Tm", "win")
+		h.Set("X-Product", "autoclaw")
+		h.Set("X-Auth-Appid", appID)
+		h.Set("X-Auth-TimeStamp", ts)
+		h.Set("X-Auth-Sign", sign(ts, secret))
+		h.Set("X-Trace-Id", traceID())
+		h.Set("X-Lang", "zh-CN")
+		h.Set("X-Channel", overseasChannel)
+		h.Set("X-Request-Model", model)
+		if token != "" {
+			h.Set("X-Authorization", token)
+		}
+		return h
+	}
 	h.Set("Accept", "*/*")
 	h.Set("User-Agent", "AutoClaw/"+managedVersion+" (win-amd64)")
 	h.Set("X-Version", managedVersion)
@@ -261,15 +342,33 @@ func managedChatHeaders(token, secret, model string) http.Header {
 	return h
 }
 
-// managedBody rewrites the IR-built body into what the CN managed gateway
-// takes: the official system prompt is mandatory, and max_tokens /
+// managedLead is what goes at the head of the system message: the harness
+// marker first (the gate requires it verbatim), then the persona line.
+//
+// Both are needed and neither replaces the other: the marker satisfies the
+// gateway's "is this our client" check, and the persona gives the model an
+// identity that is not a competing product's name. The marker has to survive
+// the caller's own prompt verbatim, so it is prepended here rather than
+// merged into the caller's text.
+func managedLead() string {
+	return harnessMarker + "\n\n" + managedSystemPrompt
+}
+
+// managedBody rewrites the IR-built body into what the managed gateway takes:
+// the official system prompt is mandatory, and max_tokens /
 // max_completion_tokens are refused outright (verified 2026-10-21).
-func managedBody(body []byte, modelID string) ([]byte, error) {
+//
+// bodyModel is what goes in body.model. It is passed separately from the route
+// id because the two lanes disagree: both address the route through the
+// X-Request-Model header (zai_glm-5.3-flash), but the overseas gateway wants
+// the BARE name in the body (glm-5.3-flash) and answers 406 to the prefixed
+// one. Verified live 2026-10-24.
+func managedBody(body []byte, bodyModel string) ([]byte, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, err
 	}
-	obj["model"] = modelID
+	obj["model"] = bodyModel
 	delete(obj, "max_tokens")
 	delete(obj, "max_completion_tokens")
 	delete(obj, "user")
@@ -283,11 +382,11 @@ func managedBody(body []byte, modelID string) ([]byte, error) {
 				// second system message is refused.
 				switch c := first["content"].(type) {
 				case string:
-					first["content"] = managedSystemPrompt + "\n\n" + c
+					first["content"] = managedLead() + "\n\n" + c
 					prefixed = true
 				case []any:
 					parts := make([]any, 0, len(c)+1)
-					parts = append(parts, map[string]any{"type": "text", "text": managedSystemPrompt})
+					parts = append(parts, map[string]any{"type": "text", "text": managedLead()})
 					first["content"] = append(parts, c...)
 					prefixed = true
 				}
@@ -295,14 +394,46 @@ func managedBody(body []byte, modelID string) ([]byte, error) {
 		}
 	}
 	if !prefixed {
-		obj["messages"] = append([]any{map[string]any{"role": "system", "content": managedSystemPrompt}}, msgs...)
+		obj["messages"] = append([]any{map[string]any{"role": "system", "content": managedLead()}}, msgs...)
 	}
 	return json.Marshal(obj)
 }
 
+// bodyModelFor is what goes in body.model, which the two lanes disagree about.
+//
+// The CN gateway takes the route id it was addressed with (zai_glm-5.3-flash).
+// The overseas gateway wants the BARE model name in the body and the route id
+// only in the X-Request-Model header. Measured 2026-10-24 with a real overseas
+// account, one variable per run:
+//
+//	body.model "glm-5.3-flash"     + header zai_glm-5.3-flash  -> 200
+//	body.model "zai_glm-5.3-flash" + header zai_glm-5.3-flash  -> 406
+//
+// The 406 is the same empty-body refusal the prompt gate uses, which is why the
+// wrong model id first read as a prompt problem.
+func bodyModelFor(cr *Creds, modelID string) string {
+	if cr != nil && cr.Region == realmOverseas {
+		return bareModelName(modelID)
+	}
+	return modelID
+}
+
+// bareModelName strips the routing prefix a route id carries, turning
+// "zai_glm-5.3-flash" into "glm-5.3-flash". Ids without a known prefix are
+// returned unchanged.
+func bareModelName(id string) string {
+	m := strings.TrimSpace(id)
+	for _, p := range []string{"zai_", "zaicoding_", "tdpsk_"} {
+		if strings.HasPrefix(m, p) {
+			return strings.TrimPrefix(m, p)
+		}
+	}
+	return m
+}
+
 // chatManaged performs one call on the CN managed gateway.
 func (d *Driver) chatManaged(ctx context.Context, cr *Creds, body []byte, modelID string) (*http.Response, error) {
-	wire, err := managedBody(body, modelID)
+	wire, err := managedBody(body, bodyModelFor(cr, modelID))
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "autoclaw managed body: %v", err)
 	}
@@ -310,11 +441,16 @@ func (d *Driver) chatManaged(ctx context.Context, cr *Creds, body []byte, modelI
 	if secret == "" {
 		return nil, uperr.New(uperr.ClassInternal, 0, "autoclaw: channels.autoclaw.app_secret is not configured")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.base()+managedChatPath, bytes.NewReader(wire))
+	overseas := cr.Region == realmOverseas
+	host, path := d.base(), managedChatPath
+	if overseas {
+		host, path = overseasHost, overseasChatPath
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+path, bytes.NewReader(wire))
 	if err != nil {
 		return nil, err
 	}
-	req.Header = managedChatHeaders(cr.bearer(), secret, modelID)
+	req.Header = managedChatHeadersFor(cr.bearer(), secret, modelID, overseas)
 	resp, err := d.http.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "autoclaw managed: %v", err)
@@ -408,8 +544,15 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "autoclaw: %v", err)
 	}
-	if cr.Region != "" && cr.Region != "cn" {
-		return nil, uperr.New(uperr.ClassBadRequest, 400, "autoclaw: region %q is not supported (cn only)", cr.Region)
+	// Two lanes are supported and they are separate credential universes: the
+	// CN acceleration gateway and the overseas 1.x gateway. An unknown region
+	// is refused rather than silently sent to the CN host, because a wrong
+	// lane answers 401 "Invalid token" and reads as a dead account.
+	switch cr.Region {
+	case "", "cn", realmOverseas:
+	default:
+		return nil, uperr.New(uperr.ClassBadRequest, 400,
+			"autoclaw: region %q is not supported (cn | global)", cr.Region)
 	}
 	if needsRefresh(cr) && cr.RefreshToken != "" {
 		// Refresh failure is not fatal while the current token is still valid;
@@ -684,7 +827,7 @@ func (d *Driver) refresh(ctx context.Context, acc *model.Account, cr *Creds) err
 		"device_id":     cr.DeviceID,
 		"refresh_token": stripBearer(cr.RefreshToken),
 	}
-	if err := d.userapiCall(ctx, http.MethodPost, refreshPath, cr.bearer(), body, &data); err != nil {
+	if err := d.userapiCallFor(ctx, http.MethodPost, refreshPath, cr.bearer(), body, &data, cr.Region == realmOverseas); err != nil {
 		return err
 	}
 	if data.AccessToken == "" {
@@ -707,7 +850,7 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	var data struct {
 		TotalBalance json.Number `json:"total_balance"`
 	}
-	if err := d.userapiCall(ctx, http.MethodGet, walletsPath, cr.bearer(), nil, &data); err != nil {
+	if err := d.userapiCallFor(ctx, http.MethodGet, walletsPath, cr.bearer(), nil, &data, cr.Region == realmOverseas); err != nil {
 		return nil, err
 	}
 	points, _ := data.TotalBalance.Int64()
@@ -721,7 +864,7 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 		Points any    `json:"expiring_points"`
 		Text   string `json:"expiring_points_text"`
 	}
-	if err := d.userapiCall(ctx, http.MethodGet, "/agent-assetmgr/api/v1/points/expiring", cr.bearer(), nil, &exp); err == nil {
+	if err := d.userapiCallFor(ctx, http.MethodGet, "/agent-assetmgr/api/v1/points/expiring", cr.bearer(), nil, &exp, cr.Region == realmOverseas); err == nil {
 		credits.Expiring = toInt64Any(exp.Points)
 	}
 	note := "points refreshed"
@@ -831,6 +974,14 @@ func (d *Driver) Login(ctx context.Context, phone, code, label string) (*model.A
 
 // userapiCall performs one signed userapi request and unwraps {code,msg,data}.
 func (d *Driver) userapiCall(ctx context.Context, method, path, token string, body any, out any) error {
+	return d.userapiCallFor(ctx, method, path, token, body, out, false)
+}
+
+// userapiCallFor is userapiCall with an explicit lane. The two credential
+// universes do not share an identity API either: an overseas token against the
+// CN host answers 410000 "session dead", which reads as an expired login. The
+// overseas host serves the same paths, so only the host changes.
+func (d *Driver) userapiCallFor(ctx context.Context, method, path, token string, body any, out any, overseas bool) error {
 	secret := strings.TrimSpace(d.cfg.AppSecret)
 	if secret == "" {
 		return uperr.New(uperr.ClassInternal, 0,
@@ -844,7 +995,11 @@ func (d *Driver) userapiCall(ctx context.Context, method, path, token string, bo
 		}
 		rd = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, d.base()+path, rd)
+	host := d.base()
+	if overseas {
+		host = overseasHost
+	}
+	req, err := http.NewRequestWithContext(ctx, method, host+path, rd)
 	if err != nil {
 		return err
 	}

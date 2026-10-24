@@ -168,6 +168,7 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /panel/api/accounts/zcode/poll", p.authed(p.handleZcodePoll, false))
 	mux.HandleFunc("POST /panel/api/accounts/autoclaw/sendcode", p.authed(p.handleAutoClawSendCode, true))
 	mux.HandleFunc("POST /panel/api/accounts/autoclaw/login", p.authed(p.handleAutoClawLogin, true))
+	mux.HandleFunc("POST /panel/api/accounts/autoclaw/import-local", p.authed(p.handleAutoClawImportLocal, true))
 	mux.HandleFunc("POST /panel/api/accounts/qoder/pat", p.authed(p.handleQoderPAT, true))
 	mux.HandleFunc("POST /panel/api/accounts/lobster/start", p.authed(p.handleLobsterStart, true))
 	mux.HandleFunc("GET /panel/api/accounts/lobster/poll", p.authed(p.handleLobsterPoll, false))
@@ -183,6 +184,12 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/api/service/autostart", p.authed(p.handleServiceAutostart, true))
 	mux.HandleFunc("POST /panel/api/service/watchdog", p.authed(p.handleServiceWatchdog, true))
 	mux.HandleFunc("POST /panel/api/config/dynamic", p.authed(p.handleRestartParams, true))
+	// Settings transfer (BP-103): export/import the tuned settings bundle.
+	mux.HandleFunc("GET /panel/api/settings/export", p.authed(p.handleSettingsExport, false))
+	mux.HandleFunc("POST /panel/api/settings/import", p.authed(p.handleSettingsImport, true))
+	// WorkBuddy registration (BP-105): one button → gateway models into the
+	// local WorkBuddy desktop app.
+	mux.HandleFunc("POST /panel/api/workbuddy/register", p.authed(p.handleWorkBuddyRegister, true))
 	mux.HandleFunc("GET /panel/api/usage", p.authed(p.handleUsage, false))
 	mux.HandleFunc("GET /panel/api/opencodezen", p.authed(p.handleZenState, false))
 	mux.HandleFunc("POST /panel/api/opencodezen", p.authed(p.handleZenManage, true))
