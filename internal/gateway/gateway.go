@@ -205,7 +205,23 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	firstEvent := false
 	seen := func(ev ir.StreamEvent) error {
 		ledger.record(ev)
-		firstEvent = true
+		// Only CLIENT-VISIBLE content counts as "the client has seen part of
+		// the answer" (BP-118). Usage and the terminal event are bookkeeping:
+		// an upstream that sends usage (or an empty done) and then dies has
+		// produced nothing the client can read, so both remedies must stay
+		// available — the cross-channel cascade (needs emitted()==false) and
+		// the same-account continuation (needs text on the ledger).
+		//
+		// Field 2026-10-26 01:02: a workbuddy leg died with "stream read:
+		// unexpected EOF" at 27s having emitted only bookkeeping. firstEvent
+		// was already true, so the cascade was refused; the ledger had no
+		// text, so canContinue() refused too. The request failed with both
+		// escape hatches shut, while the same conversation answered 200 on the
+		// same channel seconds before and after.
+		switch ev.Kind {
+		case ir.EvText, ir.EvThinking, ir.EvToolStart, ir.EvToolArgs:
+			firstEvent = true
+		}
 		return emit(ev)
 	}
 	emitted := func() bool { return firstEvent }
@@ -383,7 +399,27 @@ func estimatePromptTokens(req *ir.ChatRequest) int {
 // AutoClaw keeps its own longer ceiling through channels.autoclaw.first_byte_window
 // (90s): its relay genuinely prefills for minutes on large contexts, and it
 // sits last in every route, so its window is never multiplied by a cascade.
-const fbWindowCeiling = 30 * time.Second
+//
+// BP-118: the flat 30s cap was rejecting requests that WOULD have answered.
+// A 33万-token prompt spent 31.9s in workbuddy prefill and returned 200
+// (2026-10-26 00:50:21); minutes later the same shape was cancelled at
+// exactly 30.000s. The formula already widens with context (base + 2k
+// tokens/s), so the CAP — not the formula — was doing the rejecting.
+//
+// The default cap is now 60s: enough for roughly a 1M-token prefill at the
+// same 2k/s rate, while a five-leg cascade still costs at most 5 minutes
+// (the 90s value it replaced allowed 7.5). Explicit per-channel and global
+// settings are still honoured exactly as configured — an operator who set a
+// number meant it.
+//
+// Note the cheap legs bound the cascade in practice: a prompt too big for a
+// channel fails in milliseconds there (trae's 262144 tool ceiling rejects in
+// 0s, the lobster byte gate in 18ms), so only the legs that can actually
+// serve the request ever spend their window.
+const (
+	fbWindowCeiling     = 60 * time.Second
+	fbWindowCeilingHard = 120 * time.Second
+)
 
 // fbCeiling returns the first-byte window ceiling for one channel, most
 // specific first: channel_first_byte_windows[channel] → legacy

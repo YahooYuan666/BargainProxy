@@ -362,9 +362,13 @@ func Default() *Config {
 		FallbackWait: Duration(8 * time.Second),
 		// BP-115: 90s → 30s. The window is spent per binding, so a five-pool
 		// cascade could hold a client for 7.5 minutes before the first byte.
-		// 30s bounds a full cascade at 2.5 min; AutoClaw keeps its own longer
-		// ceiling via channels.autoclaw.first_byte_window.
-		FirstByteWindow: Duration(30 * time.Second),
+		// 30s bounded that at 2.5 min, but it also cancelled requests that
+		// would have answered: a 33万-token prefill measured 31.9s and the
+		// next one was cut at exactly 30.000s (BP-118, 2026-10-26). 60s covers
+		// roughly a 1M-token prefill at the same 2k-token/s rate and bounds a
+		// five-leg cascade at 5 minutes. AutoClaw keeps its own longer ceiling
+		// via channels.autoclaw.first_byte_window.
+		FirstByteWindow: Duration(60 * time.Second),
 		// One account per pool at a time: the anti-risk-control default
 		// (2026-10-20). Explicitly setting false restores multi-account
 		// concurrency within a pool.
