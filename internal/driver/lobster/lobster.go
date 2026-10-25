@@ -217,6 +217,23 @@ func classifyCode(code int, message string) *uperr.Error {
 	return uperr.New(uperr.ClassBadRequest, 400, "lobster: %s", message)
 }
 
+// saidOrStatus renders what the upstream said, and — when it said NOTHING —
+// the HTTP status instead.
+//
+// A 5xx with an EMPTY body is a real shape here (field 2026-10-25: six legs
+// logged `class=transport: lobster: ` with nothing after the colon). The
+// status was in ue.Status the whole time, but the log line only prints the
+// message, so "upstream returned 500 and said nothing" and "upstream returned
+// 502 and said nothing" were indistinguishable from the logs — which is why
+// the first question on every one of these is "what did the upstream actually
+// answer?". An empty body is information; print it as such.
+func saidOrStatus(status int, body []byte) string {
+	if s := strings.TrimSpace(truncate(body, 300)); s != "" {
+		return s
+	}
+	return fmt.Sprintf("empty response body (HTTP %d)", status)
+}
+
 // classifyHTTP maps a non-200 transport status.
 func classifyHTTP(status int, body []byte) *uperr.Error {
 	// A business envelope may ride a non-200 status; the code is authoritative.
@@ -224,26 +241,27 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	if json.Unmarshal(body, &env) == nil && env.Code != 0 {
 		return uperr.WithFields(classifyCode(env.Code, orElse(env.Message, truncate(body, 300))), body)
 	}
+	said := saidOrStatus(status, body)
 	switch {
 	case status == 401:
-		return uperr.WithFields(uperr.New(uperr.ClassAuth, status, "lobster: %s", truncate(body, 300)), body)
+		return uperr.WithFields(uperr.New(uperr.ClassAuth, status, "lobster: %s", said), body)
 	case status == 403:
 		if uperr.IsEdgeBlock(body) {
-			return uperr.WithFields(uperr.EdgeBlocked(status, "lobster: edge blocked: %s", truncate(body, 300)), body)
+			return uperr.WithFields(uperr.EdgeBlocked(status, "lobster: edge blocked: %s", said), body)
 		}
-		return uperr.WithFields(uperr.New(uperr.ClassWAF, status, "lobster: %s", truncate(body, 300)), body)
+		return uperr.WithFields(uperr.New(uperr.ClassWAF, status, "lobster: %s", said), body)
 	case status == 429:
-		return uperr.WithFields(uperr.New(uperr.ClassSoftRate, status, "lobster: %s", truncate(body, 300)), body)
+		return uperr.WithFields(uperr.New(uperr.ClassSoftRate, status, "lobster: %s", said), body)
 	case status == 402:
-		return uperr.WithFields(uperr.New(uperr.ClassHardCredit, status, "lobster: %s", truncate(body, 300)), body)
+		return uperr.WithFields(uperr.New(uperr.ClassHardCredit, status, "lobster: %s", said), body)
 	case status == 404:
-		return uperr.WithFields(uperr.New(uperr.ClassNotFound, status, "lobster: %s", truncate(body, 300)), body)
+		return uperr.WithFields(uperr.New(uperr.ClassNotFound, status, "lobster: %s", said), body)
 	case status == 400:
-		return uperr.WithFields(uperr.New(uperr.ClassBadRequest, status, "lobster: %s", truncate(body, 300)), body)
+		return uperr.WithFields(uperr.New(uperr.ClassBadRequest, status, "lobster: %s", said), body)
 	case status >= 500:
-		return uperr.WithFields(uperr.New(uperr.ClassTransport, status, "lobster: %s", truncate(body, 300)), body)
+		return uperr.WithFields(uperr.New(uperr.ClassTransport, status, "lobster: %s", said), body)
 	default:
-		return uperr.WithFields(uperr.New(uperr.ClassInternal, status, "lobster: %s", truncate(body, 300)), body)
+		return uperr.WithFields(uperr.New(uperr.ClassInternal, status, "lobster: %s", said), body)
 	}
 }
 

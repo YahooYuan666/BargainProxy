@@ -251,8 +251,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // execute runs gw.Execute with an attempt Trace attached and folds the
 // cascade trail onto the log row afterwards (success or failure) — BP-38.
-// On failure the last attempted channel is recorded so error rows stop
-// showing an empty channel column.
+// On failure the last attempted channel AND account are recorded so error rows
+// stop showing empty channel/account columns (account attribution added by
+// BP-107: without it "which account dropped this connection?" was answerable
+// only by guessing from the upstream IP inside the error text).
 func (s *Server) execute(r *http.Request, req *ir.ChatRequest, emit func(ir.StreamEvent) error, logRow *model.RequestLog) (*gateway.Result, error) {
 	tr := &gateway.Trace{}
 	res, err := s.gw.Execute(gateway.WithTrace(r.Context(), tr), req, emit)
@@ -262,6 +264,10 @@ func (s *Server) execute(r *http.Request, req *ir.ChatRequest, emit func(ir.Stre
 		if err != nil && logRow.Channel == "" {
 			logRow.Channel = tr.Channels[len(tr.Channels)-1]
 		}
+	}
+	if err != nil && logRow.AccountID == "" && tr.LastAccount != nil {
+		logRow.AccountID = tr.LastAccount.ID
+		logRow.AccountLabel = accountLabel(tr.LastAccount)
 	}
 	return res, err
 }

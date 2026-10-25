@@ -49,6 +49,11 @@ type business struct {
 	ID      string `json:"id"`
 	Name    string `json:"name"`
 	BeginAt any    `json:"begin_at"`
+	// Stage is the official client's task lifecycle: "start" on the first
+	// call of a task, "processing" afterwards (qoder-agent-sdk
+	// AgentLifecycle). Omitted (empty) keeps the previous wire shape, so
+	// tests pinning the old body still pass until the aggregation lands.
+	Stage string `json:"stage,omitempty"`
 }
 
 // chatRequestBody 网关 chat 请求体（字段顺序对齐官方客户端模板）。
@@ -107,6 +112,10 @@ type contentPart struct {
 	Type     string        `json:"type"`
 	ImageURL *imageURLPart `json:"image_url,omitempty"`
 	Text     string        `json:"text,omitempty"`
+	// CacheControl is the official client's per-block cache mark
+	// ({"type":"ephemeral"}); set on the last block of the last user message
+	// by markQoderCache (BP-111).
+	CacheControl map[string]string `json:"cache_control,omitempty"`
 }
 
 type normalizedToolCall struct {

@@ -58,6 +58,12 @@ type Result struct {
 type Trace struct {
 	Attempts int
 	Channels []string
+	// LastAccount is the account of the most recent leg, success or failure.
+	// Recorded so a FAILED request still names an account in the log: the
+	// request row is built from the Result on success, and a failed turn used to
+	// end up with an empty account column, leaving "which account dropped this
+	// connection?" unanswerable (BP-107 field report, 2026-10-24).
+	LastAccount *model.Account
 }
 
 type traceKey struct{}
@@ -191,8 +197,14 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	// (account rotation or another binding) would duplicate the output, so
 	// cascading stops once it is set (tickets 27/28). Buffered requests keep
 	// cascading — nothing reaches the client before the very end.
+	// BP-107: the ledger records exactly what the client has seen, which is
+	// what a mid-stream continuation has to replay. Recording happens HERE,
+	// inside the sentinel guard's flush target, so text the guard is still
+	// buffering (and may drop as a rejection) is never counted as delivered.
+	ledger := &streamLedger{}
 	firstEvent := false
 	seen := func(ev ir.StreamEvent) error {
+		ledger.record(ev)
 		firstEvent = true
 		return emit(ev)
 	}
@@ -219,6 +231,13 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		if busy, who := g.pool.ChannelBusy(binding.Channel); busy {
 			busyCount++
 			lastErr = concurrencyError(binding.Channel, who)
+			// The skip must leave a name in the trace (BP-110): a binding
+			// skipped for being busy otherwise vanishes from attempt_channels,
+			// and "why didn't it use workbuddy? it was fine" becomes
+			// unanswerable — the pool WAS considered, it was full (field
+			// 2026-10-25 14:56: one conversation's own earlier requests held
+			// every slot, the chain read trae→lobster with no workbuddy at all).
+			tr.note(binding.Channel)
 			continue
 		}
 		// Pre-flight mirrors the single-active rule: if this pool is already
@@ -254,6 +273,10 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 				lastErr = g.classifyPoolError(&pool.ErrNoCapacity{
 					Channel: binding.Channel, EarliestReset: earliest,
 				}, binding.Channel, req.Model)
+				// Same as the busy skip above: a binding skipped in pre-flight
+				// must still be named in the trace (BP-110), or the chain lies
+				// by omission about what was considered.
+				tr.note(binding.Channel)
 				continue
 			}
 		}
@@ -266,7 +289,7 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// waiting for a slot and cascaded without the upstream ever seeing it.
 		guardSeen := sentinelGuard(seen, g.cfg.Sentinels)
 		attempted = true
-		res, err := g.executeBinding(bctx, binding, req, guardSeen, win, bi > 0, emitted, tr)
+		res, err := g.executeBinding(bctx, binding, req, guardSeen, win, bi > 0, emitted, tr, ledger)
 		if err == nil {
 			return res, nil
 		}
@@ -424,7 +447,7 @@ func skipUnavailable(ok bool, earliest, now time.Time, window time.Duration) boo
 	return earliest.Sub(now) > window
 }
 
-func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, req *ir.ChatRequest, emit driver.Emit, window time.Duration, degraded bool, emitted func() bool, tr *Trace) (*Result, error) {
+func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, req *ir.ChatRequest, emit driver.Emit, window time.Duration, degraded bool, emitted func() bool, tr *Trace, ledger *streamLedger) (*Result, error) {
 	drv, ok := g.drivers[binding.Channel]
 	if !ok {
 		return nil, uperr.New(uperr.ClassInternal, 0, "channel %q driver not installed", binding.Channel)
@@ -463,6 +486,10 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			return nil, cerr
 		}
 		call := driver.ChatCall{Account: lease.Account, UpstreamModel: binding.UpstreamModel, Request: req}
+		// Remember whose leg this is, so a failure can still be attributed.
+		if tr != nil {
+			tr.LastAccount = lease.Account
+		}
 		// First-byte window (ticket 28): bounds the wait for this attempt to
 		// START answering — not the whole generation. Timer starts HERE, after
 		// the lease, and is stopped by the first emitted event (the sentinel
@@ -503,9 +530,64 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				}
 			}
 		}
+		// BP-107 mid-stream continuation: the client has already seen part of
+		// the answer and the upstream dropped the connection. Switching channel
+		// is off the table (it would replay the whole turn), so carry on with
+		// the SAME account: replay what the client saw as an assistant turn,
+		// add a "carry on" instruction, and splice the new events into the same
+		// stream. See continue.go for why each guard exists.
+		//
+		// Streaming only: a buffered client has nothing on the wire, so the
+		// ordinary cross-channel cascade is strictly better than re-asking the
+		// same account.
+		contSegs := 0
+		for streamErr != nil && req.Stream && ctx.Err() == nil && contSegs < continueMaxSegments {
+			ue, _ := uperr.As(streamErr)
+			class := uperr.ClassInternal
+			if ue != nil {
+				class = ue.Class
+			}
+			if !ledger.canContinue(class, contSegs) {
+				break
+			}
+			contSegs++
+			log.Printf("gateway: %s stream dropped after %s (%s); continuing on the same account (segment %d/%d, %d chars replayed)",
+				binding.Channel, time.Since(started).Round(time.Millisecond), class,
+				contSegs, continueMaxSegments, ledger.text.Len())
+			var contResp *ir.ChatResponse
+			contResp, streamErr = drv.Stream(actx, driver.ChatCall{
+				Account: lease.Account, UpstreamModel: binding.UpstreamModel,
+				Request: continuationRequest(req, ledger),
+			}, attemptEmit)
+			if streamErr == nil {
+				resp = mergedResponse(ledger, contResp)
+			}
+		}
 		elapsed := time.Since(started)
 		if cancel != nil {
 			cancel()
+		}
+		// Starved-thinking rescue (BP-112): a turn that spent its WHOLE output
+		// budget on reasoning (finish=length, no text, no tools, no surfaced
+		// thinking) gets ONE retry with thinking off at the SAME budget. The
+		// retry reclaims the budget FROM thinking; raising it would overspend
+		// what the client asked. See starved.go for every guard.
+		if retryReq, starved := starvedRetryRequest(req, resp); starved {
+			log.Printf("gateway: %s turn ended finish=length with no output at max_tokens=%d — thinking consumed the budget; retrying once with thinking disabled",
+				binding.Channel, req.MaxTokens)
+			retryCall := call
+			retryCall.Request = retryReq
+			startedRetry := time.Now()
+			if retryResp, rerr := drv.Stream(actx, retryCall, attemptEmit); rerr == nil && retryResp != nil &&
+				!(retryResp.StopReason == ir.StopLength && ir.TextOf(retryResp.Message.Content) == "") {
+				resp = retryResp
+				log.Printf("gateway: starved-thinking rescue answered (stop=%s, %s)",
+					retryResp.StopReason, time.Since(startedRetry).Round(time.Millisecond))
+			} else if rerr != nil {
+				// The rescue failing is not the client's problem: the original
+				// empty answer already says finish=length honestly.
+				log.Printf("gateway: starved-thinking rescue failed (%v); returning the original answer", rerr)
+			}
 		}
 		if streamErr == nil {
 			g.pool.ApplyResult(lease.Account, req.Model, nil)
@@ -548,12 +630,26 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		// One line per failed leg: without it the log only shows the final
 		// channel's error, which is how "WorkBuddy died" rumors start. The
 		// window marker separates "our timer gave up" from an upstream error.
+		//
+		// The account is named too (BP-107): a failed leg used to log only the
+		// channel, so "which account dropped this connection?" could not be
+		// answered from the logs at all — the request row has no account on a
+		// failed request either, and the only remaining clue was the upstream IP
+		// in the error text.
 		winNote := ""
 		if window > 0 && ue.Class == uperr.ClassCanceled && ctx.Err() == nil {
 			winNote = fmt.Sprintf(" first-byte window %s expired", window)
 		}
-		log.Printf("gateway: %s leg failed after %s: class=%s%s: %.160s",
-			binding.Channel, elapsed.Round(time.Millisecond), ue.Class, winNote, ue.Message)
+		// The HTTP status is printed too (BP-110): several drivers word an
+		// upstream failure as "<channel>: <body>" and truncate the body, so a
+		// non-200 with an EMPTY body logged as `class=transport: lobster: ` —
+		// with nothing to tell a 500 from a 502, or an empty body from a
+		// driver bug that produced no message. The status is the one fact that
+		// survives every wording, so it goes in the line unconditionally
+		// (status=0 means the request never got a response).
+		log.Printf("gateway: %s account %s (%s) leg failed after %s: class=%s status=%d%s: %.160s",
+			binding.Channel, lease.Account.ID, lease.Account.Nickname,
+			elapsed.Round(time.Millisecond), ue.Class, ue.Status, winNote, ue.Message)
 		g.pool.ApplyResult(lease.Account, req.Model, ue)
 		if ue.Class == uperr.ClassAccountRestricted {
 			// Say out loud that an account just left routing: otherwise the

@@ -1568,6 +1568,23 @@ var quotaCodes = map[string]bool{"810000": true}
 // busyCodes are transient throttles: never treated as an allowance wall.
 var busyCodes = map[string]bool{"810001": true, "810002": true}
 
+// bannedCodes are the gateway's own codes for "this account is refused", as
+// opposed to "this sign-in expired". 410004 arrives as
+// {"code":410004,"message":"The account has been banned"} on every route
+// (magpie-community/plugins 0.2.5, 2026-10-22, where reading it as an expired
+// sign-in dropped the token while the user never saw why).
+var bannedCodes = map[string]bool{"410004": true}
+
+// bannedMarkers are the same refusal stated in words, for bodies without a
+// code envelope. Kept narrower than magpie's regex: each entry is an
+// account-level refusal, never a per-request rejection.
+var bannedMarkers = []string{
+	"account has been banned", "account is banned", "account was banned",
+	"account banned", "account suspended", "account is suspended",
+	"account frozen", "account disabled", "account blocked",
+	"账号异常", "账户异常", "封禁", "封号", "账号被冻结", "账号停用",
+}
+
 // codeOf pulls the gateway's business code out of a body, as a string. It
 // reads the shapes seen in the field: {"code":"810000"}, {"code":810000},
 // {"error":{"code":...}} and {"data":{"code":...}}.
@@ -1635,6 +1652,20 @@ func classify(status int, code, text, lower string) *uperr.Error {
 	switch {
 	case code == "410000":
 		return uperr.New(uperr.ClassAuth, 401, "autoclaw: session dead: %s", clipped)
+	case bannedCodes[code]:
+		// 410004 "The account has been banned" — the ACCOUNT is refused on
+		// every route, not its sign-in. Refreshing gets the same account back
+		// with the same refusal, so filing this as ClassAuth made the pool rest
+		// the account for 10 minutes, let the refresh task try, fail, and
+		// repeat forever. ClassAccountRestricted is the terminal state the pool
+		// already understands (it is what workbuddy's 403/11140 uses): the
+		// account leaves routing and the panel shows it for a human to decide.
+		//
+		// Judged by code before the 401/403 fallback, and by wording as well,
+		// because the ban is also reported without a code envelope
+		// (magpie-community/plugins 0.2.5, 2026-10-22, same code and wording).
+		return uperr.New(uperr.ClassAccountRestricted, 403,
+			"autoclaw: account banned by upstream (%s): %s", code, clipped)
 	case quotaCodes[code]:
 		// Model-scoped, not account-scoped: allowances are per route, so the
 		// error carries the model it ran out on. CooldownScope turns that into
@@ -1649,6 +1680,11 @@ func classify(status int, code, text, lower string) *uperr.Error {
 		return e
 	case hasMarker(lower, hardMarkers):
 		return uperr.New(uperr.ClassHardCredit, 402, "autoclaw: %s", clipped)
+	case hasMarker(lower, bannedMarkers):
+		// The ban also arrives without a code envelope. Judged BEFORE the
+		// dead markers: "account suspended" and "session expired" are both
+		// 401/403 shapes, and only one of them is worth a refresh.
+		return uperr.New(uperr.ClassAccountRestricted, 403, "autoclaw: account banned by upstream: %s", clipped)
 	case hasMarker(lower, deadMarkers):
 		return uperr.New(uperr.ClassAuth, 401, "autoclaw: %s", clipped)
 	case status == 402:

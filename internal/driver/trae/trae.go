@@ -67,7 +67,29 @@ const (
 )
 
 // functionsTrae is the ordered ladder; the first entry is the preferred one.
-var functionsTrae = []string{functionSOLO, "chat_v3", "solo_agent", "solo_agent_lite"}
+//
+// The last two entries were added 2026-10-25 after re-reading the catalogue we
+// captured on 2026-10-23 (research/2026-10-24-trae-dual-channel-1m.md §2.1):
+// every model publishing context_window_tokens {dev:200000, max:1000000} lists
+// itself under `fn=solo_agent_remote`, while the ladder we shipped only ever
+// asked four functions — the one the catalogue points at was never tried, so
+// "we tried every function" did not actually include it.
+//
+// `solo_coder` comes from the same reading (magpie-community/plugins 0.2.20
+// lists it beside the other four): it carries models the others do not
+// (glm-5v-turbo, kimi-k2.5, minimax-m2.7, qwen-3.6-plus).
+//
+// Both sit LAST on purpose. The ladder is only walked when a function refuses
+// with a business code (4001/4023/1005), so a new tail entry can only add a
+// fallback; it never changes which function answers a request the current
+// ladder already serves. Whether solo_agent_remote actually lifts the 262144
+// input ceiling on llm_utils_chat is NOT verified — the catalogue only says
+// which function lists those models. If it does not, the 4026 lands where it
+// lands today and the turn fails exactly as before.
+var functionsTrae = []string{
+	functionSOLO, "chat_v3", "solo_agent", "solo_agent_lite",
+	"solo_agent_remote", "solo_coder",
+}
 
 // Creds is the persisted credential shape for a trae account.
 type Creds struct {
@@ -657,15 +679,40 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			}
 			return mergeToolDeltas(ev.ToolCalls)
 		case "token_usage":
+			// Cache accounting (2026-10-25): SOLO reports the prefix-cache hit
+			// at the TOP level of token_usage as `cache_read_input_tokens`,
+			// not in the OpenAI `prompt_tokens_details.cached_tokens` slot that
+			// every other driver reads. This driver only ever decoded the three
+			// counts, so Trae's cache column read "unknown" for every request
+			// even though the upstream was reporting a hit — the channel looked
+			// like it did not publish cache data at all (misakano7545 11b57d1,
+			// 2026-10-21, reports the same field for the same surface).
+			//
+			// Both spellings are accepted so a future upstream move to the
+			// OpenAI shape keeps working. CacheKnown is set only when a field is
+			// PRESENT: an absent field means "not reported", which the panel
+			// must show as unknown rather than as a 0% hit rate (BP-53).
 			var u struct {
-				PromptTokens     int `json:"prompt_tokens"`
-				CompletionTokens int `json:"completion_tokens"`
-				ReasoningTokens  int `json:"reasoning_tokens"`
+				PromptTokens         int  `json:"prompt_tokens"`
+				CompletionTokens     int  `json:"completion_tokens"`
+				ReasoningTokens      int  `json:"reasoning_tokens"`
+				CacheReadInputTokens *int `json:"cache_read_input_tokens"`
+				PromptTokensDetails  *struct {
+					CachedTokens *int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
 			}
 			if err := json.Unmarshal([]byte(payload), &u); err != nil {
 				return nil
 			}
 			usage = ir.Usage{InputTokens: u.PromptTokens, OutputTokens: u.CompletionTokens, ReasoningTokens: u.ReasoningTokens}
+			switch {
+			case u.CacheReadInputTokens != nil:
+				usage.CachedInputTokens = *u.CacheReadInputTokens
+				usage.CacheKnown = true
+			case u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil:
+				usage.CachedInputTokens = *u.PromptTokensDetails.CachedTokens
+				usage.CacheKnown = true
+			}
 			gotUsage = true
 			return nil
 		case "done":

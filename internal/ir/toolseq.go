@@ -63,23 +63,53 @@ func MergeAdjacentToolCalls(messages []Message) ([]Message, bool) {
 // bad shapes come from real clients — a turn interrupted by a model switch, a
 // pruned tool call whose result stayed behind, results replayed out of order.
 //
+// BP-110 (2026-10-25): the first cut looked for results ONLY in the contiguous
+// run of RoleTool messages directly after the call group. A result separated
+// from its call by ANY other message — an assistant text turn replayed between
+// them — was invisible, so the call counted as orphaned and was dropped, AND
+// the real result further along was deleted as "no call in front". A complete
+// valid pair was erased from the history; the model then reasoned over a past
+// that no longer contained a tool it had run (field: 436 requests in one day
+// lost 9,878 messages, avg 22.7/req — that is what "the model forgot its own
+// edit" was). The fix: collect result ids from the WHOLE remaining history
+// first; the contiguous-run restriction stays only as the placement rule for
+// where results are emitted.
+//
 // Repairs, all local to one call/results group:
-//   - a tool message with no immediately-preceding matching call is dropped;
+//   - a tool message with no matching call anywhere ahead of it is dropped;
 //   - duplicate results for one call id are dropped (first wins);
-//   - a call with no result is removed from its assistant turn;
-//   - results are reordered to the call order;
+//   - a call with no result anywhere is removed from its assistant turn;
+//   - results are reordered to the call order and pulled up to the group;
 //   - an assistant turn left with no content and no calls is dropped.
 //
 // Valid histories pass through unchanged (changed=false, same slice).
 func RepairToolPairing(messages []Message) ([]Message, bool) {
 	out := make([]Message, 0, len(messages))
 	changed := false
+	// Every tool result id in the history, in first-appearance order. A call
+	// matches against this, not against the contiguous run: the client may
+	// replay an assistant text turn (or anything else) between the call and
+	// its result (BP-110).
+	allResults := map[string]Message{}
+	for _, m := range messages {
+		if m.Role == RoleTool && m.ToolCallID != "" {
+			if _, dup := allResults[m.ToolCallID]; !dup {
+				allResults[m.ToolCallID] = m
+			} else {
+				changed = true // duplicate result somewhere in the history
+			}
+		}
+	}
 	for i := 0; i < len(messages); {
 		m := messages[i]
 		if m.Role != RoleAssistant || len(m.ToolCalls) == 0 {
 			if m.Role == RoleTool {
-				// Only a call group may own tool results; this one has no call
-				// group in front of it.
+				// Emit results exactly once, at their original position, when
+				// their call group sits immediately in front (the normal
+				// shape). Results that appear WITHOUT their call group ahead
+				// are dropped below via the global map: their call either
+				// exists elsewhere (already emitted there) or does not exist
+				// (an orphan result).
 				changed = true
 				i++
 				continue
@@ -96,11 +126,9 @@ func RepairToolPairing(messages []Message) ([]Message, bool) {
 		results := messages[i+1 : j]
 		byID := map[string]Message{}
 		for _, r := range results {
-			if _, dup := byID[r.ToolCallID]; dup {
-				changed = true
-				continue
+			if _, dup := byID[r.ToolCallID]; !dup {
+				byID[r.ToolCallID] = r
 			}
-			byID[r.ToolCallID] = r
 		}
 		var keptCalls []ToolCall
 		var keptResults []Message
@@ -112,8 +140,17 @@ func RepairToolPairing(messages []Message) ([]Message, bool) {
 			}
 			r, ok := byID[c.ID]
 			if !ok {
-				changed = true // orphan call: no result was ever produced
-				continue
+				// Not in the contiguous run — but the result may still exist
+				// further along (BP-110). Only a call with NO result anywhere
+				// is an orphan.
+				var missing bool
+				r, missing = allResults[c.ID]
+				if missing {
+					changed = true // found late: pull it up beside its call
+				} else {
+					changed = true // orphan call: no result was ever produced
+					continue
+				}
 			}
 			seen[c.ID] = true
 			keptCalls = append(keptCalls, c)

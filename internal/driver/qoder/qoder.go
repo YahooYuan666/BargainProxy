@@ -131,6 +131,10 @@ type runtime struct {
 	refreshedAt   time.Time
 	bootstrapped  bool
 	sess          *sessionContext
+	// sessions carries the BP-111 aggregation state: stable per-conversation
+	// session ids and per-turn task tuples. Lives per account with the rest
+	// of the runtime.
+	sessions *sessionTable
 
 	bearerTok   string
 	bearerExpMs int64
@@ -646,15 +650,33 @@ func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCata
 	}
 	b.ModelConfig.IsReasoning = reasoningOn
 	b.ChatContext.Extra.ModelConfig.IsReasoning = reasoningOn
-	b.Business.ID = newUUID()
-	b.Business.BeginAt = time.Now().UnixMilli()
 
 	prompt := extractLatestUserPrompt(messages)
 	b.ChatContext.Text.Text = prompt
 	b.ChatContext.Extra.OriginalContent.Text = prompt
-	b.Business.Name = truncateRunes(prompt, 30)
+	// BP-111 task aggregation: the whole user turn (its tool loop included)
+	// shares ONE (request_set_id, business.id, begin_at, stage) tuple, the way
+	// the official client sends it. A fresh tuple per wire call made 50 tool
+	// round-trips read upstream as 50 tasks; the aggregate counts task heads,
+	// and "Billing daily count exceeded" arrives sooner the more of them a
+	// session creates (magpie 0.2.31, live). request_id/chat_record_id stay
+	// per-request — they name THIS wire call, and the queue protocol keys its
+	// resends on request_set_id, which now carries the task identity too (a
+	// queued resend of the same turn rejoining its own task is correct).
+	seed := call.Request.SessionKey
+	if seed == "" {
+		seed = sessionSeedOf(messages)
+	}
+	b.SessionID = rt.sessions.sessionIDFor(seed)
+	task, stage := rt.sessions.taskFor(turnFingerprint(seed, prompt), taskNameFor(prompt), time.Now())
+	b.RequestSetID = task.id
+	b.Business.ID = task.id
+	b.Business.BeginAt = task.begin
+	b.Business.Name = task.name
+	b.Business.Stage = stage
 	toolsEnabled := applyToolConfig(b, payload)
 	b.Messages = buildQoderMessages(messages, prompt, toolsEnabled)
+	markQoderCache(b.Messages)
 
 	hasImages := false
 	for _, m := range messages {
@@ -794,7 +816,7 @@ func (d *Driver) runtimeFor(acc *model.Account) (*runtime, error) {
 		acc.CredsJSON = c.Marshal()
 		acc.CredsDirty = true
 	}
-	rt := &runtime{creds: *c}
+	rt := &runtime{creds: *c, sessions: newSessionTable()}
 	d.rt[acc.ID] = rt
 	return rt, nil
 }
