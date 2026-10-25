@@ -238,6 +238,11 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		// (user report 2026-10-16 14:11: two 400s with no server-side trace).
 		log.Printf("antigravity: upstream error status=%d model=%s account=%s body=%s",
 			resp.StatusCode, call.UpstreamModel, acc.ID, truncate(raw, 500))
+		// Optional: write the request we actually sent beside the answer, so a
+		// generic upstream rejection ("Request contains an invalid argument",
+		// which names no field) can be diffed against a hand-built request that
+		// answers 200. Off unless channels.antigravity.dump_dir is set.
+		d.dumpFailure(acc.ID, call.UpstreamModel, resp.StatusCode, body, raw)
 		ue := classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
 		// Experimental replay (BP-44) can go stale — the account switched, the
 		// model changed, or the upstream expired the signature. The experiment
@@ -264,6 +269,13 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	body2 := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer body2.Close()
 
+	// Diagnosis aid (BP-115): with channels.antigravity.dump_ok set, also keep
+	// the requests that WORKED, so a failing body can be diffed against a
+	// passing one. Without this the dump only ever shows failures, and the
+	// difference — the whole question — stays invisible.
+	if d.cfg.DumpOK && d.cfg.DumpDir != "" {
+		d.dumpFailure(acc.ID, call.UpstreamModel, resp.StatusCode, body, []byte("(200; stream not captured)"))
+	}
 	return d.parseSSE(ctx, body2, call, emit)
 }
 

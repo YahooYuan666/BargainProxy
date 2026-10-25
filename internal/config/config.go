@@ -125,6 +125,22 @@ type AntigravitySettings struct {
 	GoogleOAuthClientID     string `json:"google_oauth_client_id"`
 	GoogleOAuthClientSecret string `json:"google_oauth_client_secret"`
 	MaxInFlight             int    `json:"max_in_flight"` // default 3
+	// DumpDir, when non-empty, writes one self-contained file per FAILED chat
+	// request: the exact body we sent plus the upstream's raw answer (BP-115).
+	// Empty = off, because a body contains the user's prompts. This exists
+	// because the upstream's generic "Request contains an invalid argument"
+	// names no field, and every shape rebuilt by hand answers 200 (probed
+	// 2026-10-25 with tools, 500 tool round-trips, and signature replay), so
+	// the difference lives in the real request and nowhere else.
+	DumpDir string `json:"dump_dir"`
+	// DumpMaxBytes caps the outbound slice per file (default 262144). Long
+	// sessions put the interesting part hundreds of messages in, and a small
+	// cap truncates exactly what is worth reading.
+	DumpMaxBytes int `json:"dump_max_bytes"`
+	// DumpOK also writes SUCCESSFUL requests. Diagnostic only: the point is to
+	// diff a working request against a failing one when the upstream's answer
+	// names no field. Off by default (a body is a user's whole conversation).
+	DumpOK bool `json:"dump_ok"`
 }
 
 // WorkBuddySettings configures the Tencent CodeBuddy channel.
@@ -342,9 +358,13 @@ func Default() *Config {
 				ClientCapabilities: "kimi-k3-agentic-v1,thinking-level-control-v1",
 			},
 		},
-		MaxQueueWait:    Duration(120 * time.Second),
-		FallbackWait:    Duration(8 * time.Second),
-		FirstByteWindow: Duration(90 * time.Second),
+		MaxQueueWait: Duration(120 * time.Second),
+		FallbackWait: Duration(8 * time.Second),
+		// BP-115: 90s → 30s. The window is spent per binding, so a five-pool
+		// cascade could hold a client for 7.5 minutes before the first byte.
+		// 30s bounds a full cascade at 2.5 min; AutoClaw keeps its own longer
+		// ceiling via channels.autoclaw.first_byte_window.
+		FirstByteWindow: Duration(30 * time.Second),
 		// One account per pool at a time: the anti-risk-control default
 		// (2026-10-20). Explicitly setting false restores multi-account
 		// concurrency within a pool.

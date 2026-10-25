@@ -946,6 +946,19 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		//
 		// Everything else keeps the old account-wide behaviour: a plain balance
 		// is spent for every model at once.
+		//
+		// BP-116: a quota wall carrying a business CODE but naming no model now
+		// rests the model of THIS request instead of the whole account. Field
+		// evidence 2026-10-25: an AutoClaw account showed "0 points, cooling to
+		// 04:00 next morning" whose only stated reason was a per-model 810000
+		// wall that had expired three days earlier (zaicoding_glm-5.3, until
+		// 10-23 14:40). The account-wide fallback had turned one route's
+		// exhausted free allowance into "the whole account is broke until 4am".
+		// An account-wide balance exhaustion arrives as a plain 402 with NO
+		// business code, and still takes the account path below.
+		if upstreamErr.Model == "" && upstreamErr.Code != "" && model != "" {
+			upstreamErr.Model = model
+		}
 		if upstreamErr.Model != "" {
 			reason := "out of credit"
 			if upstreamErr.Code != "" {

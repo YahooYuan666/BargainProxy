@@ -99,6 +99,15 @@ func ParseMessagesRequest(body []byte) (*ir.ChatRequest, error) {
 	// downstream channels never see double-user turns).
 	req.Messages = mergeAdjacent(req.Messages)
 	capToolResultImages(req.Messages, maxToolResultImages)
+	// Anthropic's tool_result block carries only tool_use_id — no name. Every
+	// downstream channel that re-emits Gemini functionResponse (antigravity)
+	// or a tool name needs it, and without it the driver fell back to the
+	// literal "tool", producing a result that answers a call named "tool"
+	// while the call was named e.g. "Bash". The upstream rejects that pairing
+	// with a bare "Request contains an invalid argument" (field 2026-10-25:
+	// the subagent request, dumped at 00:02, carried
+	// functionCall.name=Bash next to functionResponse.name=tool).
+	fillToolResultNames(req.Messages)
 
 	for _, t := range w.Tools {
 		req.Tools = append(req.Tools, ir.ToolDef{Name: t.Name, Description: t.Description, Parameters: t.InputSchema})
@@ -321,6 +330,39 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 // most recent five matches AIClient2API's #718 budget while still giving the
 // model the latest screenshots (BP-70).
 const maxToolResultImages = 5
+
+// fillToolResultNames copies each assistant tool call's name onto the tool
+// message that answers it (BP-116). Anthropic's wire carries only the id on a
+// tool_result, so an IR tool message built from it has no ToolName; channels
+// that speak Gemini's functionResponse need the name on BOTH sides and, with
+// an empty one, the driver substituted the literal "tool" — a result that
+// answers nothing, which the upstream rejects with an unhelpful
+// "invalid argument".
+//
+// Matching is by call id, so parallel calls and out-of-order results pair
+// correctly. A result whose call is not in this history keeps its empty name
+// (the driver's own fallback then applies, and that case really is unknown).
+func fillToolResultNames(msgs []ir.Message) {
+	names := map[string]string{}
+	for _, m := range msgs {
+		for _, c := range m.ToolCalls {
+			if c.ID != "" && c.Name != "" {
+				names[c.ID] = c.Name
+			}
+		}
+	}
+	if len(names) == 0 {
+		return
+	}
+	for i := range msgs {
+		if msgs[i].Role != ir.RoleTool || msgs[i].ToolName != "" {
+			continue
+		}
+		if n, ok := names[msgs[i].ToolCallID]; ok {
+			msgs[i].ToolName = n
+		}
+	}
+}
 
 // capToolResultImages keeps only the most recent max images across all tool
 // messages. Text blocks stay; only image parts are dropped.

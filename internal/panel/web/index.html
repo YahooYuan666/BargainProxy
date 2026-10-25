@@ -1760,15 +1760,23 @@ function renderAccounts(){
     let quota = '—', frac = null;
     if (a.credits && (a.credits.balance_only || a.credits.total > 0)){
       const expiring = a.credits.expiring ? `（将到期 ${a.credits.expiring}）` : '';
+      // BP-116: an unread balance is "未获取", never "0 点". The gateway stores
+      // remain=0 when a probe has not run yet (or the upstream's ledger read
+      // failed), and rendering that as a real zero made a funded account look
+      // broke — field 2026-10-25: an AutoClaw row read "0 点" while the
+      // account's own client showed a full allowance. UpdatedAt is the
+      // discriminator: no observation timestamp means nothing was read.
+      const creditKnown = !!(a.credits.updated_at || a.credits.updatedAt) ||
+                          (a.credits.remain > 0) || (a.credits.total > 0);
       if (a.credits.balance_only || a.channel === 'autoclaw'){
         // Balance-only pool: there is no "total", so a percentage bar would
         // always read 100% and mislead.
-        quota = `${a.credits.remain} 点` + expiring;
+        quota = creditKnown ? `${a.credits.remain} 点` + expiring : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
       } else {
-        frac = Math.max(0, Math.min(1, (a.credits.remain||0)/a.credits.total));
+        frac = creditKnown ? Math.max(0, Math.min(1, (a.credits.remain||0)/a.credits.total)) : null;
         const unit = a.channel === 'qoder' ? ' credits' : ' 分';
         const bonus = a.credits.bonus ? `（另有加赠 ${a.credits.bonus}）` : '';
-        quota = `${a.credits.remain}/${a.credits.total}${unit}` + bonus + expiring;
+        quota = creditKnown ? `${a.credits.remain}/${a.credits.total}${unit}` + bonus + expiring : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
       }
     } else if (a.windows){
       const winPct = (k, w) => {
@@ -2586,6 +2594,60 @@ setTimeout(function(){
      返回 401（showLogin）时出现。此前标记里预置 class="veil on"+hidden，
      .veil.on 的 display:flex 会压过 [hidden] 的 UA 样式，页面一加载就可见，
      脚本一旦中断就永远挂着——这正是"密码又回来了"的载体（2026-10-16）。 -->
+<script>
+/* ── BP-116: 5 秒静默刷新（对齐 agentpoints 的实时控制台）────────────────
+   参考项目 agentpoints 的前端就是 setInterval(refreshVisible, 5000) 静默
+   轮询 overview —— 账号进冷却、被限流、被封禁，屏幕自己就变了。我们的面板
+   过去只有点「刷新」才更新，所以「这个号为什么在冷却」看到的是旧画面。
+
+   这里只重取会自己变化的东西（账号状态、冷却、窗口、KPI、模型锁），
+   并就地重画。刻意不调用 refresh()：那会重写所有设置输入框、重拉日志与
+   用量、整表替换账号行——每 5 秒做一次会跟用户抢键盘、让正在读的日志
+   跳回顶部、把展开的积分详情抽屉关掉。
+
+   后台标签页不发请求；只在账号池视图生效；登录遮罩在时跳过。 */
+let silentTimer = null, silentBusy = false;
+function silentRefresh(){
+  if (silentBusy || document.hidden) return;
+  if (document.getElementById('loginVeil').classList.contains('on')) return;
+  const v = document.getElementById('view-accounts');
+  if (!v || v.hidden) return;
+  silentBusy = true;
+  api('state').then(st => {
+    const prev = allAccounts;
+    allAccounts = st.accounts || [];
+    allLocks = st.model_locks || [];
+    const byChan = {};
+    allAccounts.forEach(a => { byChan[a.channel] = (byChan[a.channel]||0)+1; });
+    renderKpis(byChan);
+    renderModelLocks();
+    renderAccounts();
+    const msg = describeAccountDelta(prev, allAccounts);
+    if (msg) toast(msg, false);
+  }).catch(() => {
+    /* 静默失败：网络抖一下不该每 5 秒弹一次错。用户点刷新时才报。 */
+  }).finally(() => { silentBusy = false; });
+}
+function describeAccountDelta(prev, next){
+  if (!Array.isArray(prev) || !Array.isArray(next)) return '';
+  const before = {};
+  prev.forEach(a => { before[a.id] = a; });
+  for (const a of next) {
+    const b = before[a.id];
+    if (!b) continue;
+    if (!!b.cooldown_until !== !!a.cooldown_until){
+      return (a.nickname||a.id) + (a.cooldown_until
+        ? ' 进入冷却：' + (cooldownLabel(a.cooldown_reason, a.cooldown_by) || '原因未知')
+        : ' 冷却已解除');
+    }
+    if (b.disabled !== a.disabled){
+      return (a.nickname||a.id) + (a.disabled ? ' 已被停用' : ' 已恢复');
+    }
+  }
+  return '';
+}
+setInterval(silentRefresh, 5000);
+</script>
 <div class="veil" id="loginVeil">
   <div class="dlg" style="width:380px">
     <header><h3>BargainProxy 控制台</h3></header>

@@ -367,11 +367,23 @@ func estimatePromptTokens(req *ir.ChatRequest) int {
 }
 
 // fbWindowCeiling is the default first-byte window cap for every channel
-// (BP-72). AutoClaw used to be the only channel with a raised cap (90s);
-// the same prefill problem hits every pool on long ZCode sessions, and a
-// saturated uplink slows the first byte for all of them, so the generous
-// default is now global. Per-channel and global overrides live in config.
-const fbWindowCeiling = 90 * time.Second
+// (BP-72).
+//
+// BP-115 lowered it 90s → 30s. The 90s value was chosen on 2026-10-18 for
+// AutoClaw's sandbox relay and then made global because "a saturated uplink
+// slows the first byte for all of them". That reasoning was sound but the
+// cost was not counted: the window is spent PER BINDING, so a request that
+// cascades through five pools could sit for 5 x 90s = 7.5 minutes before the
+// client saw anything (field 2026-10-25 23:14: attempts=5,
+// zcode→autoclaw→workbuddy→qoder→trae, 187-306s, three legs timing out on
+// the window). A slow uplink is a real cause, but the cure for "this leg will
+// never answer" must stay cheap — 30s per leg bounds a full cascade at 2.5
+// minutes.
+//
+// AutoClaw keeps its own longer ceiling through channels.autoclaw.first_byte_window
+// (90s): its relay genuinely prefills for minutes on large contexts, and it
+// sits last in every route, so its window is never multiplied by a cascade.
+const fbWindowCeiling = 30 * time.Second
 
 // fbCeiling returns the first-byte window ceiling for one channel, most
 // specific first: channel_first_byte_windows[channel] → legacy
