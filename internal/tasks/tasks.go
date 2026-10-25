@@ -1219,8 +1219,20 @@ func (s *Scheduler) checkinQoder(ctx context.Context, acc *model.Account) (strin
 // checkActivityStreak): upstream 200s are silently dropped for accounts with
 // a missing userId, so the read-back is the only truth oracle.
 func (s *Scheduler) activityWorkBuddy(ctx context.Context, acc *model.Account) (string, error) {
-	if acc.Realm == "global" {
-		return "skipped (global realm has no activity center)", nil
+	// Global accounts DO report (BP-117). This gate used to skip them under the
+	// belief that the international build has no activity system; the reference
+	// project tested it and corrected exactly that assumption (their code says
+	// so beside the same skip): /v2/report answers code=0 on workbuddy.ai and
+	// lights the streak up. Skipping it means an international account can
+	// never light its streak, and the report costs one small request per day.
+	//
+	// Enterprise accounts still skip: /v2/report returns 200 there too, but its
+	// only effect — lighting the growth streak and unlocking first_buddy — is
+	// 403 for enterprise accounts ("growth system is only available for
+	// personal users"), so the report is zero-value and only costs a request.
+	// EnterpriseID lives in the credential blob, not on the account row.
+	if cr, err := workbuddy.ParseCreds(acc.CredsJSON); err == nil && cr.EnterpriseID != "" {
+		return "skipped (enterprise account has no personal growth system)", nil
 	}
 	drv, ok := s.gw.Driver(model.ChannelWorkBuddy).(*workbuddy.Driver)
 	if !ok {
