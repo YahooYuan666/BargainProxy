@@ -714,11 +714,22 @@ type geminiBlob struct {
 }
 
 type geminiFnCall struct {
+	// ID is Antigravity's PRIVATE extension on functionCall parts (not part of
+	// the public Gemini API). Google's backend translates these Gemini-shaped
+	// contents into Anthropic messages for Claude models and fills
+	// tool_use.id from it; a missing id fails that translation with 400
+	// "messages.N.content.M.tool_use.id: Field required" (BP-114, field
+	// 2026-10-25 18:49 — the first claude-model turns with a tool history all
+	// died there). The reference carries the same field and synthesizes ids
+	// for clients that cannot know about it.
+	ID   string         `json:"id,omitempty"`
 	Name string         `json:"name"`
 	Args map[string]any `json:"args"`
 }
 
 type geminiFnResult struct {
+	// ID must pair the functionCall it answers (see geminiFnCall.ID).
+	ID       string         `json:"id,omitempty"`
 	Name     string         `json:"name"`
 	Response map[string]any `json:"response"`
 }
@@ -757,10 +768,79 @@ type v1InternalRequest struct {
 	Request     json.RawMessage `json:"request"`
 }
 
+// ensureAntigravityToolIDs backfills the private id field on functionCall /
+// functionResponse parts (BP-114). Google's Gemini→Anthropic translation for
+// Claude models requires both: tool_use.id comes from functionCall.id and
+// tool_result.tool_use_id from functionResponse.id; either missing fails the
+// whole request with 400 "messages.N.content.M.tool_use.id: Field required".
+//
+// Call ids come from the client history and are present in the normal flow;
+// the pass exists for histories that lost them (repaired pairings, foreign
+// replays). A call without an id gets a synthetic one; a result without an id
+// is paired to the most recent unanswered call OF THE SAME NAME (FIFO) — the
+// same closed-form strategy the reference uses, no cross-request state.
+func ensureAntigravityToolIDs(contents []geminiContent) {
+	// Pass 1: every call carries an id (synthetic when the history lost it).
+	for ci := range contents {
+		for pi := range contents[ci].Parts {
+			if fc := contents[ci].Parts[pi].FunctionCall; fc != nil && fc.ID == "" {
+				fc.ID = "toolu_vrtx_" + randHex(24)
+			}
+		}
+	}
+	// Pass 2: collect each name's call ids in wire order, then hand them out
+	// FIFO to that name's id-less results. Parallel calls of one name pair in
+	// appearance order — the only ordering information the wire carries.
+	queue := map[string][]string{}
+	for ci := range contents {
+		for pi := range contents[ci].Parts {
+			if fc := contents[ci].Parts[pi].FunctionCall; fc != nil && fc.Name != "" {
+				queue[fc.Name] = append(queue[fc.Name], fc.ID)
+			}
+		}
+	}
+	for ci := range contents {
+		for pi := range contents[ci].Parts {
+			fr := contents[ci].Parts[pi].FunctionResp
+			if fr == nil || fr.ID != "" || fr.Name == "" {
+				continue
+			}
+			if ids := queue[fr.Name]; len(ids) > 0 {
+				fr.ID = ids[0]
+				queue[fr.Name] = ids[1:]
+			}
+		}
+	}
+}
+
+// upstreamModelName translates a routed model id into the name the Antigravity
+// upstream actually serves (BP-113).
+// Field evidence 2026-10-25 17:17: the routes carried `gemini-claude-sonnet-4-6`
+// — a CLIENT display name borrowed from the reference project — straight onto
+// the wire. The upstream answered daily 404 "Requested entity was not found"
+// and prod 429 RESOURCE_EXHAUSTED for that name, while the SAME account, the
+// SAME payload and the bare name `claude-sonnet-4-6` answered 200 on the daily
+// host (probed across all three accounts). The accounts were never dead and
+// the quota never exhausted (the IDE shows 97% remaining): only the name was
+// wrong, and the two error shapes were both lies about it.
+//
+// The reference resolves client display names to upstream ids before sending
+// (resolveAntigravityUpstreamModel: gemini-claude-* → claude-*); this driver
+// never had that layer, and it worked from 10-16 to 10-24 only because the
+// daily host tolerated unknown names until Google tightened it.
+func upstreamModelName(model string) string {
+	if after, ok := strings.CutPrefix(model, "gemini-claude-"); ok {
+		return "claude-" + after
+	}
+	return model
+	return model
+}
+
 // buildRequest assembles the v1internal payload. replay (may be nil) resolves
 // a real thought_signature for a replayed tool call — nil or a miss falls back
 // to the documented placeholder (BP-42/BP-44).
 func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay func(callID, name string) (string, bool)) ([]byte, error) {
+	upstreamModel = upstreamModelName(upstreamModel)
 	var (
 		contents   []geminiContent
 		sysParts   []geminiPart
@@ -791,7 +871,7 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 				if args == nil {
 					args = map[string]any{}
 				}
-				part := geminiPart{FunctionCall: &geminiFnCall{Name: tc.Name, Args: args}}
+				part := geminiPart{FunctionCall: &geminiFnCall{ID: tc.ID, Name: tc.Name, Args: args}}
 				// Real signature when the experimental replay cache has one
 				// (BP-44); placeholder otherwise (never nothing — the upstream
 				// rejects a missing signature, BP-42).
@@ -822,12 +902,17 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 			if name == "" {
 				name = "tool"
 			}
+			// The result pairs its call by tool_call_id (BP-114): the upstream
+			// translation fills tool_result.tool_use_id from this field, the
+			// same way it fills tool_use.id on the call side. A result with no
+			// id gets one from the synthetic pass below.
 			contents = append(contents, geminiContent{
 				Role:  "user",
-				Parts: []geminiPart{{FunctionResp: &geminiFnResult{Name: name, Response: payload}}},
+				Parts: []geminiPart{{FunctionResp: &geminiFnResult{ID: msg.ToolCallID, Name: name, Response: payload}}},
 			})
 		}
 	}
+	ensureAntigravityToolIDs(contents)
 	for _, t := range req.Tools {
 		decl := map[string]any{"name": t.Name}
 		if t.Description != "" {
@@ -880,9 +965,12 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 		// failure AIClient2API fixed in 95e29ca. Only ever emit the camelCase
 		// form, and only the surviving branch's key (budget XOR level).
 		thinking := map[string]any{"includeThoughts": true}
-		if strings.HasPrefix(upstreamModel, "gemini-claude") {
+		if strings.HasPrefix(upstreamModel, "claude-") {
 			// Claude via antigravity bills thinking by budget; the level
-			// vocabulary is not registered there.
+			// vocabulary is not registered there. upstreamModel is already
+			// normalized at the top of this function, so the bare name is
+			// what arrives here (BP-113: the display form gemini-claude-*
+			// became claude-* before the payload was assembled).
 			if req.Thinking.BudgetTokens > 0 {
 				thinking["thinkingBudget"] = req.Thinking.BudgetTokens
 			} else if req.Thinking.Level != "" {
