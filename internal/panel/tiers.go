@@ -4,7 +4,8 @@
 // input modalities (text/image/video/audio/pdf), supported reasoning effort
 // gears, tool-call and structured-output support.
 //
-// 国模 (domestic, credit-based pools: workbuddy / trae / zcode): the billing
+// 国模 (domestic, credit-based pools: workbuddy / trae / zcode / autoclaw /
+// qoder / lobster): the billing
 // column carries the upstream model-catalog credit multiplier ("x0.79" glm-5.3
 // flagship … "x0.06" flash tier), display only — live cost tiering reads the
 // cost observer.
@@ -141,9 +142,7 @@ func tierChannel(source string) string {
 //     channel's billing text;
 //   - Trae/ZCode: glm-5.3-flash per models.dev (text+image+video+pdf).
 var routedSpecs = map[string]tierRow{
-	// Qoder 倍率取一手接口 model/list 的 price_factor（2026-10-18 核实）：
-	// GLM-5.3 0.8 / GLM-5.3-Flash 0.1 / Qwen3.8-Flash 0（免费）/
-	// Qwen3.8-Max 0.5（错峰 22:00-08:00 打 4 折）/ DeepSeek-V4-Pro 0.5 /
+	// Qoder 倍率取一手接口 model/list 的 price_factor（2026-10-18 核实；
 	// DeepSeek-Flash 0.1 / Kimi-K3 1.4。
 	"qoder|GLM-5.3":              {Billing: "x0.8", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"qoder|GLM-5.3-Flash":        {Billing: "x0.1", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
@@ -154,6 +153,22 @@ var routedSpecs = map[string]tierRow{
 	"qoder|Kimi-K3":              {Billing: "x1.4", ContextLen: 1048576, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"autoclaw|zaicoding_glm-5.3": {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 307200, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"autoclaw|glm-5.3-flash":     {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	// Lobster（有道龙虾，BP-136）：倍率取自公开价格目录
+	// GET /api/models/pricing-catalog（无需登录，2026-10-27 实测 32 个模型）。
+	// creditsPerYuan=100，inputCredits/outputCredits 即每百万 token 的 credits；
+	// DeepSeek 两档有分时计价（高峰 09:00-12:00、14:00-18:00 工作日 = 空闲 ×2），
+	// costMultiplier 即当前时段倍率。qwen3.8-max/flash 与 kimi-k3 的
+	// thinkingConfig=null：按 BP-98 结论"null=不显示入口、不发档位参数、走上游
+	// 默认"，kimi-k3 客户端固定 max。MaxOutput 沿用同族模型在 models.dev 的
+	// 规格（目录不提供该字段）。
+	"lobster|deepseek-flash":     {Billing: "x0.05 空闲 / x0.10 高峰 · ¥1/¥4 每百万", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 high）", ToolCall: true, Structured: true},
+	"lobster|deepseek-v4-pro":    {Billing: "x0.26 空闲 / x0.52 高峰 · ¥4.5/¥13.5 每百万", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "off/high/max（默认 high）", ToolCall: true, Structured: true},
+	"lobster|glm-5.3-flashx":     {Billing: "x0.15 · ¥2/¥7 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
+	"lobster|glm-5.3-flash":      {Billing: "x0.06 · ¥0.8/¥2.8 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
+	"lobster|glm-5.3":            {Billing: "x1.08 · ¥8/¥28 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
+	"lobster|qwen3.8-max":        {Billing: "x0.91 · ¥12/¥36 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "官方不开放档位（走上游默认）", ToolCall: true, Structured: true},
+	"lobster|qwen3.8-flash":      {Billing: "x0.06 · ¥0.8/¥2.7 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "官方不开放档位（走上游默认）", ToolCall: true, Structured: true},
+	"lobster|kimi-k3":            {Billing: "x1.35 · ¥20/¥100 每百万（思考固定 max）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "客户端固定 max", ToolCall: true, Structured: true},
 	// autoclaw 的 tdpsk_deepseek-* 两条已移除：CN 加速网关对本账号三个候选 id
 	// 全部回 400「非法模型」，而同刻 glm-5.3-flash 可用（2026-10-23 实测）。
 	// Trae 免费用户折扣表：glm-5.3-flash 未单列，取客户端截图 0.06x（无折扣标签）。
@@ -225,6 +240,8 @@ func tierSourceRank(source string) int {
 		return 3
 	case model.ChannelQoder:
 		return 4
+	case model.ChannelLobster:
+		return 5
 	}
 	switch {
 	case strings.HasPrefix(source, "antigravity · Gemini"):
@@ -307,6 +324,8 @@ func creditUnit(channel string) string {
 		return "credits"
 	case model.ChannelAutoClaw:
 		return "点"
+	case model.ChannelLobster:
+		return "credits"
 	}
 	return ""
 }
@@ -400,6 +419,22 @@ func (p *Panel) tierSeen() (map[string]bool, bool) {
 	return m, false
 }
 
+// tiersAdmittedChannels is the set of domestic channels whose routes may
+// appear on the 模型与档位 page (BP-136). It exists as a named function so a
+// test can pin it against the router's fleet: Lobster was routed and probed
+// from BP-98 onward yet never appeared here, and nothing failed — the page
+// just silently omitted a whole channel.
+func tiersAdmittedChannels() map[string]bool {
+	return map[string]bool{
+		model.ChannelWorkBuddy: true,
+		model.ChannelTrae:      true,
+		model.ChannelZCode:     true,
+		model.ChannelAutoClaw:  true,
+		model.ChannelQoder:     true,
+		model.ChannelLobster:   true,
+	}
+}
+
 // handleTiers serves both catalogs for the panel page. Rows outside the final
 // route table are retired (the page hides them by default, with a toggle);
 // first-seen rows are new and always shown.
@@ -409,13 +444,7 @@ func (p *Panel) handleTiers(w http.ResponseWriter, r *http.Request) {
 	for _, rt := range routes {
 		active[rt.Channel+"|"+rt.UpstreamModel] = true
 	}
-	domesticChannels := map[string]bool{
-		model.ChannelWorkBuddy: true,
-		model.ChannelTrae:      true,
-		model.ChannelZCode:     true,
-		model.ChannelAutoClaw:  true,
-		model.ChannelQoder:     true,
-	}
+	domesticChannels := tiersAdmittedChannels()
 	foreignChannels := map[string]bool{model.ChannelAntigravity: true}
 	domestic := mergeRouted(domesticCatalog(), routes, domesticChannels)
 	foreign := mergeRouted(foreignCatalog(), routes, foreignChannels)

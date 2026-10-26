@@ -458,7 +458,7 @@ tr:last-child td{border-bottom:none}
     <!-- ══ 模型与档位 ══ -->
     <section class="view" id="view-tiers" hidden>
       <div class="box">
-        <header><h3>国模（积分制渠道：WorkBuddy / Trae / ZCode / AutoClaw / Qoder）</h3>
+        <header><h3>国模（积分制渠道：WorkBuddy / Trae / ZCode / AutoClaw / Qoder / Lobster）</h3>
           <span class="grow"></span>
           <label class="chk">排序
             <select id="tiersSort" onchange="saveTierSort()" style="width:auto;margin-left:4px">
@@ -468,7 +468,7 @@ tr:last-child td{border-bottom:none}
           </label>
           <label class="chk"><input type="checkbox" id="tiersHideRetired" checked onchange="saveTiersFilter()"> 隐藏淘汰模型</label>
           <span class="note" id="tiersHiddenNote"></span>
-          <span class="note">扣分口径：WorkBuddy 按 token 倍率（分）、Qoder 按量 credits、Trae 按积分倍率、AutoClaw 按次点数、ZCode 套餐额度。倍率只在同一渠道内可比——三个渠道的 1 分 / 1 credits / 1 积分购买力不同。错峰折扣：Qoder 22:00-08:00（Qwen3.8-Max 0.5→0.2、Qwen3.7-Plus 0.1→0.04）；Trae 空闲 22:00-08:00（DeepSeek 系 5 折，付费会员 DeepSeek-V4.1-Flash 全时段 5 折）</span></header>
+          <span class="note">扣分口径：WorkBuddy 按 token 倍率（分）、Qoder 按量 credits、Trae 按积分倍率、AutoClaw 按次点数、ZCode 套餐额度、Lobster 按 token 倍率（credits，DeepSeek 系分时计价）。倍率只在同一渠道内可比——三个渠道的 1 分 / 1 credits / 1 积分购买力不同。错峰折扣：Qoder 22:00-08:00（Qwen3.8-Max 0.5→0.2、Qwen3.7-Plus 0.1→0.04）；Trae 空闲 22:00-08:00（DeepSeek 系 5 折，付费会员 DeepSeek-V4.1-Flash 全时段 5 折）</span></header>
         <div class="tbl-wrap">
           <table id="tiersDomestic"><thead><tr>
             <th>账号源</th><th>模型 ID</th><th>计费口径（上游倍率）</th><th>近 7 天实扣</th><th>上下文</th><th>最大输出</th><th>输入模态</th><th>推理档位</th><th>工具调用</th><th>结构化输出</th>
