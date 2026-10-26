@@ -103,6 +103,23 @@ type Credits struct {
 	PeakAt time.Time `json:"peak_at,omitempty"`
 }
 
+// Spendable is what the account can actually pay with (BP-134): for
+// balance-only channels the balance itself; for plan+addon channels the plan
+// remainder PLUS the add-on packs.
+//
+// Every consumer that answers "can this account still serve a billed request?"
+// must read this number, not Remain: Qoder's plan pool legitimately reads 0
+// while a +382 add-on pack sits unspent, and routing that looked only at
+// Remain benched the account for every observed-paid model while the client's
+// own usage page showed 382 remaining. The panel must lead with it too —
+// "0/300" as the headline is exactly the "为什么一直显示 0 分" complaint.
+func (c Credits) Spendable() int64 {
+	if c.BalanceOnly {
+		return c.Remain
+	}
+	return c.Remain + c.Bonus
+}
+
 // CostObservation records the observed billing tier for one (account, model)
 // pair: 0 = observed free, 1 = unknown, 2 = observed paid.
 type CostObservation struct {

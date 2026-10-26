@@ -387,7 +387,10 @@ func (p *Pool) usableForModel(a *model.Account, modelName string, now time.Time)
 // sticky path unbinds on the same predicate instead of serving a drained
 // account until upstream rejects it). Callers must hold the lock.
 func (p *Pool) floorBlockedLocked(a *model.Account, modelName string, now time.Time) bool {
-	return modelName != "" && !a.Credits.UpdatedAt.IsZero() && a.Credits.Remain <= 0 &&
+	// Spendable, not Remain (BP-134): Qoder's plan pool reads 0 while the
+	// add-on pack still holds credits; benching the account for observed-paid
+	// models there threw away exactly the pool the daily check-in feeds.
+	return modelName != "" && !a.Credits.UpdatedAt.IsZero() && a.Credits.Spendable() <= 0 &&
 		costTierLocked(a, modelName, now, p.params.CostTTL) == 2
 }
 
@@ -1789,8 +1792,8 @@ func (p *Pool) pickCreditLocked(modelName string, candidates []*model.Account, n
 	// set (upstream parity: truncation ranking and the draw share one basis).
 	var maxCredits int64
 	for _, a := range floored {
-		if a.Credits.Remain > maxCredits {
-			maxCredits = a.Credits.Remain
+		if s := a.Credits.Spendable(); s > maxCredits { // BP-134: both pools
+			maxCredits = s
 		}
 	}
 
@@ -1802,8 +1805,8 @@ func (p *Pool) pickCreditLocked(modelName string, candidates []*model.Account, n
 	items := make([]scored, 0, len(group))
 	for _, a := range group {
 		w := 1.0
-		if maxCredits > 0 && a.Credits.Remain > 0 {
-			w += float64(a.Credits.Remain) / float64(maxCredits) * 10
+		if spend := a.Credits.Spendable(); maxCredits > 0 && spend > 0 { // BP-134: both pools
+			w += float64(spend) / float64(maxCredits) * 10
 		}
 		if a.LastUsedAt.IsZero() {
 			// Never used: full idle score (upstream pick.go parity). Scoring

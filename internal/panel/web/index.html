@@ -1787,15 +1787,25 @@ function renderAccounts(){
           ? `${a.credits.remain} 点` + expiring + peakNote
           : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
       } else {
-        frac = creditKnown ? Math.max(0, Math.min(1, (a.credits.remain||0)/a.credits.total)) : null;
+        // BP-134: lead with the SPENDABLE total. The plan pool alone reads
+        // "0/300" for an account whose subscription ran out while a +382
+        // add-on pack sat unspent — the user reads "0", the client shows
+        // 382 remaining, and "为什么一直显示 0 分" was exactly this. The two
+        // pools follow as the breakdown, mirroring the client's
+        // 套餐内 Credits / 资源包 split.
+        const spendable = (a.credits.remain||0) + (a.credits.bonus||0);
         const unit = a.channel === 'qoder' ? ' credits' : ' 分';
+        // Bar denominator: everything ever issued across both pools, so the
+        // fill reads as "how much of what I was given is still there".
+        frac = creditKnown
+          ? Math.max(0, Math.min(1, spendable/(a.credits.total + (a.credits.bonus_total||0))))
+          : null;
         // BP-122: the add-on pack shows its own remain/total, so a fresh pack
         // (Qoder's 资源包: 382/400) is distinguishable from a nearly-spent one.
-        // "另有加赠 382" alone could never answer "did a new pack land?".
         const bonus = a.credits.bonus
-          ? `（另有加赠 ${a.credits.bonus}${a.credits.bonus_total ? '/'+a.credits.bonus_total : ''}）`
-          : '';
-        quota = creditKnown ? `${a.credits.remain}/${a.credits.total}${unit}` + bonus + expiring : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
+          ? `（套餐 ${a.credits.remain}/${a.credits.total} · 资源包 ${a.credits.bonus}${a.credits.bonus_total ? '/'+a.credits.bonus_total : ''}）`
+          : `（套餐 ${a.credits.remain}/${a.credits.total}）`;
+        quota = creditKnown ? `${spendable}${unit} 可用` + bonus + expiring : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
       }
     } else if (a.windows){
       const winPct = (k, w) => {

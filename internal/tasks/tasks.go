@@ -1119,7 +1119,9 @@ func (s *Scheduler) checkinTrae(ctx context.Context, acc *model.Account) (string
 		if res, err := prober.Probe(ctx, acc); err == nil {
 			s.gw.ApplyProbe(acc, res)
 			if res.Credits != nil {
-				s.gw.Pool().ReleaseOnCredits(acc, res.Credits.Remain)
+				// Spendable (BP-134): a top-up into the add-on pack must
+				// release a plan-exhausted cooldown too — Remain alone stays 0 there.
+				s.gw.Pool().ReleaseOnCredits(acc, res.Credits.Spendable())
 			}
 			_ = s.st.SaveAccount(acc)
 		}
