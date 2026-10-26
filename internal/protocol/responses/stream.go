@@ -130,6 +130,15 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 		return nil
 	}
 	switch ev.Kind {
+	case ir.EvAttemptReset:
+		// BP-123: a failed gateway attempt is being retried on this same
+		// client stream. This writer streams tool deltas immediately, so a
+		// retry after tool fragments never happens (the gateway refuses to
+		// cascade once content was delivered) — but the usage-only drop path
+		// can still land here, and stale tool items would then collide with
+		// the next attempt's indexes. Cheap to clear.
+		s.toolItems = map[int]*toolItemState{}
+		return nil
 	case ir.EvText:
 		if err := s.openMessageItem(); err != nil {
 			return err

@@ -82,6 +82,13 @@ func (l *streamLedger) record(ev ir.StreamEvent) {
 		if ev.Usage != nil {
 			l.addUsage(*ev.Usage)
 		}
+	case ir.EvAttemptReset:
+		// BP-123: the failed attempt's fragments are being discarded
+		// everywhere (sentinel guard, protocol writers) — the ledger's tool
+		// flag belongs to them. Without this, one attempt dying mid-tool-call
+		// would permanently disqualify the continuation for a LATER attempt
+		// that legitimately streamed prose and then dropped.
+		l.sawTool = false
 	}
 }
 

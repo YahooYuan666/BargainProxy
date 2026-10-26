@@ -222,6 +222,16 @@ type ChatRequest struct {
 	// "no stable identity" (never stick).
 	SessionKey string
 
+	// ToolDeltasBuffered marks ingress protocols whose stream writer holds
+	// tool-call blocks until the turn ends (Anthropic Messages, Gemini v1beta
+	// — BP-70 / single-frame finalize). On those protocols tool-call fragments
+	// NEVER reach the client, so a mid-tool transport drop leaves nothing to
+	// duplicate and the gateway may re-run the whole turn on another attempt
+	// (BP-123). OpenAI chat and Responses stream tool deltas as they arrive,
+	// where a retry WOULD duplicate them — the flag stays false there and the
+	// gateway keeps refusing mid-stream retries.
+	ToolDeltasBuffered bool
+
 	// Raw carries protocol-specific extras (rarely needed downstream).
 	Raw map[string]any
 }
@@ -302,6 +312,15 @@ const (
 	EvToolArgs          StreamEventKind = "tool_args"  // Delta = arguments fragment; ToolIndex identifies the call
 	EvUsage             StreamEventKind = "usage"      // Usage set
 	EvDone              StreamEventKind = "done"       // Stop set (terminal event)
+	// EvAttemptReset is emitted by the gateway before a RETRY attempt reuses
+	// the same client stream (account rotation or cross-channel cascade,
+	// BP-123). It orders every stateful layer to discard what the FAILED
+	// attempt buffered: the ledger drops its tool flag, the sentinel guard
+	// drops not-yet-matched text, and writers that buffer tool blocks until
+	// the turn ends (Anthropic, Gemini) clear them — otherwise the next
+	// attempt's arguments would concatenate onto the dead attempt's partial
+	// JSON. Writers that stream everything immediately may ignore it.
+	EvAttemptReset StreamEventKind = "attempt_reset"
 )
 
 // StreamEvent is one incremental event from a driver stream.

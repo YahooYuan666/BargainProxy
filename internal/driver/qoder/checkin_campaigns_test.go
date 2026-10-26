@@ -42,7 +42,10 @@ func TestCheckinCampaignsFallback(t *testing.T) {
 			fmt.Fprint(w, `{"campaigns":[{"id":"c1","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"amount":100}}]}`)
 		case strings.Contains(r.URL.Path, "/campaigns/c1/claim"):
 			campaignHits++
-			fmt.Fprint(w, `{"success":true,"rewardCredits":100}`)
+			// The CAMPAIGNS claim shape (BP-124, magpie native-checkin): status CLAIMED
+			// with the reward nested in benefit.amount — NOT the legacy
+			// {"success":true,"rewardCredits":N} of the retired check-in endpoint.
+			fmt.Fprint(w, `{"status":"CLAIMED","benefit":{"amount":100,"kind":"CREDITS"}}`)
 		case strings.HasSuffix(r.URL.Path, "/jobToken/exchange"):
 			fmt.Fprintf(w, `{"token":"open-bearer-%d","expires_in":7200}`, time.Now().Unix())
 		case strings.HasSuffix(r.URL.Path, "/jobToken/exchange"):

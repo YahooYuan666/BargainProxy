@@ -219,8 +219,35 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// escape hatches shut, while the same conversation answered 200 on the
 		// same channel seconds before and after.
 		switch ev.Kind {
-		case ir.EvText, ir.EvThinking, ir.EvToolStart, ir.EvToolArgs:
+		case ir.EvText, ir.EvThinking:
 			firstEvent = true
+		case ir.EvToolStart, ir.EvToolArgs:
+			// Tool deltas count as delivered ONLY on protocols that stream
+			// them as they arrive (OpenAI chat, Responses). Anthropic and
+			// Gemini buffer tool blocks until the turn ends (BP-70 / finalize):
+			// there a mid-tool drop has delivered NOTHING the client can read,
+			// so the cross-channel cascade must stay available (BP-123).
+			//
+			// Field 2026-10-26 22:19: a workbuddy leg died with "stream read:
+			// unexpected EOF" 92s in, having emitted ONLY tool-call fragments
+			// (proof by elimination: ttfb=2295ms means an event was emitted;
+			// no continuation log means the ledger had no text/thinking, so
+			// the event was a tool one; attempts=1 means the cascade was
+			// refused). firstEvent was true so the cascade was refused,
+			// sawTool refused the continuation, and the client — which had
+			// received nothing but message_start — lost the whole turn while
+			// the same conversation answered 200 on the same channel before
+			// and after. On the Anthropic ingress the tool fragments were
+			// still sitting in the writer's buffer, undelivered.
+			if !req.ToolDeltasBuffered {
+				firstEvent = true
+			}
+		case ir.EvAttemptReset:
+			// A retry is about to reuse this stream: the failed attempt's
+			// buffered state is being discarded everywhere (ledger below,
+			// sentinel guard, protocol writers). It says nothing about what
+			// the client has SEEN — the reset only flows when nothing was
+			// delivered, so firstEvent stays false and the retry proceeds.
 		}
 		return emit(ev)
 	}
@@ -555,6 +582,18 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			}
 		}
 		started := time.Now()
+		// BP-123: a RETRY is about to reuse the same client stream — another
+		// account of this binding (attempt > 0) or the next binding after a
+		// cascade (degraded). The failed attempt may have left buffered state
+		// behind: tool fragments in the protocol writer (Anthropic/Gemini hold
+		// them until the turn ends), un-matched text in the sentinel guard,
+		// the ledger's tool flag. EvAttemptReset tells every layer to drop it,
+		// or the next attempt's tool arguments would concatenate onto the dead
+		// attempt's partial JSON. It only ever flows when nothing was
+		// delivered — a delivered stream never reaches a retry.
+		if degraded || attempt > 0 {
+			_ = emit(ir.StreamEvent{Kind: ir.EvAttemptReset})
+		}
 		resp, streamErr := drv.Stream(actx, call, attemptEmit)
 		// max_tokens floor repair (BP-99): some upstreams reject a too-small
 		// max_tokens with a 400 whose text carries the minimum they demand

@@ -150,6 +150,17 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 		s.started = true
 	}
 	switch ev.Kind {
+	case ir.EvAttemptReset:
+		// BP-123: a failed gateway attempt is being retried on this same
+		// client stream. Tool blocks are buffered until the turn ends (BP-70),
+		// so fragments from the dead attempt are still sitting in toolStates —
+		// the next attempt's arguments would concatenate onto them and hand
+		// the client invalid JSON. Nothing else needs resetting: text or
+		// thinking would have opened a block (and thereby blocked the retry —
+		// delivered content never cascades), so at reset time no block is open.
+		s.toolStates = map[int]*toolBlock{}
+		s.toolOrder = nil
+		return nil
 	case ir.EvText:
 		if err := s.openText(); err != nil {
 			return err

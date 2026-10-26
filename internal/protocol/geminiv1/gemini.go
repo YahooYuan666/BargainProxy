@@ -344,6 +344,14 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 		return nil
 	}
 	switch ev.Kind {
+	case ir.EvAttemptReset:
+		// BP-123: a failed gateway attempt is being retried on this same
+		// client stream. Tool calls are held until finalize (they go out as
+		// one functionCall part), so the dead attempt's fragments must be
+		// dropped before the next attempt writes over the same indexes.
+		s.tools = nil
+		s.toolOrder = nil
+		return nil
 	case ir.EvText:
 		s.sent = true
 		s.textBuf.WriteString(ev.Delta)

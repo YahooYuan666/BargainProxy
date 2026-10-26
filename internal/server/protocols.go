@@ -64,6 +64,10 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.Model = gateway.TrimModelName(req.Model)
+	// This protocol's stream writer buffers tool blocks until the turn ends
+	// (BP-70) — the gateway may retry a mid-tool transport drop on another
+	// attempt, because the client has then received nothing (BP-123).
+	req.ToolDeltasBuffered = true
 	applyNativeSession(r, req)
 	if url, bad := gateway.HasUnsupportedImageURL(req); bad {
 		writeJSON(w, http.StatusBadRequest, anthropic.RenderError("invalid_request_error",
@@ -291,6 +295,9 @@ func (s *Server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, geminiv1.RenderError(400, "INVALID_ARGUMENT", err.Error()))
 		return
 	}
+	// This protocol's stream writer holds tool calls until finalize — the
+	// gateway may retry a mid-tool transport drop on another attempt (BP-123).
+	req.ToolDeltasBuffered = true
 	req.Model = gateway.TrimModelName(modelName)
 	applyNativeSession(r, req)
 	if req.Model == "" {

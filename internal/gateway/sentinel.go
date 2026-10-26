@@ -46,6 +46,23 @@ func sentinelGuard(inner driver.Emit, sentinels []string) driver.Emit {
 		return inner(ir.StreamEvent{Kind: ir.EvText, Delta: buf.String()})
 	}
 	return func(ev ir.StreamEvent) error {
+		if ev.Kind == ir.EvAttemptReset {
+			// BP-123: a fresh attempt is starting on the same client stream.
+			// Text buffered for sentinel matching belongs to the FAILED
+			// attempt and must be DROPPED, never delivered — the default
+			// branch below flushes on any non-text event, which would emit
+			// the dead attempt's opening words followed by the new attempt's
+			// own. The guard is per-binding, so this path is reached on
+			// account rotation inside one binding; cross-binding cascades
+			// already get a fresh guard. A settled rejection stays settled:
+			// the payload was refused by content policy, and the retry (which
+			// only happens on another account/channel) must not un-refuse it —
+			// the buffered text is still dropped so it cannot leak later.
+			// The reset itself PASSES THROUGH: the ledger and the protocol
+			// writers downstream need it to drop their own buffers too.
+			buf.Reset()
+			return inner(ev)
+		}
 		if rejected {
 			return uperr.New(uperr.ClassSentinel, 200, "upstream rejected the request (content policy)")
 		}

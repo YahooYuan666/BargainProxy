@@ -1360,6 +1360,13 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 // checkin): list /sash/api/v1/me/campaigns, find the active CLAIM_BENEFIT
 // campaign, claim it. CLAIMED = the day's done; no active campaign =
 // inactive (not an error).
+//
+// Response shapes are the CAMPAIGNS ones, not the legacy check-in ones
+// (BP-124, magpie index.mjs native-checkin): a claim answers
+// `status: "CLAIMED"` (top level or under data) with the reward in the
+// NESTED benefit.amount — `rewardCredits` and a flat `benefit.amount` key
+// belong to the retired daily-check-in endpoints, so reading them reported a
+// successful claim as "+0 credits".
 func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool, int64, bool, error) {
 	list, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+campaignPath, nil, uid, bearer)
 	if err != nil {
@@ -1383,7 +1390,7 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 			}
 		case "CLAIMED":
 			if active {
-				return true, toInt64(c["benefit.amount"]), true, nil
+				return true, campaignBenefit(c), true, nil
 			}
 		}
 	}
@@ -1401,12 +1408,21 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 	if toString(claim["result"]) == "ALREADY_CLAIMED" {
 		return true, 0, true, nil
 	}
-	if succ, ok := claim["success"].(bool); ok && !succ {
+	// Success is the campaigns vocabulary: status == "CLAIMED" at the top
+	// level or under data (magpie reads claim?.status ?? claim?.data?.status).
+	// A response that names any OTHER status is a refusal, not a success —
+	// treating it as one would record a check-in that never paid.
+	doc := claim
+	if inner, ok := claim["data"].(map[string]any); ok && toString(claim["status"]) == "" {
+		doc = inner
+	}
+	said := toString(doc["status"])
+	if said != "CLAIMED" {
 		return false, 0, false, fmt.Errorf("qoder campaigns claim rejected: %s", clip(marshalCompact(claim), 160))
 	}
-	reward := toInt64(claim["rewardCredits"])
+	reward := campaignBenefit(doc)
 	if reward == 0 {
-		reward = toInt64(claimable["benefit.amount"])
+		reward = campaignBenefit(claimable)
 	}
 	// A fresh campaigns claim IS the day's check-in done: the task ledger
 	// must record it as ok/checked-in so the next slot does not re-run it
@@ -1414,6 +1430,17 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 	// reports CLAIMED the next time; the campaigns page has no such
 	// re-read in the same day).
 	return true, reward, true, nil
+}
+
+// campaignBenefit reads the NESTED benefit.amount (magpie:
+// claim.benefit.amount ?? claim.data.benefit.amount ?? campaign.benefit.amount).
+// The old flat-key read (`c["benefit.amount"]`) never matches anything: Go map
+// keys are literal, and the upstream nests benefit as an object.
+func campaignBenefit(m map[string]any) int64 {
+	if b, ok := m["benefit"].(map[string]any); ok {
+		return toInt64(b["amount"])
+	}
+	return 0
 }
 
 // CatalogMap returns the live display-name -> upstream-key catalogue

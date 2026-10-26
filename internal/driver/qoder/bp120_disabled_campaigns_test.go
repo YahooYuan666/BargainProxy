@@ -39,7 +39,10 @@ func TestCheckinDisabledFallsBackToCampaigns(t *testing.T) {
 			fmt.Fprint(w, `{"campaigns":[{"id":"c1","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"amount":100,"kind":"CREDITS"}}]}`)
 		case strings.Contains(r.URL.Path, "/campaigns/c1/claim"):
 			claimed = true
-			fmt.Fprint(w, `{"success":true,"rewardCredits":100}`)
+			// The CAMPAIGNS claim shape (BP-124, magpie native-checkin): status CLAIMED
+			// with the reward nested in benefit.amount — NOT the legacy
+			// {"success":true,"rewardCredits":N} of the retired check-in endpoint.
+			fmt.Fprint(w, `{"status":"CLAIMED","benefit":{"amount":100,"kind":"CREDITS"}}`)
 		case strings.HasSuffix(r.URL.Path, "/jobToken/exchange"):
 			fmt.Fprintf(w, `{"token":"open-bearer-%d","expires_in":7200}`, time.Now().Unix())
 		default:
@@ -169,5 +172,133 @@ func TestProbeCarriesAddonTotal(t *testing.T) {
 	}
 	if res.Credits.Bonus != 382 || res.Credits.BonusTotal != 400 {
 		t.Fatalf("add-on pool = %d/%d, want 382/400", res.Credits.Bonus, res.Credits.BonusTotal)
+	}
+}
+
+// --- BP-124: the campaigns CLAIM response shape ---
+
+// TestCampaignsClaimReadsNestedBenefit: a successful claim answers
+// `status:"CLAIMED"` with the reward in the NESTED benefit.amount. The old
+// parsing read the legacy flat keys (`rewardCredits`, `benefit.amount` as one
+// literal map key) and reported every successful claim as "+0 credits".
+func TestCampaignsClaimReadsNestedBenefit(t *testing.T) {
+	var claimHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/daily-check-in/status"):
+			fmt.Fprint(w, `{"status":"DISABLED"}`)
+		case strings.HasSuffix(r.URL.Path, "/campaigns") && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"campaigns":[{"id":"c1","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"amount":100,"kind":"CREDITS"}}]}`)
+		case strings.Contains(r.URL.Path, "/campaigns/c1/claim"):
+			claimHits++
+			fmt.Fprint(w, `{"status":"CLAIMED","benefit":{"amount":100,"kind":"CREDITS"}}`)
+		case strings.HasSuffix(r.URL.Path, "/jobToken/exchange"):
+			fmt.Fprintf(w, `{"token":"open-bearer-%d","expires_in":7200}`, time.Now().Unix())
+		default:
+			fmt.Fprint(w, `{}`)
+		}
+	}))
+	defer srv.Close()
+
+	d := New(config.QoderSettings{GatewayBase: srv.URL, OpenBase: srv.URL}, nil)
+	checkedIn, credits, enable, err := d.Checkin(context.Background(), testQoderAccount(t))
+	if err != nil {
+		t.Fatalf("checkin: %v", err)
+	}
+	if claimHits != 1 {
+		t.Fatalf("claim called %d times, want 1", claimHits)
+	}
+	if !checkedIn || !enable {
+		t.Fatalf("result = (%v, %v), want (true, true)", checkedIn, enable)
+	}
+	if credits != 100 {
+		t.Fatalf("reward = %d, want 100 from the nested benefit.amount", credits)
+	}
+}
+
+// TestCampaignsClaimDataEnvelope: the same answer wrapped in a data envelope
+// must read the same way (magpie checks claim?.status ?? claim?.data?.status).
+func TestCampaignsClaimDataEnvelope(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/daily-check-in/status"):
+			fmt.Fprint(w, `{"status":"DISABLED"}`)
+		case strings.HasSuffix(r.URL.Path, "/campaigns") && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"campaigns":[{"id":"c1","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"amount":100}}]}`)
+		case strings.Contains(r.URL.Path, "/campaigns/c1/claim"):
+			fmt.Fprint(w, `{"data":{"status":"CLAIMED","benefit":{"amount":100}}}`)
+		case strings.HasSuffix(r.URL.Path, "/jobToken/exchange"):
+			fmt.Fprintf(w, `{"token":"open-bearer-%d","expires_in":7200}`, time.Now().Unix())
+		default:
+			fmt.Fprint(w, `{}`)
+		}
+	}))
+	defer srv.Close()
+
+	d := New(config.QoderSettings{GatewayBase: srv.URL, OpenBase: srv.URL}, nil)
+	_, credits, _, err := d.Checkin(context.Background(), testQoderAccount(t))
+	if err != nil {
+		t.Fatalf("checkin: %v", err)
+	}
+	if credits != 100 {
+		t.Fatalf("reward = %d, want 100 from the enveloped benefit.amount", credits)
+	}
+}
+
+// TestCampaignsClaimOtherStatusIsRefused: any status other than CLAIMED is a
+// refusal. Recording it as a successful check-in would make the scheduler skip
+// the rest of the day while the account never received the credits.
+func TestCampaignsClaimOtherStatusIsRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/daily-check-in/status"):
+			fmt.Fprint(w, `{"status":"DISABLED"}`)
+		case strings.HasSuffix(r.URL.Path, "/campaigns") && r.Method == http.MethodGet:
+			fmt.Fprint(w, `{"campaigns":[{"id":"c1","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"amount":100}}]}`)
+		case strings.Contains(r.URL.Path, "/campaigns/c1/claim"):
+			fmt.Fprint(w, `{"status":"LIMIT_EXCEEDED"}`)
+		case strings.HasSuffix(r.URL.Path, "/jobToken/exchange"):
+			fmt.Fprintf(w, `{"token":"open-bearer-%d","expires_in":7200}`, time.Now().Unix())
+		default:
+			fmt.Fprint(w, `{}`)
+		}
+	}))
+	defer srv.Close()
+
+	d := New(config.QoderSettings{GatewayBase: srv.URL, OpenBase: srv.URL}, nil)
+	_, _, _, err := d.Checkin(context.Background(), testQoderAccount(t))
+	if err == nil {
+		t.Fatal("a non-CLAIMED claim answer must be an error, not a recorded check-in")
+	}
+}
+
+// TestCampaignsClaimedReadsNestedBenefit: an already-claimed day reports the
+// campaign's own reward (the amount that WAS granted), read from the nested
+// benefit object.
+func TestCampaignsClaimedReadsNestedBenefit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/daily-check-in/status"):
+			fmt.Fprint(w, `{"status":"DISABLED"}`)
+		case strings.HasSuffix(r.URL.Path, "/campaigns"):
+			fmt.Fprint(w, `{"campaigns":[{"id":"c1","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMED","benefit":{"amount":100,"kind":"CREDITS"}}]}`)
+		case strings.HasSuffix(r.URL.Path, "/jobToken/exchange"):
+			fmt.Fprintf(w, `{"token":"open-bearer-%d","expires_in":7200}`, time.Now().Unix())
+		default:
+			fmt.Fprint(w, `{}`)
+		}
+	}))
+	defer srv.Close()
+
+	d := New(config.QoderSettings{GatewayBase: srv.URL, OpenBase: srv.URL}, nil)
+	checkedIn, credits, _, err := d.Checkin(context.Background(), testQoderAccount(t))
+	if err != nil {
+		t.Fatalf("checkin: %v", err)
+	}
+	if !checkedIn {
+		t.Fatal("CLAIMED must read as checked-in")
+	}
+	if credits != 100 {
+		t.Fatalf("reward = %d, want 100 from the campaign's nested benefit.amount", credits)
 	}
 }
