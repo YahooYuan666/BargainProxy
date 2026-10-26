@@ -234,10 +234,12 @@ func TestCheckinFlow(t *testing.T) {
 	}
 }
 
-// BP-98 TRAE-3: a business refusal is upstream's answer about today — 9074
-// ("check in via the app") answers the same however often it is asked, so it
-// fails on the FIRST claim; the retry loop is for 5xx/transport only
-// (yetone/magpie#808: three 20s waits per account per slot bought nothing).
+// BP-98 TRAE-3: a PERMANENT business refusal is upstream's answer about today
+// — it answers the same however often it is asked, so it fails on the FIRST
+// claim; the retry loop is for 5xx/transport only (yetone/magpie#808: three
+// 20s waits per account per slot bought nothing). BP-135 split the RUSH
+// wording off: 9074 "参与用户太多" retries with a wider delay — see
+// TestCheckin9074RushRetries.
 func TestCheckinClaimBusinessCodeRetriesThenFails(t *testing.T) {
 	old := checkinRetryDelay
 	checkinRetryDelay = time.Millisecond
@@ -249,7 +251,7 @@ func TestCheckinClaimBusinessCodeRetriesThenFails(t *testing.T) {
 			fmt.Fprint(w, `{"checked_in":false,"credits":100,"enable":true}`)
 		case "/trae/api/v2/ug/checkin_credits/claim":
 			claims++
-			fmt.Fprint(w, `{"code":9074,"message":"当前参与用户太多"}`)
+			fmt.Fprint(w, `{"code":9074,"message":"请前往App参与活动"}`)
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
 		}
@@ -460,5 +462,78 @@ func TestBadRequest4001Classified(t *testing.T) {
 	}
 	if ue.Status != 400 {
 		t.Fatalf("status = %d, want 400", ue.Status)
+	}
+}
+
+// BP-135: 9074 "当前参与用户太多，请稍后再试" is the check-in RUSH answer —
+// the upstream itself asks for a later retry, and the money is still there.
+// It failed the task three days running at the 01:00 slot because the whole
+// 9074 family was treated as permanent. The rush wording now retries with the
+// wider delay and claims on a calm attempt.
+func TestCheckin9074RushRetriesThenClaims(t *testing.T) {
+	oldRush := checkinRushRetryDelay
+	checkinRushRetryDelay = time.Millisecond
+	defer func() { checkinRushRetryDelay = oldRush }()
+	claims := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/trae/api/v2/ug/checkin_credits/status":
+			fmt.Fprint(w, `{"checked_in":false,"credits":100,"enable":true}`)
+		case "/trae/api/v2/ug/checkin_credits/claim":
+			claims++
+			if claims == 1 {
+				fmt.Fprint(w, `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`)
+				return
+			}
+			fmt.Fprint(w, `{}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	d := testDriver(srv.URL, srv.URL)
+	checked, credits, enable, err := d.Checkin(context.Background(), testAccount())
+	if err != nil {
+		t.Fatalf("checkin: %v", err)
+	}
+	if !checked || credits != 100 || !enable {
+		t.Fatalf("checkedIn=%v credits=%d enable=%v, want true/100/true", checked, credits, enable)
+	}
+	if claims != 2 {
+		t.Fatalf("claim attempts = %d, want 2 (one rush refusal, then the claim)", claims)
+	}
+}
+
+// ...and the rush retry is BOUNDED: a rush that never clears still surfaces as
+// a failure after the attempts are spent (the ledger row says why).
+func TestCheckin9074RushExhausts(t *testing.T) {
+	oldRush := checkinRushRetryDelay
+	checkinRushRetryDelay = time.Millisecond
+	defer func() { checkinRushRetryDelay = oldRush }()
+	claims := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/trae/api/v2/ug/checkin_credits/status":
+			fmt.Fprint(w, `{"checked_in":false,"credits":100,"enable":true}`)
+		case "/trae/api/v2/ug/checkin_credits/claim":
+			claims++
+			fmt.Fprint(w, `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`)
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	d := testDriver(srv.URL, srv.URL)
+	_, _, _, err := d.Checkin(context.Background(), testAccount())
+	if err == nil {
+		t.Fatal("a rush that never clears must still fail the task (honestly)")
+	}
+	if claims != 3 {
+		t.Fatalf("claim attempts = %d, want 3 (the retry budget)", claims)
+	}
+	if !strings.Contains(err.Error(), "9074") {
+		t.Fatalf("error should carry the business code: %v", err)
 	}
 }

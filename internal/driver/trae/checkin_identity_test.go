@@ -140,7 +140,7 @@ func TestCheckin9074FailsFast(t *testing.T) {
 			return
 		}
 		claims++
-		fmt.Fprint(w, `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`)
+		fmt.Fprint(w, `{"code":9074,"message":"请前往App参与活动"}`)
 	}))
 	defer srv.Close()
 	oldDelay := checkinRetryDelay

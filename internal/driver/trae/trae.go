@@ -1180,18 +1180,44 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 			// no retries, no red task row (magpie 0.2.19: outcome done).
 			return true, st.Credits, true, nil
 		}
-		if !retryableCheckinErr(lastErr) {
+		if !retryableCheckinErr(lastErr) && !rushCheckinErr(lastErr) {
 			return false, 0, false, lastErr
 		}
+		// BP-135: 9074 "当前参与用户太多，请稍后再试" is the upstream asking
+		// for a LATER retry — it is the check-in rush hour, not the "check in
+		// via the app" refusal. It failed the task three days running at the
+		// 01:00 slot while the message itself says the money is still there.
+		// Wait out the rush with a wider spacing than the transport backoff.
 		if attempt < 3 {
+			delay := checkinRetryDelay
+			if rushCheckinErr(lastErr) {
+				delay = checkinRushRetryDelay
+			}
 			select {
 			case <-ctx.Done():
 				return false, 0, false, uperr.New(uperr.ClassCanceled, 0, "trae checkin: %v", ctx.Err())
-			case <-time.After(checkinRetryDelay):
+			case <-time.After(delay):
 			}
 		}
 	}
 	return false, 0, false, lastErr
+}
+
+// checkinRushRetryDelay is the spacing for the 9074 rush answer. 20s kept
+// landing inside the same rush (three days of failed 01:00 rows); a minute
+// gives the upstream's own "稍后再试" a chance to be true. Package var so
+// tests can shorten it.
+var checkinRushRetryDelay = 60 * time.Second
+
+// rushCheckinErr reports whether a claim refusal is the TRANSIENT rush shape:
+// 9074 whose message asks for a later retry. Other 9074 wordings (the
+// historical "go check in via the app" answer) stay fail-fast.
+func rushCheckinErr(err error) bool {
+	ce, ok := err.(*checkinCodeErr)
+	if !ok || ce.code != 9074 {
+		return false
+	}
+	return strings.Contains(ce.ue.Message, "参与用户太多")
 }
 
 // checkinRetryDelay is a package var so tests can shorten the backoff.

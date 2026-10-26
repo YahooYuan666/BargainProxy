@@ -1625,11 +1625,16 @@ function renderKpis(byChan){
       rows.push({v: v===null ? '—' : (v*100).toFixed(1)+'%', k, cls: cls(v)});
     });
   } else {
+    // BP-135: every pool the account can actually pay with counts here —
+    // plan remainder AND add-on packs (the row-level BP-134 rule applied to
+    // the KPI card). The card used to sum the plan pool alone and showed a
+    // red "0 / 300 (0%)" while the row under it said 382 credits available.
     let credits = 0, creditsTotal = 0, balanceOnly = 0;
     list.forEach(a => {
       if (!a.credits) return;
       if (a.credits.balance_only){ balanceOnly += a.credits.remain||0; return; }
-      credits += a.credits.remain||0; creditsTotal += a.credits.total||0;
+      credits += (a.credits.remain||0) + (a.credits.bonus||0);
+      creditsTotal += (a.credits.total||0) + (a.credits.bonus_total||0);
     });
     if (creditsTotal > 0){
       const pct = Math.round(credits/creditsTotal*100);
@@ -1769,22 +1774,20 @@ function renderAccounts(){
       const creditKnown = !!(a.credits.updated_at || a.credits.updatedAt) ||
                           (a.credits.remain > 0) || (a.credits.total > 0);
       if (a.credits.balance_only || a.channel === 'autoclaw'){
-        // Balance-only pool: there is no "total", so a percentage bar would
-        // always read 100% and mislead.
-        //
-        // BP-122: the high-water mark stands in for the missing cap. Without
-        // it a balance-only row can only ever say "now", so a daily reward
-        // landing (+400 AutoClaw / +100 Lobster) is invisible — the number is
-        // just a number, and a spent-down account looks identical to one that
-        // never received anything. Showing 峰值 + 自峰值已用 turns the row into
-        // the same read as WorkBuddy's "remain/total": how much is left, and
-        // how much has gone out since the last time it was full.
-        const peak = a.credits.peak || 0;
-        const peakNote = (peak > 0 && peak > (a.credits.remain||0))
-          ? `<div class="small muted">峰值 ${peak}，自峰值已用 ${peak - (a.credits.remain||0)}${a.credits.peak_at ? ' · ' + esc(fmtTime(a.credits.peak_at)) : ''}</div>`
+        // BP-135: the user asked for WorkBuddy's shape here — 剩余/上限 with a
+        // bar, so a top-up is VISIBLE. The high-water mark (BP-122) is the
+        // ceiling: balance-only channels have no issued total, and "400 点"
+        // alone answers neither "how much of it is gone" nor "did the daily
+        // reward land". remain/peak shows both: spending opens the gap, a
+        // top-up above the old peak moves the ceiling itself.
+        const remain = a.credits.remain||0;
+        const peak = Math.max(a.credits.peak||0, remain);
+        frac = creditKnown && peak > 0 ? Math.max(0, Math.min(1, remain/peak)) : null;
+        const usedNote = peak > remain
+          ? `<div class="small muted">自峰值已用 ${peak - remain}${a.credits.peak_at ? ' · ' + esc(fmtTime(a.credits.peak_at)) : ''}</div>`
           : '';
         quota = creditKnown
-          ? `${a.credits.remain} 点` + expiring + peakNote
+          ? `${remain}/${peak} 点` + expiring + usedNote
           : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
       } else {
         // BP-134: lead with the SPENDABLE total. The plan pool alone reads
