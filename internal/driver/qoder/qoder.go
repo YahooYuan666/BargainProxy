@@ -1317,7 +1317,18 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 	case "CLAIMED":
 		return true, 0, true, nil
 	case "DISABLED":
-		return false, 0, false, nil
+		// DISABLED is NOT "this account has no check-in programme" (BP-120).
+		// Qoder CN retired the legacy daily-check-in endpoint and moved the
+		// daily 100 credits into the desktop benefit centre, where the legacy
+		// status endpoint answers DISABLED for everyone. Returning enable=false
+		// here made the scheduler report "qoder checkin not available" every
+		// day and never look at the campaigns page — which, read live on
+		// 2026-10-26, carries an ACTIVE CLAIM_BENEFIT campaign
+		// ("每天领 100 Credits", 每日 10:00 UTC+8 刷新, 30 天有效) whose
+		// claimStatus was CLAIMED, i.e. the account HAD been claiming — just
+		// never through us. Fall through to the campaigns path; it is the only
+		// path that can still answer "claimable" on today's upstream.
+		return d.checkinCampaigns(ctx, uid, bearer)
 	case "CLAIMABLE":
 		claim, cerr := d.checkinJSON(ctx, http.MethodPost, d.openAPIBase()+pathCheckClaim, []byte("{}"), uid, bearer)
 		if cerr != nil {
@@ -1524,6 +1535,7 @@ func probeCreditsFromDoc(doc map[string]any) *driver.ProbeResult {
 	remain := toInt64(doc["plan_remaining"])
 	total := toInt64(doc["plan_total"])
 	addon := toInt64(doc["addon_remaining"])
+	addonTotal := int64(0)
 	note := fmt.Sprintf("plan %d/%d, addon %d, org %d", toInt64(doc["plan_used"]), total,
 		addon, toInt64(doc["org_remaining"]))
 	// Live documents nest the numbers under userQuota (usageType=credits).
@@ -1534,28 +1546,34 @@ func probeCreditsFromDoc(doc map[string]any) *driver.ProbeResult {
 			remain, total, toString(uq["unit"]), toInt64(uq["used"]))
 		if aq, ok := doc["addOnQuota"].(map[string]any); ok {
 			addon = toInt64(aq["remaining"])
+			addonTotal = toInt64(aq["total"])
 		}
 	}
 	bonus := addon
+	bonusTotal := addonTotal
 	if oq, ok := doc["orgResourcePackage"].(map[string]any); ok {
 		if avail, _ := oq["available"].(bool); avail {
 			bonus += toInt64(oq["remaining"])
+			bonusTotal += toInt64(oq["total"])
 		}
 	}
 	dedicated := int64(0)
+	dedicatedTotal := int64(0)
 	if pkgs, ok := doc["dedicatedResourcePackages"].([]any); ok {
 		for _, it := range pkgs {
 			if pkg, ok := it.(map[string]any); ok {
 				dedicated += toInt64(pkg["remaining"])
+				dedicatedTotal += toInt64(pkg["total"])
 			}
 		}
 	}
 	if dedicated > 0 {
 		bonus += dedicated
+		bonusTotal += dedicatedTotal
 		note += fmt.Sprintf(", dedicated %d", dedicated)
 	}
 	return &driver.ProbeResult{Credits: &model.Credits{
-		Remain: remain, Total: total, Bonus: bonus, UpdatedAt: time.Now(),
+		Remain: remain, Total: total, Bonus: bonus, BonusTotal: bonusTotal, UpdatedAt: time.Now(),
 	}, Note: note}
 }
 

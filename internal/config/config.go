@@ -205,6 +205,12 @@ type AutoClawSettings struct {
 	// login, wallet/ledger, checkin) fail with an explicit config error; the
 	// chat relay uses a separate token header and is unaffected.
 	AppSecret string `json:"app_secret"`
+
+	// OverseasBase overrides the overseas lane host (default
+	// https://autoglm-api.autoglm.ai). The CN lane has had an override
+	// (userapi_base) since the start; the overseas one did not, which made the
+	// lane untestable end-to-end and left host migrations to a source edit.
+	OverseasBase string `json:"overseas_base"`
 }
 
 // QoderSettings configures the Alibaba Qoder channel (PAT + COSY protocol).

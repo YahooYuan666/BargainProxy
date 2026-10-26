@@ -1771,11 +1771,30 @@ function renderAccounts(){
       if (a.credits.balance_only || a.channel === 'autoclaw'){
         // Balance-only pool: there is no "total", so a percentage bar would
         // always read 100% and mislead.
-        quota = creditKnown ? `${a.credits.remain} 点` + expiring : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
+        //
+        // BP-122: the high-water mark stands in for the missing cap. Without
+        // it a balance-only row can only ever say "now", so a daily reward
+        // landing (+400 AutoClaw / +100 Lobster) is invisible — the number is
+        // just a number, and a spent-down account looks identical to one that
+        // never received anything. Showing 峰值 + 自峰值已用 turns the row into
+        // the same read as WorkBuddy's "remain/total": how much is left, and
+        // how much has gone out since the last time it was full.
+        const peak = a.credits.peak || 0;
+        const peakNote = (peak > 0 && peak > (a.credits.remain||0))
+          ? `<div class="small muted">峰值 ${peak}，自峰值已用 ${peak - (a.credits.remain||0)}${a.credits.peak_at ? ' · ' + esc(fmtTime(a.credits.peak_at)) : ''}</div>`
+          : '';
+        quota = creditKnown
+          ? `${a.credits.remain} 点` + expiring + peakNote
+          : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
       } else {
         frac = creditKnown ? Math.max(0, Math.min(1, (a.credits.remain||0)/a.credits.total)) : null;
         const unit = a.channel === 'qoder' ? ' credits' : ' 分';
-        const bonus = a.credits.bonus ? `（另有加赠 ${a.credits.bonus}）` : '';
+        // BP-122: the add-on pack shows its own remain/total, so a fresh pack
+        // (Qoder's 资源包: 382/400) is distinguishable from a nearly-spent one.
+        // "另有加赠 382" alone could never answer "did a new pack land?".
+        const bonus = a.credits.bonus
+          ? `（另有加赠 ${a.credits.bonus}${a.credits.bonus_total ? '/'+a.credits.bonus_total : ''}）`
+          : '';
         quota = creditKnown ? `${a.credits.remain}/${a.credits.total}${unit}` + bonus + expiring : '未获取 <span class="muted">（点「刷新额度」读取）</span>';
       }
     } else if (a.windows){

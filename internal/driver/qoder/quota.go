@@ -11,6 +11,7 @@ package qoder
 import (
 	"context"
 	"net/http"
+	"time"
 
 	"bargainproxy/internal/model"
 )
@@ -103,6 +104,13 @@ func parseQuotaDetail(doc map[string]any) *QuotaDetail {
 }
 
 // CheckinStatus reads the daily check-in status without claiming it.
+//
+// The legacy endpoint reports DISABLED for every account since Qoder CN moved
+// the daily 100 credits into the desktop benefit centre (BP-120). Reporting
+// that verbatim made the panel say the account has no check-in programme while
+// an active CLAIM_BENEFIT campaign was sitting on the campaigns page. When the
+// legacy status is DISABLED (or unrecognised), the campaigns page is the
+// authority: it knows whether today's claim is still available.
 func (d *Driver) CheckinStatus(ctx context.Context, acc *model.Account) (*CheckinState, error) {
 	rt, err := d.runtimeFor(acc)
 	if err != nil {
@@ -126,10 +134,50 @@ func (d *Driver) CheckinStatus(ctx context.Context, acc *model.Account) (*Checki
 	switch st.Status {
 	case "CLAIMABLE":
 		st.Claimable = true
+		return st, nil
 	case "CLAIMED":
 		st.Claimed = true
-	case "DISABLED":
-		st.Disabled = true
+		return st, nil
 	}
+	// DISABLED / anything else: ask the campaigns page instead of repeating a
+	// status that no longer describes the programme.
+	if cs, cerr := d.campaignCheckinState(ctx, uid, bearer); cerr == nil && cs != nil {
+		cs.StreakDays = st.StreakDays
+		return cs, nil
+	}
+	st.Disabled = true
 	return st, nil
+}
+
+// campaignCheckinState derives the check-in status from the campaigns page:
+// the active CLAIM_BENEFIT campaign is the daily 100-credit benefit.
+// A nil result means "no active daily campaign at all".
+func (d *Driver) campaignCheckinState(ctx context.Context, uid, bearer string) (*CheckinState, error) {
+	list, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+campaignPath, nil, uid, bearer)
+	if err != nil {
+		return nil, qoderError(err)
+	}
+	rawList, _ := list["campaigns"].([]any)
+	now := time.Now().Unix()
+	for _, it := range rawList {
+		c, ok := it.(map[string]any)
+		if !ok || toString(c["actionType"]) != "CLAIM_BENEFIT" {
+			continue
+		}
+		start, end := toInt64(c["startAt"]), toInt64(c["endAt"])
+		if !((start == 0 || start <= now) && (end == 0 || end > now)) {
+			continue
+		}
+		st := &CheckinState{Status: toString(c["claimStatus"])}
+		switch st.Status {
+		case "CLAIMABLE":
+			st.Claimable = true
+		case "CLAIMED":
+			st.Claimed = true
+		default:
+			st.Disabled = true
+		}
+		return st, nil
+	}
+	return nil, nil
 }

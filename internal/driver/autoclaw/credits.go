@@ -66,13 +66,18 @@ func (d *Driver) CreditDetail(ctx context.Context, acc *model.Account, page, pag
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "autoclaw: %v", err)
 	}
+	// The lane matters here as much as it does for Probe (BP-119): an
+	// overseas token sent to the CN host answers 410000 "Please log in to
+	// continue.", so a global account's ledger drawer was permanently broken
+	// with a message that reads as a dead login.
+	overseas := cr.Region == realmOverseas
 	run := func() (*CreditDetail, error) {
 		out := &CreditDetail{Account: acc.ID, Entries: []LedgerEntry{}}
 
 		var wallet struct {
 			TotalBalance json.Number `json:"total_balance"`
 		}
-		if err := d.userapiCall(ctx, http.MethodGet, walletsPath, cr.bearer(), nil, &wallet); err != nil {
+		if err := d.userapiCallFor(ctx, http.MethodGet, walletsPath, cr.bearer(), nil, &wallet, overseas); err != nil {
 			return nil, err
 		}
 		out.Balance, _ = wallet.TotalBalance.Int64()
@@ -82,7 +87,7 @@ func (d *Driver) CreditDetail(ctx context.Context, acc *model.Account, page, pag
 			Total   any              `json:"total"`
 		}
 		path := fmt.Sprintf("/agent-assetmgr/api/v1/ledgers_std?page=%d&page_size=%d", page, pageSize)
-		if err := d.userapiCall(ctx, http.MethodGet, path, cr.bearer(), nil, &ledger); err != nil {
+		if err := d.userapiCallFor(ctx, http.MethodGet, path, cr.bearer(), nil, &ledger, overseas); err != nil {
 			return nil, err
 		}
 		out.Entries = parseLedgerEntries(ledger.Entries)
@@ -97,7 +102,7 @@ func (d *Driver) CreditDetail(ctx context.Context, acc *model.Account, page, pag
 			Days        any    `json:"expire_time_value"`
 			Text        string `json:"expiring_points_text"`
 		}
-		if err := d.userapiCall(ctx, http.MethodGet, "/agent-assetmgr/api/v1/points/expiring", cr.bearer(), nil, &exp); err == nil {
+		if err := d.userapiCallFor(ctx, http.MethodGet, "/agent-assetmgr/api/v1/points/expiring", cr.bearer(), nil, &exp, overseas); err == nil {
 			out.Expiring = &ExpiringPoints{
 				Points: toInt64Any(exp.Points),
 				Total:  toInt64Any(exp.TotalPoints),

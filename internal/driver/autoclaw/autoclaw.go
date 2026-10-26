@@ -256,6 +256,57 @@ func DeviceIDForPhone(phone string) string {
 	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
 }
 
+// deviceIDFor returns the device id to sign a refresh with, deriving one from
+// the account identity when the credential blob has none.
+//
+// WHY THIS IS NOT OPTIONAL (BP-119, field 2026-10-26): /userapi/v1/refresh
+// answers `code=400001 "Request data error"` for an EMPTY device_id and 200 for
+// any UUID-shaped one. Verified live against the real overseas account, one
+// variable per run:
+//
+//	device_id ""          -> 400001 Request data error
+//	device_id <uuid>      -> 200 {access_token, refresh_token}
+//	device_id absent      -> 400001 Request data error
+//
+// Accounts imported from the desktop client's credential store have no
+// device_id (the client keeps it elsewhere), so EVERY refresh failed silently:
+// the hourly task logged "Request data error", the access token ran out, and
+// from then on the panel's 刷新额度 read `410000 "Please log in to continue."`
+// — which the UI renders as "session dead: Please log in to continue.", i.e.
+// "your account is broken", when the account was fine all along.
+//
+// Deriving from the account id keeps it stable across restarts (a new random
+// id per call also works upstream, but a stable one keeps the token's own
+// device claim consistent with what we sign with).
+func deviceIDFor(cr *Creds, acc *model.Account) string {
+	if id := strings.TrimSpace(cr.DeviceID); id != "" {
+		return id
+	}
+	seed := ""
+	if acc != nil {
+		seed = firstNonEmpty(acc.ID, acc.UID)
+	}
+	if seed == "" {
+		seed = firstNonEmpty(cr.UID, cr.UserName, cr.Phone)
+	}
+	if seed == "" {
+		// Last resort: a value the upstream accepts, at the cost of being
+		// different per process. Better a working refresh than a silent 401.
+		seed = "anonymous"
+	}
+	return DeviceIDForPhone(seed)
+}
+
+// ensureDeviceID fills in a missing device id and reports whether it changed,
+// so the caller knows the credential blob is worth persisting.
+func ensureDeviceID(cr *Creds, acc *model.Account) bool {
+	if strings.TrimSpace(cr.DeviceID) != "" {
+		return false
+	}
+	cr.DeviceID = deviceIDFor(cr, acc)
+	return true
+}
+
 func sign(ts, secret string) string {
 	sum := md5.Sum([]byte(appID + "&" + ts + "&" + secret))
 	return hex.EncodeToString(sum[:])
@@ -444,7 +495,7 @@ func (d *Driver) chatManaged(ctx context.Context, cr *Creds, body []byte, modelI
 	overseas := cr.Region == realmOverseas
 	host, path := d.base(), managedChatPath
 	if overseas {
-		host, path = overseasHost, overseasChatPath
+		host, path = d.overseasBase(), overseasChatPath
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+path, bytes.NewReader(wire))
 	if err != nil {
@@ -528,6 +579,15 @@ func (d *Driver) base() string {
 		return strings.TrimRight(d.cfg.UserAPIBase, "/")
 	}
 	return defaultUserAPIBase
+}
+
+// overseasBase resolves the overseas lane host, honouring the config override
+// (tests and host migrations both need it).
+func (d *Driver) overseasBase() string {
+	if d.cfg.OverseasBase != "" {
+		return strings.TrimRight(d.cfg.OverseasBase, "/")
+	}
+	return overseasHost
 }
 
 // Channel implements driver.Driver.
@@ -818,6 +878,10 @@ func (d *Driver) refresh(ctx context.Context, acc *model.Account, cr *Creds) err
 	if strings.TrimSpace(cr.RefreshToken) == "" {
 		return uperr.New(uperr.ClassAuth, 0, "autoclaw: no refresh_token")
 	}
+	// A missing device id makes the upstream refuse the refresh outright
+	// (400001), which used to leave the account silently dead — see
+	// deviceIDFor. Derive one and persist it with the new token.
+	ensureDeviceID(cr, acc)
 	var data struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
@@ -842,11 +906,32 @@ func (d *Driver) refresh(ctx context.Context, acc *model.Account, cr *Creds) err
 }
 
 // Probe implements driver.Prober: fetch the points balance.
+//
+// A dead access token is refreshed once and the read retried (BP-119): the
+// panel's 刷新额度 button is the operator's only way to see a balance, and
+// answering it with "session dead: Please log in to continue." while the
+// account is perfectly healthy — only its token aged out — is the exact wrong
+// conclusion. CreditDetail already did this; Probe did not, so the account card
+// stayed broken even after the ledger drawer recovered.
 func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeResult, error) {
 	cr, err := ParseCreds(acc.CredsJSON)
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "autoclaw: %v", err)
 	}
+	res, err := d.probeWith(ctx, cr)
+	if err == nil {
+		return res, nil
+	}
+	if ue, ok := uperr.As(err); !ok || ue.Class != uperr.ClassAuth {
+		return nil, err
+	}
+	if rerr := d.refresh(ctx, acc, cr); rerr != nil {
+		return nil, err // report the original read failure, not the refresh's
+	}
+	return d.probeWith(ctx, cr)
+}
+
+func (d *Driver) probeWith(ctx context.Context, cr *Creds) (*driver.ProbeResult, error) {
 	var data struct {
 		TotalBalance json.Number `json:"total_balance"`
 	}
@@ -875,13 +960,26 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 }
 
 // Checkin implements the daily_signin task (idempotent upstream).
+//
+// The host is the account's own lane (BP-119). This used to hard-code the CN
+// gateway, so an overseas account's daily check-in was refused with
+// 401 {"error":"Invalid token"} every single day — visible in the task ledger
+// as "autoclaw checkin failed ... 401 Invalid token" for the global account
+// while the CN account checked in fine. Verified live 2026-10-26: the same
+// token that answers 401 on the CN host answers
+// {"data":{"already_completed":false,"reward_points":400,"success":true}} on
+// the overseas host.
 func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn bool, credits int64, enable bool, err error) {
 	cr, err := ParseCreds(acc.CredsJSON)
 	if err != nil {
 		return false, 0, false, uperr.New(uperr.ClassAuth, 0, "autoclaw: %v", err)
 	}
+	host := d.base()
+	if cr.Region == realmOverseas {
+		host = d.overseasBase()
+	}
 	body, _ := json.Marshal(map[string]any{"task_id": "daily_signin"})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.base()+taskCompletePath, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, host+taskCompletePath, bytes.NewReader(body))
 	if err != nil {
 		return false, 0, false, err
 	}
@@ -997,7 +1095,7 @@ func (d *Driver) userapiCallFor(ctx context.Context, method, path, token string,
 	}
 	host := d.base()
 	if overseas {
-		host = overseasHost
+		host = d.overseasBase()
 	}
 	req, err := http.NewRequestWithContext(ctx, method, host+path, rd)
 	if err != nil {

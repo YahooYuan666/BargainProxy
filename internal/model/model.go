@@ -77,14 +77,30 @@ type Window struct {
 
 // Credits is a credit balance snapshot (workbuddy / trae credit pools).
 type Credits struct {
-	Remain            int64     `json:"remain"`
-	Total             int64     `json:"total"`
-	BalanceOnly       bool      `json:"balance_only,omitempty"`        // no finite quota: Total equals the current balance (AutoClaw points)
-	Expiring          int64     `json:"expiring,omitempty"`            // within the expiring soon window
-	Bonus             int64     `json:"bonus,omitempty"`               // extra add-on / org credits on top of the plan
+	Remain      int64 `json:"remain"`
+	Total       int64 `json:"total"`
+	BalanceOnly bool  `json:"balance_only,omitempty"` // no finite quota: Total equals the current balance (AutoClaw points)
+	Expiring    int64 `json:"expiring,omitempty"`     // within the expiring soon window
+	Bonus       int64 `json:"bonus,omitempty"`        // extra add-on / org credits on top of the plan
+	// BonusTotal is the issued size of that extra pool (Qoder's add-on
+	// package: 382 remaining out of 400). Without it the panel could only say
+	// "另有加赠 382", which never shows how much of the pack has been burned
+	// nor how big a fresh pack is — so "did a new pack land?" was unanswerable
+	// (BP-122).
+	BonusTotal        int64     `json:"bonus_total,omitempty"`
 	EarliestExpiresAt time.Time `json:"earliest_expires_at,omitempty"` // earliest future expiry among positive packs
 	EarliestRemaining int64     `json:"earliest_remaining,omitempty"`
 	UpdatedAt         time.Time `json:"updated_at"`
+
+	// Peak is the highest balance ever observed for this account, and PeakAt
+	// when it was reached (BP-122). It exists to make "did I actually receive
+	// the daily reward?" answerable: a balance that only ever falls is
+	// indistinguishable from one that received a +400 top-up hours ago unless
+	// the high-water mark is kept. WorkBuddy already shows 已用/上限 this way
+	// (remain out of the plan total); the balance-only channels (AutoClaw,
+	// Lobster) have no issued total at all, so the peak IS their ceiling.
+	Peak   int64     `json:"peak,omitempty"`
+	PeakAt time.Time `json:"peak_at,omitempty"`
 }
 
 // CostObservation records the observed billing tier for one (account, model)

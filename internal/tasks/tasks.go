@@ -574,6 +574,27 @@ func (s *Scheduler) hourIn(hours []int, h int) bool {
 	return false
 }
 
+// checkinFanOutTasks is the single list of channels whose daily check-in the
+// timer fires.
+//
+// It is a function returning a fresh slice rather than four inline calls
+// because of BP-121: Lobster's driver has had a complete Checkin (the
+// 每日积分礼, +100 credits/day) since BP-98, its task type was registered in
+// TaskTypes(), and its per-account handler existed in RunTask — yet nothing
+// ever called it from the timer, so task_runs holds ZERO rows for
+// checkin_lobster and the balance could only fall. Adding a channel meant
+// remembering an invisible fourth edit; the list makes it visible, and a test
+// pins that every registered checkin task is scheduled.
+func checkinFanOutTasks() []string {
+	return []string{
+		TaskCheckinWorkBuddy,
+		TaskCheckinTrae,
+		TaskCheckinAutoClaw,
+		TaskCheckinQoder,
+		TaskCheckinLobster,
+	}
+}
+
 // Start launches the background loop: daily checkins at the configured hours
 // (default 09:05/21:05 Asia/Shanghai), probes every probe_minutes, token
 // refresh every refresh_minutes — all panel-editable and hot-applied.
@@ -616,10 +637,9 @@ func (s *Scheduler) loop() {
 			// past the hour to avoid the top-of-hour upstream rush).
 			if id, _, ok := dueSlot(local, checkinHours, 5, s.lastFiredSlot("checkin")); ok {
 				s.markFired("checkin", id)
-				s.runScheduled(TaskCheckinWorkBuddy, now)
-				s.runScheduled(TaskCheckinTrae, now)
-				s.runScheduled(TaskCheckinAutoClaw, now)
-				s.runScheduled(TaskCheckinQoder, now)
+				for _, taskType := range checkinFanOutTasks() {
+					s.runScheduled(taskType, now)
+				}
 			}
 			// Growth pipeline at the panel-editable hours (15-minute offset).
 			if id, _, ok := dueSlot(local, growthHours, 15, s.lastFiredSlot("growth")); ok {

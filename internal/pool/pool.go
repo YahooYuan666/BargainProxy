@@ -1161,7 +1161,26 @@ func (p *Pool) RecordCredits(a *model.Account, c model.Credits) {
 			}
 		}
 	}
+	// High-water mark (BP-122): every probe of a balance-only channel
+	// overwrites Total with the current balance, so the panel can only ever
+	// show "now". Keeping the peak is what makes a credit ARRIVAL visible —
+	// a daily check-in (+400 on AutoClaw, +100 on Lobster/Qoder) raises the
+	// balance above the previous peak exactly once, and the panel can then say
+	// "峰值 N，M 分钟前" instead of leaving the operator to guess whether the
+	// scheduled task actually paid out.
+	//
+	// The previous peak has to be read BEFORE the snapshot is replaced: the
+	// incoming Credits comes straight from a driver probe and carries no
+	// history.
+	prevPeak, prevPeakAt := a.Credits.Peak, a.Credits.PeakAt
 	a.Credits = c
+	if c.Remain > prevPeak || prevPeak == 0 {
+		a.Credits.Peak = c.Remain
+		a.Credits.PeakAt = c.UpdatedAt
+	} else {
+		a.Credits.Peak = prevPeak
+		a.Credits.PeakAt = prevPeakAt
+	}
 	a.UpdatedAt = p.params.Now()
 	p.changedLocked(a)
 }
