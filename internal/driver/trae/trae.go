@@ -4,9 +4,12 @@
 //
 // Behaviour notes (clean-room from research/2026-10-13-三项目与生态调研.md):
 // the upstream chat endpoint is /api/agent/v3/llm_utils_chat on the SOLO
-// agent host with a fixed header set; config_name injection breaks newer
-// models so only `model` is sent; error 1005 means plan entitlement
-// exhaustion (hard cooldown), 401 means the IDE JWT died.
+// agent host with a fixed header set. BOTH `model` and `config_name` are sent
+// and must carry the same id: config_name is what the upstream routes on, and
+// a request without it answers 200 from a single fixed provider endpoint
+// regardless of the model asked for (BP-137 — measured, see buildSOLOBody).
+// Error 1005 means plan entitlement exhaustion (hard cooldown), 401 means the
+// IDE JWT died.
 package trae
 
 import (
@@ -463,8 +466,32 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 		"function":   function,
 		"stream":     true, // forced
 		"model":      call.UpstreamModel,
-		"request_id": traeRequestID(),
-		"session_id": traeSessionID(call),
+		// config_name is what the upstream ROUTES on (BP-137). Sending only
+		// `model` does not fail — the request answers 200 with a normal-looking
+		// reply from ONE fixed provider endpoint, whatever the model says. The
+		// proof is in the response's own timing_cost frame:
+		//
+		//	model=kimi-k3                 provider_model_name=ep-20260802210216-sl4tw
+		//	model=Doubao-Seed-2.1-Pro     provider_model_name=ep-20260802210216-sl4tw
+		//	model=kimi-k2.6               provider_model_name=ep-20260802210216-sl4tw
+		//	model=glm-5.3-flash           provider_model_name=ep-20260802210216-sl4tw
+		//	model=___not_a_model___       provider_model_name=ep-20260802210216-sl4tw
+		//
+		// (measured 2026-10-27 on the CN account; ep-… is a Volcengine endpoint
+		// id, i.e. ByteDance's own default). Adding config_name changed the
+		// answers to ali-kimi-k3 / glm-5.3-flash — the models actually asked
+		// for. This also explains the long-standing "any fake model name gets
+		// 200" observation: it was never leniency, it was the router ignoring
+		// us. magpie sends config_name+model together (trae index.mjs
+		// chatBody); traework documents that the chat route matches
+		// config_name exactly.
+		//
+		// The old "config_name injection breaks newer models" note in this
+		// package's header came from an early, partial read and is now known
+		// to be wrong — the opposite was true.
+		"config_name": call.UpstreamModel,
+		"request_id":  traeRequestID(),
+		"session_id":  traeSessionID(call),
 	}
 	if req.Temperature != nil {
 		body["temperature"] = *req.Temperature

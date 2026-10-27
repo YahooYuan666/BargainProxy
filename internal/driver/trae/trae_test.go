@@ -66,8 +66,12 @@ func TestSOLOBodyShape(t *testing.T) {
 	if doc["model"] != "glm-5.2" {
 		t.Fatalf("model = %v", doc["model"])
 	}
-	if _, ok := doc["config_name"]; ok {
-		t.Fatal("config_name must NOT be injected (breaks newer models)")
+	// BP-137 reversed the old rule here. The body MUST carry config_name: it is
+	// what the upstream routes on, and without it every request is answered by
+	// one fixed provider endpoint regardless of `model` (measured 2026-10-27 —
+	// bp137_config_name_test.go holds the provider_model_name evidence).
+	if got, ok := doc["config_name"]; !ok || got != doc["model"] {
+		t.Fatalf("config_name = %v (present=%v), must equal model %v", got, ok, doc["model"])
 	}
 	msgs := doc["messages"].([]any)
 	// First message content must be block array form.
