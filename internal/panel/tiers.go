@@ -82,6 +82,10 @@ func domesticCatalog() []tierRow {
 		{Source: "workbuddy", ID: "deepseek-v4-flash", Billing: "x0.11 · 已被 4.1 淘汰", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + high", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "deepseek-v4.1-flash", Billing: "x0.11（夜间折扣）", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "kimi-k3", Billing: "x1.62", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+		// Kimi 3.1 (BP-138): CN spells it kimi-k3-1, global kimi-k3.1-pro — both
+		// present in /v3/config (2026-10-27). 倍率未在配置里给出，按 K3 同档标注待实测。
+		{Source: "workbuddy", ID: "kimi-k3-1", Billing: "倍率待实测（K3.1，CN 拼写）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+		{Source: "workbuddy", ID: "kimi-k3.1-pro", Billing: "倍率待实测（K3.1，国际拼写）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "kimi-k2.7", Billing: "x0.25（倍率待复核）", ContextLen: 262144, MaxOutput: 262144, InputModes: m("text", "image", "video"), Reasoning: "关闭（Moonshot 官方仅 toggle）", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "kimi-k2.6", Billing: "x0.20（倍率待复核）", ContextLen: 262144, MaxOutput: 262144, InputModes: m("text", "image", "video"), Reasoning: "关闭（Moonshot 官方仅 toggle）", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "minimax-m3", Billing: "x0.15（倍率待复核）", ContextLen: 1048576, MaxOutput: 512000, InputModes: m("text", "image", "video"), Reasoning: "关闭（MiniMax 官方仅 toggle）", ToolCall: true, Structured: true},
@@ -101,6 +105,7 @@ func domesticCatalog() []tierRow {
 		{Source: "trae", ID: "deepseek-v4.1-flash", Billing: "免费忙时 x0.12 / 空闲 x0.06；付费会员全时段 x0.06", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: false, Structured: true},
 		{Source: "trae", ID: "doubao-seed-2.1-pro", Billing: "高级包 约30-50/次", ContextLen: 256000, MaxOutput: 128000, InputModes: m("text", "image", "video"), Reasoning: "官方 turbo 口径 关闭 + low/high（pro 未单列）", ToolCall: true, Structured: true},
 		{Source: "trae", ID: "kimi-k3", Billing: "x1.83", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "kimi-k3.1-pro", Billing: "倍率待实测（K3.1）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
 		// ZCode（Z.AI Coding Plan 计划内额度；提供 GLM 系模型，无 Claude）
 		{Source: "zcode", ID: "glm-5.3", Billing: "计划内额度", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	}
@@ -169,6 +174,9 @@ var routedSpecs = map[string]tierRow{
 	"lobster|qwen3.8-max":        {Billing: "x0.91 · ¥12/¥36 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "官方不开放档位（走上游默认）", ToolCall: true, Structured: true},
 	"lobster|qwen3.8-flash":      {Billing: "x0.06 · ¥0.8/¥2.7 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "官方不开放档位（走上游默认）", ToolCall: true, Structured: true},
 	"lobster|kimi-k3":            {Billing: "x1.35 · ¥20/¥100 每百万（思考固定 max）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "客户端固定 max", ToolCall: true, Structured: true},
+	// K3.1 反而比 K3 便宜（0.88 vs 1.35，2026-10-27 价格目录实测）；highspeed 版更贵。
+	"lobster|kimi-k3.1-pro":           {Billing: "x0.88 · K3.1 Pro（比 K3 便宜）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "客户端固定 max", ToolCall: true, Structured: true},
+	"lobster|kimi-k3.1-pro-highspeed": {Billing: "x1.16 · K3.1 Pro 高速版", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "客户端固定 max", ToolCall: true, Structured: true},
 	// autoclaw 的 tdpsk_deepseek-* 两条已移除：CN 加速网关对本账号三个候选 id
 	// 全部回 400「非法模型」，而同刻 glm-5.3-flash 可用（2026-10-23 实测）。
 	// Trae 免费用户折扣表：glm-5.3-flash 未单列，取客户端截图 0.06x（无折扣标签）。

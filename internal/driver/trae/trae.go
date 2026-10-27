@@ -1514,7 +1514,7 @@ func (d *Driver) Models(ctx context.Context) ([]string, error) {
 		// model table documents the same constraint).
 		"deepseek-v4.1-flash",
 		"glm-5.2", "glm-5", "glm-5-turbo",
-		"kimi-k3", "kimi-k2.7-code", "kimi-k2.6",
+		"kimi-k3", "kimi-k3.1-pro", "kimi-k2.7-code", "kimi-k2.6",
 		"minimax-m3", "qwen-3.7-plus",
 	}, nil
 }

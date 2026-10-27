@@ -1399,7 +1399,12 @@ func (d *Driver) Models(ctx context.Context) ([]string, error) {
 	return []string{
 		"glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5v-turbo",
 		"deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4.1-flash",
-		"kimi-k2.6", "kimi-k2.7", "kimi-k3", "minimax-m3",
+		// Kimi 3.1 (BP-138): the CN catalogue spells it `kimi-k3-1` and the
+		// global one `kimi-k3.1-pro` — both verified against /v3/config on
+		// 2026-10-27 (12 and 6 kimi entries respectively). The bare
+		// `kimi-k3.1` spelling is answered 11158 "service info not found",
+		// which reads like an account-type limit but is a name error.
+		"kimi-k2.6", "kimi-k2.7", "kimi-k3", "kimi-k3-1", "kimi-k3.1-pro", "minimax-m3",
 		"hy3", "hy3-preview", "gemini-3.5-flash",
 	}, nil
 }
