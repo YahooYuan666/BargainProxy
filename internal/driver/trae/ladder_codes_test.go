@@ -71,17 +71,19 @@ func TestLadderWalksOn4023And1005(t *testing.T) {
 
 // Test1005CarriesBusinessCode: the final propagated 1005 (every rung refused)
 // must keep its business code on the error so the panel shows 1005, not a
-// bare message — and so the pool's SoftRate handling keys on the code.
+// bare message — and so the ladder gate and the panel key on the code.
+// BP-125: the class moved to model_rate (plan paywall is per-model; the
+// account-wide 12h rest froze healthy accounts) with a 1h TTL.
 func Test1005CarriesBusinessCode(t *testing.T) {
 	e := classifyBusiness(1005, "plan entitlement exhausted")
 	if e.Code != "1005" {
 		t.Fatalf("1005 must carry Code=1005, got %q", e.Code)
 	}
-	if e.Class != uperr.ClassSoftRate {
-		t.Fatalf("1005 class = %s, want soft_rate", e.Class)
+	if e.Class != uperr.ClassModelRate {
+		t.Fatalf("1005 class = %s, want model_rate", e.Class)
 	}
-	if time.Until(e.ResetAt) < 11*time.Hour {
-		t.Fatalf("1005 reset too soon: %s", e.ResetAt)
+	if ttl := time.Until(e.ResetAt); ttl < 30*time.Minute || ttl > 2*time.Hour {
+		t.Fatalf("1005 reset = %s, want about 1h", e.ResetAt)
 	}
 }
 
@@ -99,14 +101,14 @@ func Test4023IsBadRequestWithCode(t *testing.T) {
 }
 
 // TestQuotaCodes4008And4011: the quota family beyond 1005 (CN 4008, Global
-// 4011) must read as plan-entitlement soft-rate with the code attached —
-// today they fall into ClassInternal "account keeps being retried without a
-// cooldown".
+// 4011) must read as plan-entitlement model_rate with the code attached —
+// BP-125 moved them off soft_rate so a paywalled model no longer freezes the
+// whole account.
 func TestQuotaCodes4008And4011(t *testing.T) {
 	for _, code := range []int{4008, 4011} {
 		e := classifyBusiness(code, "quota")
-		if e.Class != uperr.ClassSoftRate {
-			t.Fatalf("code %d class = %s, want soft_rate", code, e.Class)
+		if e.Class != uperr.ClassModelRate {
+			t.Fatalf("code %d class = %s, want model_rate", code, e.Class)
 		}
 		if e.Code != fmt.Sprint(code) {
 			t.Fatalf("code %d must carry its business code, got %q", code, e.Code)
@@ -177,8 +179,8 @@ func TestLadderExhaustedPropagates1005Cooldown(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected an uperr.Error, got %T: %v", err, err)
 	}
-	if ue.Class != uperr.ClassSoftRate || ue.Code != "1005" {
-		t.Fatalf("final error = %s/%s, want soft_rate/1005", ue.Class, ue.Code)
+	if ue.Class != uperr.ClassModelRate || ue.Code != "1005" {
+		t.Fatalf("final error = %s/%s, want model_rate/1005", ue.Class, ue.Code)
 	}
 	if strings.Count(ue.Message, "1005") > 0 && !strings.Contains(ue.Message, "plan entitlement") {
 		t.Fatalf("message lost the upstream reason: %q", ue.Message)

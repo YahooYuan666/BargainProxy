@@ -37,11 +37,14 @@ const (
 	// (official packet captures of both packages, 2026-10-22). Version segments
 	// are per realm — the two distributions ship on different cadences, so
 	// sending CN's number to the global edge does not match any real build.
-	desktopUA             = "WorkBuddy/" + clientVersionCN + " WorkBuddy/" + clientVersionCN + " CLI/" + cliVersion
-	desktopUAGlobal       = "WorkBuddy/" + clientVersionGlobal + " workbuddy-ai/" + clientVersionGlobal + " CLI/" + cliVersion
-	clientVersionCN       = "5.8.3"
-	clientVersionGlobal   = "5.8.4"
-	cliVersion            = "2.161.0"
+	desktopUA           = "WorkBuddy/" + clientVersionCN + " WorkBuddy/" + clientVersionCN + " CLI/" + cliVersion
+	desktopUAGlobal     = "WorkBuddy/" + clientVersionGlobal + " workbuddy-ai/" + clientVersionGlobal + " CLI/" + cliVersion
+	clientVersionCN     = "5.8.3"
+	clientVersionGlobal = "5.8.4"
+	// 2.176.0: the npm @tencent-ai/codebuddy-code version the risk-control
+	// environment checks against (misakano 244d4e6/f0c427d — 2.161.0 predates
+	// the versioned gate).
+	cliVersion            = "2.176.0"
 	clientVersion         = clientVersionCN // legacy alias used by the growth/billing paths
 	stainlessSDKVersion   = "6.25.0"
 	stainlessNodeVersion  = "v22.21.1"

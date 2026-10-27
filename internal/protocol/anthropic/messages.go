@@ -529,8 +529,14 @@ func RenderMessage(id, model string, resp *ir.ChatResponse) *MessageResponse {
 		out.Content = append(out.Content, ContentBlock{Type: "text", Text: text})
 	}
 	for _, tc := range resp.Message.ToolCalls {
+		// BP-128: pass the arguments through as raw JSON. Unmarshalling into
+		// map[string]any turned every number into float64, so a 64-bit id
+		// like 9007199254740993 reached the client rounded to …992 (new-api
+		// 4d962e4 hit the same wire bug). Invalid JSON still degrades to {}.
 		var input any
-		if err := json.Unmarshal([]byte(tc.Arguments), &input); err != nil {
+		if raw := strings.TrimSpace(tc.Arguments); raw != "" && json.Valid([]byte(raw)) {
+			input = json.RawMessage(raw)
+		} else {
 			input = map[string]any{}
 		}
 		out.Content = append(out.Content, ContentBlock{Type: "tool_use", ID: tc.ID, Name: tc.Name, Input: input})

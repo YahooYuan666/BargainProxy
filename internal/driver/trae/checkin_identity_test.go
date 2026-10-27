@@ -72,15 +72,23 @@ func TestUgDeviceNormalizedTo16Digits(t *testing.T) {
 // (yetone/magpie#808).
 func TestUgBodyReqSource(t *testing.T) {
 	var statusBody, claimBody string
+	claimed := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw := make([]byte, 512)
 		n, _ := r.Body.Read(raw)
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/status"):
 			statusBody = string(raw[:n])
+			// BP-147: the status is read twice (before and after the claim);
+			// the second read is what confirms the day registered.
+			if claimed {
+				fmt.Fprint(w, `{"checked_in":true,"enable":true,"credits":200}`)
+				return
+			}
 			fmt.Fprint(w, `{"checked_in":false,"enable":true,"credits":100}`)
 		default:
 			claimBody = string(raw[:n])
+			claimed = true
 			fmt.Fprint(w, `{"code":0}`)
 		}
 	}))
@@ -130,8 +138,10 @@ func TestCheckin9095IsIdempotentSuccess(t *testing.T) {
 	}
 }
 
-// TestCheckin9074FailsFast: "go check in via the app" is not retryable —
-// three 20s waits per account per slot is the current waste.
+// TestCheckin9074FailsFast: a PERMANENT 9074 refusal ("go check in via the
+// app") is not retryable — three 20s waits per account per slot is pure waste
+// (BP-98 TRAE-3). The RUSH wording ("参与用户太多") is a different answer and
+// retries — see TestCheckin9074RushRetries in trae_test.go.
 func TestCheckin9074FailsFast(t *testing.T) {
 	var claims int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

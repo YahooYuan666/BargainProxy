@@ -92,6 +92,16 @@ type Credits struct {
 	EarliestRemaining int64     `json:"earliest_remaining,omitempty"`
 	UpdatedAt         time.Time `json:"updated_at"`
 
+	// NotReported marks a channel that structurally cannot answer "how many
+	// credits are left" — today only a WorkBuddy API-key account, whose key has
+	// no billing endpoint at all (BP-144).
+	//
+	// It is NOT the same fact as an unread balance. "未获取（点刷新额度读取）"
+	// tells the user to press a button that cannot work here, and a row of
+	// "—" is indistinguishable from "we have not looked yet". This flag lets
+	// the panel say the honest thing: the upstream does not report it.
+	NotReported bool `json:"not_reported,omitempty"`
+
 	// Peak is the highest balance ever observed for this account, and PeakAt
 	// when it was reached (BP-122). It exists to make "did I actually receive
 	// the daily reward?" answerable: a balance that only ever falls is
@@ -229,6 +239,12 @@ type RequestLog struct {
 	// (quota-based channels report none) — BP-40.
 	Credit      float64 `json:"credit,omitempty"`
 	CreditKnown bool    `json:"credit_known,omitempty"`
+	// ToolsDeclared/ToolCalls count the tools the request declared vs the
+	// calls the answer actually made (misakano ce6e753, issue #44): the gap
+	// "upstream said stop but never called a tool" becomes observable instead
+	// of anecdotal (BP-133).
+	ToolsDeclared int `json:"tools_declared,omitempty"`
+	ToolCalls     int `json:"tool_calls,omitempty"`
 	// CachedTokens is the upstream-reported prefix-cache hit size for this
 	// request (workbuddy usage.prompt_cache_hit_tokens / gemini
 	// cachedContentTokenCount; 0 = nothing cached). CacheKnown marks whether

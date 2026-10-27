@@ -33,7 +33,7 @@ func TestStreamRoutesPerLane(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
 		w.Header().Set("Content-Type", "text/event-stream")
-		if r.URL.Path == "/v1/responses" {
+		if r.URL.Path == "/responses" {
 			w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"))
 			w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
 			return
@@ -70,7 +70,7 @@ func TestStreamRoutesPerLane(t *testing.T) {
 	if _, err := d.Stream(context.Background(), call, emit); err == nil {
 		t.Fatal("a model with no supported lane must be refused")
 	}
-	want := "/v1/responses,/v1/chat/completions"
+	want := "/responses,/chat/completions"
 	if got := strings.Join(paths, ","); got != want {
 		t.Fatalf("upstream paths = %q, want %q", got, want)
 	}
@@ -99,8 +99,9 @@ func TestBuildResponsesWireShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if body["instructions"] != "be brief" {
-		t.Fatalf("system prompt must ride in instructions: %v", body["instructions"])
+	// BP-127: instructions end with OpenCode's environment block.
+	if ins, _ := body["instructions"].(string); !strings.HasPrefix(ins, "be brief") || !zenHasEnvironment.MatchString(ins) {
+		t.Fatalf("instructions must keep the prompt and carry the env block: %q", body["instructions"])
 	}
 	if body["stream"] != true {
 		t.Fatal("streaming is a hard free-lane requirement")
@@ -112,8 +113,8 @@ func TestBuildResponsesWireShape(t *testing.T) {
 		t.Fatal(`tool_choice:"none" must never reach the responses lane`)
 	}
 	tools, _ := body["tools"].([]any)
-	if len(tools) != 3 {
-		t.Fatalf("tools = %d, want 1 real + 2 gate", len(tools))
+	if len(tools) != 1+len(gateToolNames) {
+		t.Fatalf("tools = %d, want 1 real + %d gate", len(tools), len(gateToolNames))
 	}
 	names := map[string]bool{}
 	for _, tl := range tools {
@@ -238,10 +239,15 @@ func TestBuildChatWireToolRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(body.Messages) != 3 {
-		t.Fatalf("messages = %d, want 3", len(body.Messages))
+	// BP-127: the request carried no system message, so the OpenCode env
+	// block rides in as one first.
+	if len(body.Messages) != 4 {
+		t.Fatalf("messages = %d, want 4 (3 turns + injected env system)", len(body.Messages))
 	}
-	asst := body.Messages[1]
+	if env, _ := body.Messages[0]["content"].(string); !zenHasEnvironment.MatchString(env) {
+		t.Fatalf("first message must be the env system block, got %v", body.Messages[0])
+	}
+	asst := body.Messages[2]
 	if _, hasContent := asst["content"]; hasContent {
 		t.Fatalf("tool-only assistant turn must omit content: %v", asst)
 	}
@@ -253,7 +259,7 @@ func TestBuildChatWireToolRoundTrip(t *testing.T) {
 	if fn["name"] != "get_weather" || fn["arguments"] != `{"city":"sf"}` {
 		t.Fatalf("tool call mangled: %v", fn)
 	}
-	toolMsg := body.Messages[2]
+	toolMsg := body.Messages[3]
 	if toolMsg["role"] != "tool" || toolMsg["tool_call_id"] != "call_1" || toolMsg["content"] != "18C" {
 		t.Fatalf("tool result shape wrong: %v", toolMsg)
 	}
@@ -321,7 +327,7 @@ func TestToolCapKeepsTheTurnAlive(t *testing.T) {
 			t.Fatalf("%s: unmarshal: %v", lane, err)
 		}
 		if len(body.Tools) != maxUpstreamTools {
-			t.Fatalf("%s: tools = %d, want exactly %d (126 client + bash/read)", lane, len(body.Tools), maxUpstreamTools)
+			t.Fatalf("%s: tools = %d, want exactly %d (client + %d gate stubs)", lane, len(body.Tools), maxUpstreamTools, len(gateToolNames))
 		}
 		if got := toolNameOf(body.Tools[0]); got != "get_weather" {
 			t.Fatalf("%s: first client tool lost: %q", lane, got)

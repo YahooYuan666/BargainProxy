@@ -25,6 +25,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // outputLimits maps a canonical or upstream model id to its maximum output
@@ -173,4 +175,73 @@ func FloorFromMessage(body string) int {
 		}
 	}
 	return 0
+}
+
+// --- learned output ceilings (BP-129) ----------------------------------------
+
+// maxTokensCeilingRe matches the wording upstreams use when max_tokens exceeds
+// their per-model maximum — the mirror image of the floor wording above.
+// Evidence: Qoder answers 400 "Range of max_tokens should be [1, N]" with no
+// catalog field disclosing N (qoderhub #100/#101, learned-and-clamped there
+// since 2026-10-25).
+var maxTokensCeilingRe = regexp.MustCompile(
+	`(?i)range of max[_ ]?(?:output[_ ]?|completion[_ ]?)?tokens?\s*(?:should be|is|must be)?[^\[]{0,20}\[\s*1\s*,\s*(\d{1,9})\s*\]`,
+)
+
+// CeilingFromMessage extracts the per-model maximum output-token count a 400
+// body states, or 0 when none. Sanity band: real ceilings are ≥ 1024 (a
+// smaller number would be a floor wearing a ceiling's clothes) and ≤ 10M.
+func CeilingFromMessage(body string) int {
+	if body == "" {
+		return 0
+	}
+	m := maxTokensCeilingRe.FindStringSubmatch(body)
+	if m == nil {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 1024 || n > 10_000_000 {
+		return 0
+	}
+	return n
+}
+
+// learnedCeilings remembers (channel, model) → max an upstream stated in a
+// 400, so later requests clamp upfront instead of failing once per turn.
+// In-process only: after a restart the first over-limit request re-learns
+// with one repaired retry, which is cheap. An entry expires after 7 days —
+// upstreams do raise limits.
+var learnedCeilings sync.Map // key string → learnedCeiling
+
+type learnedCeiling struct {
+	cap   int
+	until time.Time
+}
+
+const learnedCeilingTTL = 7 * 24 * time.Hour
+
+func ceilingKey(channel, model string) string {
+	return channel + "" + strings.ToLower(strings.TrimSpace(model))
+}
+
+// LearnOutputCeiling records an upstream-stated ceiling.
+func LearnOutputCeiling(channel, model string, cap int) {
+	if cap <= 0 || model == "" {
+		return
+	}
+	learnedCeilings.Store(ceilingKey(channel, model), learnedCeiling{cap: cap, until: time.Now().Add(learnedCeilingTTL)})
+}
+
+// LearnedOutputCeiling returns a still-fresh learned ceiling, or 0.
+func LearnedOutputCeiling(channel, model string) int {
+	v, ok := learnedCeilings.Load(ceilingKey(channel, model))
+	if !ok {
+		return 0
+	}
+	lc := v.(learnedCeiling)
+	if time.Now().After(lc.until) {
+		learnedCeilings.Delete(ceilingKey(channel, model))
+		return 0
+	}
+	return lc.cap
 }

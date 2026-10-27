@@ -94,8 +94,10 @@ func TestNormalizeBodyIdentityBlocksAndCacheControl(t *testing.T) {
 		t.Fatal("stream must be forced true")
 	}
 	sys := doc["system"].([]any)
-	if len(sys) < 4 {
-		t.Fatalf("expected official blocks + currentModel + user system, got %d blocks", len(sys))
+	// BP-126: zcode.z.ai rejects a fourth block with 405/3012 — the model
+	// declaration and the user system are merged into the third block's text.
+	if len(sys) != 3 {
+		t.Fatalf("expected exactly 3 system blocks (3012 beyond that), got %d", len(sys))
 	}
 	// The dynamic currentModel block must exist.
 	foundModelBlock := false
@@ -108,10 +110,17 @@ func TestNormalizeBodyIdentityBlocksAndCacheControl(t *testing.T) {
 	if !foundModelBlock {
 		t.Fatal("currentModel identity block missing")
 	}
-	// metadata.user_id = JWT sub.
+	// BP-126: metadata.user_id is a JSON object string naming the device and
+	// the conversation's session id (the bare JWT sub mostly missed the
+	// BigModel prompt cache).
 	meta := doc["metadata"].(map[string]any)
-	if meta["user_id"] != "u1" {
-		t.Fatalf("metadata.user_id = %v", meta["user_id"])
+	uidRaw, _ := meta["user_id"].(string)
+	var uid struct {
+		DeviceID  string `json:"device_id"`
+		SessionID string `json:"session_id"`
+	}
+	if json.Unmarshal([]byte(uidRaw), &uid) != nil || uid.DeviceID == "" || uid.SessionID == "" {
+		t.Fatalf("metadata.user_id = %v, want a device/session JSON string", meta["user_id"])
 	}
 	// cache_control ephemeral on last block of last non-system message.
 	msgs := doc["messages"].([]any)
@@ -245,11 +254,17 @@ func TestCode3012IsContentRejection(t *testing.T) {
 		Request:       &ir.ChatRequest{Model: "glm-5.3", Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "x"}}}}},
 	}, func(ev ir.StreamEvent) error { return nil })
 	ue, ok := uperr.As(err)
-	if !ok || ue.Class != uperr.ClassContentBlocked {
-		t.Fatalf("expected content_blocked for 3012, got %v", err)
+	if !ok || ue.Class != uperr.ClassAccountRestricted {
+		t.Fatalf("expected account_restricted for 3012, got %v", err)
 	}
+	// BP-146 reversed the rotation rule. 3012 is upstream risk control on the
+	// ACCOUNT, and risk control reads a burst of attempts from one egress as
+	// the pattern it reacts to — Coding2API measured exactly that on the
+	// sibling code (one request walked three accounts, the last banned three
+	// minutes later, f428e33). The bind loop still cascades to a different
+	// channel.
 	if uperr.Rotatable(ue.Class) {
-		t.Fatal("content rejection must not rotate accounts")
+		t.Fatal("a risk-flagged account must NOT rotate within its channel (BP-146)")
 	}
 }
 

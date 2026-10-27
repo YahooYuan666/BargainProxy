@@ -64,6 +64,7 @@ const (
 	keyActivityHours      = "task_activity_hours"
 	keyTravelHours        = "task_travel_hours"
 	keyBlackcatHours      = "task_blackcat_hours"
+	keyBlackcatAccountCap = "task_blackcat_account_cap"
 )
 
 // Scheduler runs tasks on demand and on a daily wall clock.
@@ -101,6 +102,7 @@ type Scheduler struct {
 	activityHours  []int
 	travelHours    []int
 	blackcatHours  []int
+	blackcatCap    int // 0 = all accounts (BP-133 Top-N knob, default off)
 	probeMin       int
 	googleProbeMin int
 	refreshMin     int
@@ -415,6 +417,11 @@ func (s *Scheduler) LoadSettings() {
 	if v, ok, err := s.st.GetSetting(keyBlackcatHours); err == nil && ok {
 		if hours, err := parseHours(v); err == nil {
 			s.blackcatHours = hours
+		}
+	}
+	if v, ok, err := s.st.GetSetting(keyBlackcatAccountCap); err == nil && ok {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
+			s.blackcatCap = n
 		}
 	}
 	if v, ok, err := s.st.GetSetting(KeyIncludeDisabledInTasks); err == nil && ok {
@@ -861,6 +868,33 @@ func (s *Scheduler) runPerAccount(
 	if len(accounts) == 0 {
 		return "no accounts on channel " + channel, nil
 	}
+	// BP-149: drop the accounts this task can never act on BEFORE dispatching,
+	// so they leave no ledger row at all.
+	//
+	// These tasks used to be dispatched anyway and answer "skipped (global
+	// realm has no growth center)" as a success. With one global account on a
+	// channel and five scheduled workbuddy tasks that is five "成功" rows a day
+	// whose detail says nothing happened — the panel's task history becomes
+	// mostly noise, and a real failure is one row among them (field 2026-10-27:
+	// the user asked why these rows exist at all).
+	//
+	// An account-targeted run (a panel click) still goes through: the user
+	// asked for THAT account and deserves the honest answer.
+	if accountID == "" {
+		before := len(accounts)
+		accounts = s.filterActionable(taskType, accounts)
+		if len(accounts) == 0 {
+			return fmt.Sprintf("nothing to do (%d account(s) not eligible for this task on %s)",
+				before, channel), nil
+		}
+	}
+	// BP-133: the night-owl burst is a fleet-wide real-chat run at a fixed
+	// hour. An account cap (store setting task_blackcat_account_cap, 0 = all)
+	// keeps only the top-N accounts by credit balance in the game — the same
+	// "夜猫子 Top-N" humanization misakano a24c10a shipped.
+	if taskType == TaskBlackcatWorkBuddy && accountID == "" && s.blackcatCap > 0 {
+		accounts = capBlackcatAccounts(accounts, s.blackcatCap)
+	}
 
 	today := time.Now().In(Shanghai).Format("2006-01-02")
 	var notes []string
@@ -932,6 +966,20 @@ func (s *Scheduler) runPerAccount(
 	// Errors are informative, not fatal: accounts are independent. Report the
 	// first failure so the panel can surface it while keeping the detail.
 	return detail, firstErr
+}
+
+// capBlackcatAccounts keeps the top-N accounts by credit balance (stable
+// order otherwise), so a capped night-owl burst prefers the accounts with the
+// most to burn.
+func capBlackcatAccounts(accounts []*model.Account, cap int) []*model.Account {
+	if cap <= 0 || len(accounts) <= cap {
+		return accounts
+	}
+	sorted := append([]*model.Account(nil), accounts...)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Credits.Remain > sorted[j].Credits.Remain
+	})
+	return sorted[:cap]
 }
 
 func (s *Scheduler) accountsOf(channel string) []*model.Account {

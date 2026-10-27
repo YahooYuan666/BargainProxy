@@ -18,7 +18,7 @@ func TestQoderMultipliersMatchUpstreamCatalog(t *testing.T) {
 		"Qwen3.8-Max":     "x0.5",
 		"DeepSeek-V4-Pro": "x0.5",
 		"DeepSeek-Flash":  "x0.1",
-		"Kimi-K3":         "x1.4",
+		"Kimi-K3.1-Pro":   "x1.0",
 	}
 	for model, prefix := range want {
 		spec, ok := routedSpecs["qoder|"+model]
@@ -120,7 +120,7 @@ func TestMultipliersAreNotCrossChannelComparable(t *testing.T) {
 			trae++
 		}
 	}
-	for _, key := range []string{"qoder|GLM-5.3", "qoder|Kimi-K3"} {
+	for _, key := range []string{"qoder|GLM-5.3", "qoder|Kimi-K3.1-Pro"} {
 		if _, ok := routedSpecs[key]; ok {
 			qoder++
 		}

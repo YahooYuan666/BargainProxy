@@ -164,6 +164,7 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("POST /panel/api/accounts/workbuddy/poll", p.authed(p.handleWBPoll, true))
 	mux.HandleFunc("POST /panel/api/accounts/trae/start", p.authed(p.handleTraeStart, true))
 	mux.HandleFunc("GET /panel/api/accounts/trae/poll", p.authed(p.handleTraePoll, false))
+	mux.HandleFunc("POST /panel/api/accounts/trae/paste", p.authed(p.handleTraePaste, true))
 	mux.HandleFunc("POST /panel/api/accounts/zcode/start", p.authed(p.handleZcodeStart, true))
 	mux.HandleFunc("GET /panel/api/accounts/zcode/poll", p.authed(p.handleZcodePoll, false))
 	mux.HandleFunc("POST /panel/api/accounts/autoclaw/sendcode", p.authed(p.handleAutoClawSendCode, true))

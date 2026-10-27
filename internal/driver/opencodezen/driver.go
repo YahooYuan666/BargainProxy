@@ -24,7 +24,13 @@ import (
 )
 
 // zenUpstreamBase is the anonymous free-lane base. Overridable for tests.
-const zenUpstreamBase = "https://opencode.ai/zen"
+// zenUpstreamBase is the inference API the free lane answers on. Before
+// BP-127 this was https://opencode.ai/zen (→ /zen/v1 on the wire): since
+// mid-October 2026 the free models answer 403 FreeTierError there and 200 on
+// the inference API — the same request, byte for byte (magpie zen-free,
+// which moved with it). The /v1 the old code appended per path is part of
+// the base now.
+const zenUpstreamBase = "https://opencode.ai/inference/v1"
 
 // Driver implements driver.Driver for the opencodezen channel.
 type Driver struct {
@@ -57,7 +63,7 @@ func (d *Driver) Channel() string { return model.ChannelOpenCodeZen }
 
 // Probe is a lightweight liveness check against the model list endpoint.
 func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(d.base(), "/")+"/v1/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(d.base(), "/")+"/models", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -77,8 +83,13 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 }
 
 func (d *Driver) base() string {
-	if d.cfg.BaseURL != "" {
-		return d.cfg.BaseURL
+	if b := strings.TrimRight(d.cfg.BaseURL, "/"); b != "" {
+		// Stale configs still name the pre-BP-127 default; the free lane
+		// stopped answering there, so route the old default to the new base.
+		if strings.HasSuffix(b, "opencode.ai/zen") || strings.HasSuffix(b, "opencode.ai/zen/v1") {
+			return zenUpstreamBase
+		}
+		return b
 	}
 	return zenUpstreamBase
 }
@@ -86,7 +97,7 @@ func (d *Driver) base() string {
 // Models lists the upstream model catalog (best-effort; used by the
 // directory sync task — BP-54).
 func (d *Driver) Models(ctx context.Context) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(d.base(), "/")+"/v1/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(d.base(), "/")+"/models", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -171,10 +182,12 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 // few MCP servers easily exceeds that, and a hard failure kills the whole turn —
 // keeping the first N client tools plus our two gate stubs lets the request
 // through (with fewer optional tools) instead.
-const (
-	maxUpstreamTools = 128
-	maxClientTools   = maxUpstreamTools - 2 // room for the bash/read gate stubs
-)
+const maxUpstreamTools = 128
+
+// maxClientTools is a var, not a const: it leaves room for the gate stubs,
+// whose count grew from two (bash/read) to OpenCode's five-tool core set in
+// BP-127. len() over a slice is not constant, so the const block had to go.
+var maxClientTools = maxUpstreamTools - len(gateToolNames)
 
 // capTools truncates an over-long tool list, reporting whether it cut anything.
 func capTools[T any](tools []T) ([]T, bool) {
@@ -417,6 +430,7 @@ func (d *Driver) buildWire(call driver.ChatCall) ([]byte, error) {
 	if d.gateEnabled.Load() {
 		ensureGateTools(body, false)
 	}
+	injectEnvironment(body, false)
 	return json.Marshal(body)
 }
 
@@ -424,7 +438,7 @@ func (d *Driver) buildWire(call driver.ChatCall) ([]byte, error) {
 func (d *Driver) chatOnce(ctx context.Context, wire []byte, emit driver.Emit) (*ir.ChatResponse, error) {
 	ids := deriveRequestIDs(wire)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(d.base(), "/")+"/v1/chat/completions", bytes.NewReader(wire))
+		strings.TrimRight(d.base(), "/")+"/chat/completions", bytes.NewReader(wire))
 	if err != nil {
 		return nil, err
 	}
@@ -782,6 +796,7 @@ func (d *Driver) buildResponsesWire(call driver.ChatCall) ([]byte, error) {
 	}
 	if d.gateEnabled.Load() {
 		ensureGateTools(body, true)
+		injectEnvironment(body, true)
 	}
 	return json.Marshal(body)
 }
@@ -790,7 +805,7 @@ func (d *Driver) buildResponsesWire(call driver.ChatCall) ([]byte, error) {
 func (d *Driver) responsesOnce(ctx context.Context, wire []byte, emit driver.Emit) (*ir.ChatResponse, error) {
 	ids := deriveRequestIDs(wire)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		strings.TrimRight(d.base(), "/")+"/v1/responses", bytes.NewReader(wire))
+		strings.TrimRight(d.base(), "/")+"/responses", bytes.NewReader(wire))
 	if err != nil {
 		return nil, err
 	}

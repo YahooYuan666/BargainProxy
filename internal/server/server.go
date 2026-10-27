@@ -64,6 +64,13 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.APIKey != "" {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if got == "" {
+				// Anthropic SDKs authenticate every call — model lists
+				// included — with x-api-key, not Bearer (misakano dc75c04):
+				// without this fallback such a client calls /v1/messages fine
+				// and then 401s on GET /v1/models.
+				got = r.Header.Get("x-api-key")
+			}
 			if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.APIKey)) != 1 {
 				writeJSON(w, http.StatusUnauthorized, openai.RenderError("invalid api key", "invalid_request_error", "invalid_api_key"))
 				return
@@ -242,7 +249,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		logRow.CreditKnown = result.Response.Usage.CreditKnown
 		logRow.CachedTokens = result.Response.Usage.CachedInputTokens
 		logRow.CacheKnown = result.Response.Usage.CacheKnown
+		logRow.ToolCalls = len(result.Response.Message.ToolCalls)
 	}
+	logRow.ToolsDeclared = result.ToolsDeclared
 	if result.Degraded != "" {
 		logRow.Degraded = result.Degraded
 	}
@@ -302,12 +311,17 @@ func (s *Server) bufferedChat(w http.ResponseWriter, r *http.Request, req *ir.Ch
 
 // streamChat runs a streamed request with OpenAI SSE framing.
 func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.ChatRequest, reqID string, start time.Time, logRow *model.RequestLog) (*gateway.Result, error) {
-	fl, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Request-Id", reqID)
 	w.WriteHeader(http.StatusOK)
+
+	// BP-142: a Chat client only understands data frames, so an SSE comment
+	// is the one keepalive we may send while the upstream is quiet — see
+	// keepalive.go for why silence is not survivable without it.
+	lw, ka := newStreamKeepalive(w, "")
+	defer ka.Stop()
 
 	created := time.Now().Unix()
 	first := true
@@ -322,11 +336,8 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 		if err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+		if _, err := fmt.Fprintf(lw, "data: %s\n\n", b); err != nil {
 			return err
-		}
-		if fl != nil {
-			fl.Flush()
 		}
 		return nil
 	}
@@ -336,6 +347,8 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 			logRow.TTFBMs = int(time.Since(start).Milliseconds())
 			first = false
 		}
+		ka.MarkStarted()
+		ka.NoteEvent()
 		switch ev.Kind {
 		case ir.EvText:
 			d := &openai.RespDelta{Role: "assistant", Content: ev.Delta}
@@ -371,10 +384,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 			if err := send(openai.RenderChunk(reqID, req.Model, created, &openai.RespDelta{}, &finish)); err != nil {
 				return err
 			}
-			_, err := fmt.Fprint(w, "data: [DONE]\n\n")
-			if fl != nil {
-				fl.Flush()
-			}
+			_, err := lw.Write([]byte("data: [DONE]\n\n"))
 			return err
 		}
 		return nil
@@ -384,10 +394,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 		// chunk and [DONE] so clients don't hang.
 		if headersSent(w) {
 			_ = send(openAIError(err))
-			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-			if fl != nil {
-				fl.Flush()
-			}
+			_, _ = lw.Write([]byte("data: [DONE]\n\n"))
 		}
 		return nil, err
 	}

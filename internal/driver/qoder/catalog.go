@@ -42,21 +42,28 @@ type ModelCatalog struct {
 }
 
 const defaultMaxOutputTokens = 32000
-const preferredDefaultKey = "qmodel_latest"
 
-// DefaultModelMap is the static fallback catalogue (catalog-v7).
+// preferredDefaultKey is the model a request without a usable name falls back
+// to. qmodel_latest (Qwen3.7-Max) served until 2026-10-26, when Zhengyuuuui/
+// qoder2api 872d9b9 pulled the live catalogue and the whole Qwen3.7 family
+// was gone; Qwen3.8-Flash is the surviving cheap workhorse.
+const preferredDefaultKey = "qfmodel"
+
+// DefaultModelMap is the static fallback catalogue. 2026-10-26 refresh
+// (Zhengyuuuui/qoder2api 872d9b9, live pull): qmodel / qmodel_latest /
+// q37fmodel / gm51model are removed upstream (requests 400 非法模型), and
+// kmodel_latest upgraded in place to Kimi-K3.1-Pro (rate 1.4 → 1). The
+// desktop-only flagships (smodel/cmodel/fast) are NOT listed here: they only
+// exist when the desktop header family is on (channels.qoder.desktop_protocol),
+// and the live catalogue carries them in that mode.
 var DefaultModelMap = map[string]string{
 	"Qwen3.8-Max":       "qmodel_38max",
 	"Qwen3.8-Flash":     "qfmodel",
-	"Qwen3.7-Max":       "qmodel_latest",
-	"Qwen3.7-Plus":      "qmodel",
-	"Qwen3.7-Flash":     "q37fmodel",
 	"DeepSeek-V4-Pro":   "dmodel",
 	"DeepSeek-Flash":    "dfmodel",
 	"GLM-5.3":           "gmodel",
 	"GLM-5.3-Flash":     "gfmodel",
-	"GLM-5.2":           "gm51model",
-	"Kimi-K3":           "kmodel_latest",
+	"Kimi-K3.1-Pro":     "kmodel_latest",
 	"Kimi-K2.8-Preview": "kmodel",
 	"MiniMax-M2.7":      "mmodel",
 }

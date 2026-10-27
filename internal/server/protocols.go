@@ -82,13 +82,17 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	if req.Stream {
 		var sw *anthropic.StreamWriter
-		fl, _ := w.(http.Flusher)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
+		// BP-142: keep the client alive while the upstream is silent. Before
+		// message_start only SSE comments are legal; after it, one ping per
+		// minute at most (see keepalive.go).
+		lw, ka := newStreamKeepalive(w, "event: ping\ndata: {\"type\":\"ping\"}\n\n")
+		defer ka.Stop()
 		// The estimate fills message_start's prompt accounting until the
 		// upstream reports the real numbers in the final usage (BP-56).
-		sw = anthropic.NewStreamWriter(w, fl, reqID, req.Model, anthropic.EstimateTokens(req))
+		sw = anthropic.NewStreamWriter(lw, lw, reqID, req.Model, anthropic.EstimateTokens(req))
 		// Capture the first-byte time on the streaming path too (BP-40):
 		// 反应时间 is the metric the panel's log/efficiency columns need, and
 		// streaming is how the Claude-protocol clients actually talk.
@@ -98,7 +102,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 				logRow.TTFBMs = int(time.Since(start).Milliseconds())
 				first = false
 			}
-			return sw.Send(ev)
+			if err := sw.Send(ev); err != nil {
+				return err
+			}
+			// Send writes message_start on its first call, so the stream is
+			// past the "comments only" window from here on.
+			ka.MarkStarted()
+			ka.NoteEvent()
+			return nil
 		}
 		result, err := s.execute(r, req, emit, logRow)
 		if err != nil {
@@ -195,18 +206,26 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		fl, _ := w.(http.Flusher)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
-		sw := responses.NewStreamWriter(w, fl, reqID, req.Model)
+		// BP-142: Responses carries a sequence_number on every event, so we
+		// must not invent frames — a comment is the only legal keepalive.
+		lw, ka := newStreamKeepalive(w, "")
+		defer ka.Stop()
+		sw := responses.NewStreamWriter(lw, lw, reqID, req.Model)
 		first := true
 		emit := func(ev ir.StreamEvent) error {
 			if first {
 				logRow.TTFBMs = int(time.Since(start).Milliseconds())
 				first = false
 			}
-			return sw.Send(ev)
+			if err := sw.Send(ev); err != nil {
+				return err
+			}
+			ka.MarkStarted()
+			ka.NoteEvent()
+			return nil
 		}
 		result, err := s.execute(r, req, emit, logRow)
 		if err != nil {
@@ -317,18 +336,27 @@ func (s *Server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 
 	req.Stream = streaming // the gateway needs stream-ness for no-duplicate cascading (ticket 28)
 	if streaming {
-		fl, _ := w.(http.Flusher)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
-		sw := geminiv1.NewStreamWriter(w, fl, req.Model, req.Thinking != nil && req.Thinking.Include)
+		// BP-142: Gemini's SSE framing is comment-tolerant; it has no
+		// keepalive event of its own, so comments only (magpie sends nothing
+		// for Gemini for the same reason).
+		lw, ka := newStreamKeepalive(w, "")
+		defer ka.Stop()
+		sw := geminiv1.NewStreamWriter(lw, lw, req.Model, req.Thinking != nil && req.Thinking.Include)
 		first := true
 		emit := func(ev ir.StreamEvent) error {
 			if first {
 				logRow.TTFBMs = int(time.Since(start).Milliseconds())
 				first = false
 			}
-			return sw.Send(ev)
+			if err := sw.Send(ev); err != nil {
+				return err
+			}
+			ka.MarkStarted()
+			ka.NoteEvent()
+			return nil
 		}
 		result, err := s.execute(r, req, emit, logRow)
 		if err != nil {
@@ -459,16 +487,27 @@ func retryAfterSeconds(err error) int {
 	return s
 }
 
-// withRetryAfter sets Retry-After on 429 responses when the reset moment is
-// known. Call before writeJSON.
+// withRetryAfter sets Retry-After on 429 and 503 responses when the reset
+// moment is known. 503 upstream-busy carries one too (qoderhub #99: an
+// aggregator without the header retries immediately and deepens the queue).
+// The value is capped at 600s: CLI clients sleep delayMs =
+// Retry-After*1000 with no ceiling of their own, and a multi-hour model
+// cooldown must not hang them for hours (misakano 436631c). Call before
+// writeJSON.
 func withRetryAfter(w http.ResponseWriter, status int, err error) {
-	if status != http.StatusTooManyRequests {
+	if status != http.StatusTooManyRequests && status != http.StatusServiceUnavailable {
 		return
 	}
 	if ra := retryAfterSeconds(err); ra > 0 {
+		if ra > maxRetryAfterSeconds {
+			ra = maxRetryAfterSeconds
+		}
 		w.Header().Set("Retry-After", strconv.Itoa(ra))
 	}
 }
+
+// maxRetryAfterSeconds caps the Retry-After header we hand to clients.
+const maxRetryAfterSeconds = 600
 
 func logResult(row *model.RequestLog, result *gateway.Result, start time.Time) {
 	row.Status = 200
@@ -483,7 +522,9 @@ func logResult(row *model.RequestLog, result *gateway.Result, start time.Time) {
 		row.CreditKnown = result.Response.Usage.CreditKnown
 		row.CachedTokens = result.Response.Usage.CachedInputTokens
 		row.CacheKnown = result.Response.Usage.CacheKnown
+		row.ToolCalls = len(result.Response.Message.ToolCalls)
 	}
+	row.ToolsDeclared = result.ToolsDeclared
 	if result.Degraded != "" {
 		row.Degraded = result.Degraded
 	}

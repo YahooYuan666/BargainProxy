@@ -461,3 +461,64 @@ func subtleCompare(a, b string) int {
 	}
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b))
 }
+
+// handleTraePaste completes a Trae login from a PASTED redirect URL — the
+// fallback for remote/container deployments, where the login redirect goes to
+// 127.0.0.1 on the operator's browser and can never reach this host
+// (Coding2API e61a22f hit the same gap). The still-pending flow is found by
+// channel; the pasted URL replays through the exact callback machinery, so
+// exchange/userinfo/import behave identically. The running poll picks the
+// finished flow up on its own.
+func (p *Panel) handleTraePaste(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || strings.TrimSpace(in.URL) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "缺少 url（请粘贴登录后跳转的完整地址）"})
+		return
+	}
+	key, ok := p.findPendingFlow(model.ChannelTrae)
+	if !ok {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "没有进行中的 Trae 登录流程，请先点「获取 Trae 登录链接」"})
+		return
+	}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimSpace(in.URL), nil)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "地址无法解析：" + err.Error()})
+		return
+	}
+	rec := &pasteCapture{header: http.Header{}}
+	p.handleTraeCallback(rec, req, key)
+	f, _ := p.getFlow(key)
+	out := map[string]any{"ok": rec.code == http.StatusOK && f.status == "success", "status": f.status}
+	if f.errMsg != "" {
+		out["error"] = f.errMsg
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// findPendingFlow returns the key of the channel's one pending login flow.
+func (p *Panel) findPendingFlow(channel string) (string, bool) {
+	p.flowMu.Lock()
+	defer p.flowMu.Unlock()
+	for k, f := range p.flows {
+		if f != nil && f.channel == channel && f.status == "pending" && time.Now().Before(f.expiresAt) {
+			return k, true
+		}
+	}
+	return "", false
+}
+
+// pasteCapture is a minimal http.ResponseWriter so the loopback callback
+// machinery can be reused without emitting its HTML page to the paste caller.
+type pasteCapture struct {
+	header http.Header
+	code   int
+	buf    bytes.Buffer
+}
+
+func (c *pasteCapture) Header() http.Header { return c.header }
+
+func (c *pasteCapture) Write(b []byte) (int, error) { return c.buf.Write(b) }
+
+func (c *pasteCapture) WriteHeader(code int) { c.code = code }

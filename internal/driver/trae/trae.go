@@ -392,6 +392,21 @@ func traeRequestID() string {
 
 // buildSOLOBody converts the IR request into the SOLO chat body:
 // {messages, function:"solo_work_lite", stream:true, model}.
+// traeEffort maps the portable gear onto Trae's three levels
+// light/high/extra_high (magpie trae 0.2.20). medium sits closer to high than
+// to light; off/none send nothing rather than an invented value.
+func traeEffort(effort string) string {
+	switch effort {
+	case "minimal", "low":
+		return "light"
+	case "medium", "high":
+		return "high"
+	case "xhigh", "max":
+		return "extra_high"
+	}
+	return ""
+}
+
 func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 	req := call.Request
 	var messages []map[string]any
@@ -462,10 +477,10 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 		messages = append(messages, wire)
 	}
 	body := map[string]any{
-		"messages":   messages,
-		"function":   function,
-		"stream":     true, // forced
-		"model":      call.UpstreamModel,
+		"messages": messages,
+		"function": function,
+		"stream":   true, // forced
+		"model":    call.UpstreamModel,
 		// config_name is what the upstream ROUTES on (BP-137). Sending only
 		// `model` does not fail — the request answers 200 with a normal-looking
 		// reply from ONE fixed provider endpoint, whatever the model says. The
@@ -498,6 +513,12 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 	}
 	if req.MaxTokens > 0 {
 		body["max_tokens"] = req.MaxTokens
+	}
+	// BP-132: Trae's own reasoning_effort levels are light/high/extra_high
+	// (magpie trae 0.2.20) — the gear the client picked never reached the
+	// upstream before, so every model ran at its default.
+	if gear := traeEffort(req.RequestedEffort); gear != "" {
+		body["reasoning_effort"] = gear
 	}
 	var tools []map[string]any
 	for _, t := range req.Tools {
@@ -1063,7 +1084,7 @@ func traeCodeOf(raw any, msg string) (int, string, bool) {
 // (BP-98 TRAE-1, red first in ladder_codes_test.go).
 func traeWrongFunction(err error) bool {
 	ue, ok := uperr.As(err)
-	if !ok || ue.Class != uperr.ClassBadRequest && ue.Class != uperr.ClassSoftRate {
+	if !ok || ue.Class != uperr.ClassBadRequest && ue.Class != uperr.ClassSoftRate && ue.Class != uperr.ClassModelRate {
 		return false
 	}
 	if ue.Code != "" {
@@ -1084,12 +1105,18 @@ func classifyBusiness(code int, msg string) *uperr.Error {
 		return uperr.New(uperr.ClassAuth, 401, "trae: %s", msg)
 	case 1005, 4008, 4011:
 		// The plan-entitlement family: 1005 CN/Global, 4008 CN, 4011 Global
-		// (magpie 0.2.19 site tables). SoftRate so the pool cools the account
-		// instead of retrying it; the code rides on ue.Code for the ladder
-		// gate and the panel.
-		e := uperr.New(uperr.ClassSoftRate, 200, "trae: plan entitlement exhausted (code=%d): %s", code, msg)
+		// (magpie 0.2.19 site tables). Field evidence from traework2api-panel
+		// (bb1059a/41217d3, 2026-10-22): a 1005 means THIS MODEL is behind a
+		// paywall for the account's plan — the same account serves dozens of
+		// other models fine. The old account-wide 12h rest froze a healthy
+		// account (misakano saw one stay dead for 17 days of retries), so the
+		// code is model-scoped now (ClassModelRate: the pool fills in the
+		// request's model when e.Model is empty) with a 1h TTL, matching
+		// upstream planDeniedTTL. The code still rides on ue.Code for the
+		// ladder gate and the panel.
+		e := uperr.New(uperr.ClassModelRate, 200, "trae: plan entitlement exhausted (code=%d): %s", code, msg)
 		e.Code = fmt.Sprint(code)
-		e.ResetAt = time.Now().Add(12 * time.Hour)
+		e.ResetAt = time.Now().Add(time.Hour)
 		return e
 	case 4001:
 		// Upstream rejected the payload shape ("bad request: json: cannot
@@ -1143,34 +1170,39 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	}
 }
 
-// Checkin performs the daily checkin (idempotent upstream-side).
-func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn bool, credits int64, enable bool, err error) {
-	creds, err := ParseCreds(acc.Credentials())
-	if err != nil {
-		return false, 0, false, uperr.New(uperr.ClassAuth, 0, "%v", err)
-	}
-	// Status first. The growth pages go out with {"req_source":1}, not {}
-	// — every check-in sent with {} came back 9074 even with the IDE's
-	// headers (yetone/magpie#808).
+// traeCheckinStatus is the check-in status page's answer.
+type traeCheckinStatus struct {
+	CheckedIn bool
+	Credits   int64
+	Enable    bool
+}
+
+// checkinStatus asks the check-in status page. It is called twice per run
+// (before the claim and, since BP-147, after it) — the second read is what
+// tells a real claim from an answer that registered nothing.
+//
+// The growth pages go out with {"req_source":1}, not {} — every check-in sent
+// with {} came back 9074 even with the IDE's headers (yetone/magpie#808).
+func (d *Driver) checkinStatus(ctx context.Context, creds *Creds, accID string) (traeCheckinStatus, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.ugBase()+"/trae/api/v2/ug/checkin_credits/status", bytes.NewReader(ugBody))
 	if err != nil {
-		return false, 0, false, err
+		return traeCheckinStatus{}, err
 	}
 	ugHeaders(req, creds)
 	resp, err := d.rpc.Do(req)
 	if err != nil {
-		return false, 0, false, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "trae checkin status: %v", err)
+		return traeCheckinStatus{}, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "trae checkin status: %v", err)
 	}
 	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, 0, false, classifyHTTP(resp.StatusCode, raw)
+		return traeCheckinStatus{}, classifyHTTP(resp.StatusCode, raw)
 	}
 	// The status/credits below feed task decisions; a truncated read must not
 	// read as "not checked in, zero credits" (ticket 11).
 	if rerr != nil {
-		log.Printf("trae: checkin status read failed (account=%s, endpoint=checkin_credits/status): %v", acc.ID, rerr)
-		return false, 0, false, uperr.New(uperr.ClassTransport, 0, "trae checkin status: read body: %v", rerr)
+		log.Printf("trae: checkin status read failed (account=%s, endpoint=checkin_credits/status): %v", accID, rerr)
+		return traeCheckinStatus{}, uperr.New(uperr.ClassTransport, 0, "trae checkin status: read body: %v", rerr)
 	}
 	var st struct {
 		Code      any    `json:"code"`
@@ -1186,7 +1218,20 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 	// masking a dead credential forever (BP-98 TRAE-3; the chat path's
 	// self-heal from ticket 37 never covered check-in).
 	if code, _, ok := traeBodyCode(st.Code, st.Message); ok {
-		return false, 0, false, classifyBusiness(code, st.Message)
+		return traeCheckinStatus{}, classifyBusiness(code, st.Message)
+	}
+	return traeCheckinStatus{CheckedIn: st.CheckedIn, Credits: st.Credits, Enable: st.Enable}, nil
+}
+
+// Checkin performs the daily checkin (idempotent upstream-side).
+func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn bool, credits int64, enable bool, err error) {
+	creds, err := ParseCreds(acc.Credentials())
+	if err != nil {
+		return false, 0, false, uperr.New(uperr.ClassAuth, 0, "%v", err)
+	}
+	st, err := d.checkinStatus(ctx, creds, acc.ID)
+	if err != nil {
+		return false, 0, false, err
 	}
 	if st.CheckedIn || !st.Enable {
 		// enable=false means the check-in program is unavailable for this
@@ -1200,7 +1245,32 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 	for attempt := 1; attempt <= 3; attempt++ {
 		lastErr = d.claimCheckin(ctx, creds)
 		if lastErr == nil {
-			return true, st.Credits, true, nil
+			// BP-147: a claim's own code 0 is not proof the day is in.
+			// Trae answers it for a claim that registered nothing, and its
+			// body usually carries no credits at all (magpie trae 0.2.22,
+			// #333). Success is what the STATUS page says after the claim, so
+			// the credits we report are the new ones, not the pre-claim read.
+			back, serr := d.checkinStatus(ctx, creds, acc.ID)
+			if serr != nil {
+				// Unreadable status is not a failed claim: the claim itself
+				// succeeded, we just cannot confirm or price it. Report the
+				// success and keep the old balance rather than turning a
+				// possible credit into a red task row.
+				log.Printf("trae: checkin claimed but the status re-read failed (account=%s): %v", acc.ID, serr)
+				return true, st.Credits, true, nil
+			}
+			if !back.CheckedIn {
+				// Claimed code 0, day still not registered: report it honestly
+				// as ineligible so the ledger does not claim money that never
+				// arrived, and do not re-send the claim today (the upstream
+				// answers the same way).
+				return false, 0, true, &checkinCodeErr{
+					ue: uperr.New(uperr.ClassBadRequest, 200,
+						"trae: claim answered success but the day's check-in is not in — not retrying today"),
+					code: 9101,
+				}
+			}
+			return true, back.Credits, true, nil
 		}
 		if idempotent, ok := idempotentCheckinErr(lastErr); ok && idempotent {
 			// 9095 "this device has checked in today": the day's success —
@@ -1388,6 +1458,13 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 		return nil, uperr.New(uperr.ClassInternal, 0, "trae usage parse: %v", err)
 	}
 	_ = packs
+	// BP-132: the entitlement answer also names the account's real concurrency
+	// allowance and pay identity (Trae2api-cn bb7b659). Surfaced in the note
+	// for now — wiring it into per-account concurrency limits is a scheduler
+	// decision that needs its own ticket.
+	if pl, pay := ParseTraeEntitlementMeta(raw); pl > 0 || pay != "" {
+		log.Printf("trae: entitlement meta (account=%s): parallel_limit=%d pay_identity=%s", acc.ID, pl, pay)
+	}
 	credits := &model.Credits{Remain: remain, Total: limit, UpdatedAt: time.Now()}
 	if unlimited {
 		// No finite quota: keep the routing floor and the 100% bar honest
@@ -1402,6 +1479,41 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 		credits.EarliestExpiresAt = earliestExpiry
 	}
 	return &driver.ProbeResult{Credits: credits, Note: "trae credits refreshed"}, nil
+}
+
+// ParseTraeEntitlementMeta reads the account-level fields the entitlement
+// answer carries beside the packs (Trae2api-cn bb7b659): the per-account
+// parallel limit and the pay identity (free/付费). Both are informational
+// today; a future scheduler ticket can drive per-account concurrency from
+// parallelLimit.
+func ParseTraeEntitlementMeta(raw []byte) (parallelLimit int, payIdentity string) {
+	var resp struct {
+		UserEntitlementPackList []struct {
+			EntitlementBaseInfo struct {
+				Quota struct {
+					SoloAgentParallelLimit int    `json:"solo_agent_parallel_limit"`
+					UserPayIdentity        string `json:"user_pay_identity"`
+					UserPayIdentityStr     string `json:"user_pay_identity_str"`
+				} `json:"quota"`
+			} `json:"entitlement_base_info"`
+		} `json:"user_entitlement_pack_list"`
+	}
+	if json.Unmarshal(raw, &resp) != nil {
+		return 0, ""
+	}
+	for _, p := range resp.UserEntitlementPackList {
+		q := p.EntitlementBaseInfo.Quota
+		if q.SoloAgentParallelLimit > parallelLimit {
+			parallelLimit = q.SoloAgentParallelLimit
+		}
+		if payIdentity == "" {
+			payIdentity = q.UserPayIdentity
+			if payIdentity == "" {
+				payIdentity = q.UserPayIdentityStr
+			}
+		}
+	}
+	return parallelLimit, payIdentity
 }
 
 // ParseEntUsage aggregates the entitlement pack list: remain = limit - used.

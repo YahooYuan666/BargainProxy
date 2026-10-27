@@ -41,9 +41,30 @@ var NativeHeaders = []string{
 	"X-Deepseek-Harness-Session-Id",
 }
 
+// SubagentHeaders name the SUBAGENT a request belongs to, when the client
+// sends one. Claude Code sends its session id with every request of the
+// session — its subagents' too — and only the agent id distinguishes a
+// subagent's turn (yetone/magpie 3b717d5, 2026-10-25).
+//
+// Why it has to split the key: stickiness is one binding per
+// (channel, session). A subagent that runs on the lead's model wrote its own
+// answer over the lead's binding, so the lead's next turn was judged by the
+// subagent's cache — a small one reads as "no cache", a 5-minute write reads
+// as "cold" — and the conversation moved to another account, where the whole
+// history is re-written at the cache-write price. Upstream measured two Pro
+// accounts' 5 hours spent in ten minutes (~318k tokens a request).
+var SubagentHeaders = []string{
+	"X-Claude-Code-Agent-Id",
+}
+
 // FromHeader returns the conversation id the client named, "" when it named
 // none. Values are hashed so a raw client id never reaches logs or upstream
 // headers. A blank or absurdly long value is ignored rather than trusted.
+//
+// BP-143: when the request also names a subagent, the key gets a second
+// segment. The lead keeps the plain session key it always had (so bindings
+// written before this change still resolve), while each subagent gets its
+// own — a subagent's answer can no longer move the lead off its account.
 func FromHeader(get func(string) string) string {
 	if get == nil {
 		return ""
@@ -53,7 +74,24 @@ func FromHeader(get func(string) string) string {
 		if v == "" || len(v) > 256 {
 			continue
 		}
-		return digest("sid:", v)
+		key := digest("sid:", v)
+		if sub := subagentOf(get); sub != "" {
+			key += "#sub:" + sub
+		}
+		return key
+	}
+	return ""
+}
+
+// subagentOf returns the hashed subagent id the request carries, "" for a
+// lead conversation (or a client that does not name subagents at all).
+func subagentOf(get func(string) string) string {
+	for _, h := range SubagentHeaders {
+		v := strings.TrimSpace(get(h))
+		if v == "" || len(v) > 256 {
+			continue
+		}
+		return strings.TrimPrefix(digest("sub:", v), "sub:")
 	}
 	return ""
 }

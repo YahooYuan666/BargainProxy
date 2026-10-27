@@ -145,6 +145,9 @@ type Driver struct {
 	cfg  config.QoderSettings
 	http *http.Client // chat streams
 	rpc  *http.Client // short signed calls
+	// desktop mirrors cfg.DesktopProtocol: the official desktop-client header
+	// family (BP-129, default off until an A/B probe).
+	desktop bool
 
 	mu sync.Mutex
 	rt map[string]*runtime
@@ -164,7 +167,7 @@ func New(cfg config.QoderSettings, httpClient *http.Client) *Driver {
 	if httpClient == nil {
 		httpClient = httpx.ChatClient()
 	}
-	return &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient(), rt: map[string]*runtime{}}
+	return &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient(), desktop: cfg.DesktopProtocol, rt: map[string]*runtime{}}
 }
 
 func (d *Driver) gatewayBase() string {
@@ -325,6 +328,7 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 		return nil, false, err
 	}
 	req.Header = bearerHeaders(sess, date, bearer, "text/event-stream")
+	applyDesktopHeaders(req.Header, d.desktop)
 	req.Header.Set("x-model-key", qoderKey)
 	req.Header.Set("x-model-source", "system")
 	resp, err := d.http.Do(req)
@@ -1052,6 +1056,21 @@ func qoderCommonHeaders(c *Creds, date, sig string) http.Header {
 	return h
 }
 
+// applyDesktopHeaders rewrites CLI-shaped headers into the official desktop
+// client's family (Zhengyuuuui/qoder2api 2671a21): the model list unlocks
+// smodel/cmodel/fast only for it. Config-gated (BP-129, default off) because
+// it changes the account's client fingerprint — flip after an A/B probe.
+func applyDesktopHeaders(h http.Header, desktop bool) {
+	if !desktop {
+		return
+	}
+	h.Set("cosy-clienttype", "10")
+	h.Set("cosy-version", "1.1.69")
+	h.Set("user-agent", "undici")
+	h.Set("cosy-scene", "app")
+	h.Set("cosy-business-product", "app")
+}
+
 // bearerHeaders builds the COSY-signed chat/model-list request headers.
 func bearerHeaders(sess *sessionContext, dateUnix int64, bearer, accept string) http.Header {
 	h := http.Header{}
@@ -1089,6 +1108,7 @@ func (d *Driver) postEncoded(ctx context.Context, url string, obj any, c *Creds)
 		return nil, err
 	}
 	req.Header = qoderCommonHeaders(c, date, sig)
+	applyDesktopHeaders(req.Header, d.desktop)
 	resp, err := d.rpc.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "qoder: %v", err)
@@ -1141,6 +1161,7 @@ func (d *Driver) fetchModelCatalog(ctx context.Context, sess *sessionContext) (m
 		return nil, err
 	}
 	req.Header = bearerHeaders(sess, dateUnix, bearer, "application/json")
+	applyDesktopHeaders(req.Header, d.desktop)
 	resp, err := d.rpc.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "qoder: %v", err)
@@ -1676,8 +1697,64 @@ func qoderBodyCode(body string) string {
 	return ""
 }
 
+// qoderNestedPermission reports Qoder's nested RESOURCE_LIMIT refusal: the
+// HTTP 403's message field is itself a JSON document (Zhengyuuuui/qoder2api
+// internal/bridge/errors.go), and when the inner doc says the account is NOT
+// queued, has NO retryAfterSeconds, and carries subCode RESOURCE_LIMIT, the
+// account simply has no entitlement for this model. The old path matched the
+// "10605" substring first (ClassSoftRate, account-wide) or fell to 403→Auth
+// (token refresh + account rest) — both wrong for a per-model permission wall.
+func qoderNestedPermission(body string) bool {
+	var env struct {
+		Message json.RawMessage `json:"message"`
+	}
+	if json.Unmarshal([]byte(body), &env) != nil || len(env.Message) == 0 {
+		return false
+	}
+	inner := env.Message
+	if len(inner) > 0 && inner[0] == '"' {
+		var s string
+		if json.Unmarshal(inner, &s) != nil {
+			return false
+		}
+		inner = []byte(s)
+	}
+	var doc struct {
+		IsQueued          bool   `json:"isQueued"`
+		ServiceAvailable  bool   `json:"serviceAvailable"`
+		RetryAfterSeconds any    `json:"retryAfterSeconds"`
+		SubCode           string `json:"subCode"`
+	}
+	if json.Unmarshal(inner, &doc) != nil {
+		return false
+	}
+	if doc.SubCode != "RESOURCE_LIMIT" || doc.IsQueued || doc.ServiceAvailable {
+		return false
+	}
+	switch n := doc.RetryAfterSeconds.(type) {
+	case nil:
+	case float64:
+		if n > 0 {
+			return false
+		}
+	case string:
+		if n != "" && n != "0" {
+			return false
+		}
+	}
+	return true
+}
+
 func classifyQoder(status int, body string) *uperr.Error {
 	text := clip(body, 300)
+	if qoderNestedPermission(body) {
+		// Per-model entitlement wall: hold the model (the pool fills in the
+		// request's model), leave the account live for everything else, and
+		// re-probe in an hour.
+		e := uperr.New(uperr.ClassModelRate, 403, "qoder: model not available on this account (RESOURCE_LIMIT): %s", text)
+		e.ResetAt = time.Now().Add(time.Hour)
+		return e
+	}
 	if strings.Contains(body, busyCode) || status == http.StatusTooManyRequests {
 		return uperr.New(uperr.ClassSoftRate, status, "qoder: %s", text)
 	}

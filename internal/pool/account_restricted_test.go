@@ -54,10 +54,15 @@ func TestAccountRestrictedLeavesRouting(t *testing.T) {
 	}
 }
 
-// The class must be rotatable: the request should retry another account of
-// the same channel immediately (the account is at fault, not the payload).
-func TestAccountRestrictedRotates(t *testing.T) {
-	if !uperr.Rotatable(uperr.ClassAccountRestricted) {
-		t.Fatal("account_restricted must rotate to another account")
+// BP-146 reversed this rule. It used to say the request should retry another
+// account of the same channel immediately ("the account is at fault, not the
+// payload"). Coding2API measured what that costs: one request walked three
+// accounts of the pool, and the account touched last was banned three minutes
+// later (f428e33). The ban is per account or per egress IP — every further
+// attempt in the same pool is another risk record. The bind loop still
+// cascades to a DIFFERENT channel, which is a different upstream.
+func TestAccountRestrictedDoesNotRotateWithinChannel(t *testing.T) {
+	if uperr.Rotatable(uperr.ClassAccountRestricted) {
+		t.Fatal("account_restricted must NOT rotate within the same channel (BP-146)")
 	}
 }

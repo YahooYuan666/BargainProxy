@@ -845,7 +845,6 @@ func upstreamModelName(model string) string {
 		return "claude-" + after
 	}
 	return model
-	return model
 }
 
 // buildRequest assembles the v1internal payload. replay (may be nil) resolves
@@ -1126,7 +1125,17 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		reset := parseQuotaReset(text)
 		e := uperr.New(uperr.ClassSoftRate, status, "antigravity: %s", truncate(body, 300))
 		e.ResetAt = reset
-		if strings.Contains(lower, "model") {
+		// The delay/reset the body names IS the quota bucket's own boundary
+		// (5h / weekly): a hard number, not our guess (BP-135).
+		e.ResetHard = !reset.IsZero()
+		// Antigravity serves native Gemini and 3P (Claude/GPT) from separate
+		// quota ledgers (AIClient2API antigravity-quota-family.js). Google's
+		// own 429 ("RESOURCE_EXHAUSTED", "Quota exceeded for quota metric …")
+		// names no model, and the old body-contains-"model" heuristic left
+		// e.Model empty — so one family's 429 cooled the WHOLE account and
+		// took the other family's healthy quota down with it. Every 429 now
+		// holds the model that was actually asked for.
+		if upstreamModel != "" {
 			e.Model = upstreamModel
 		}
 		return e

@@ -58,34 +58,27 @@ func TestDisguiseHeadersComplete(t *testing.T) {
 	}
 }
 
-// TestUserAgentMatchesOfficialShape pins BP-97: the real CLI's UA carries the
-// ai-sdk provider-utils and Bun runtime segments, and the provider-utils
-// version differs per protocol. An invented "(windows amd64; node20)" tail is a
-// different shape entirely, which is why bumping only the version number never
-// lifted the free-tier gate.
+// TestUserAgentMatchesOfficialShape pins BP-127: 2.x sends ONE UA on every
+// protocol — `opencode/latest/<version>/cli` — and the old 1.19.0 shape is
+// exactly what Zen's free tier started answering 429 FreeUsageLimitError to
+// (2026-10-26), while any other string is served.
 func TestUserAgentMatchesOfficialShape(t *testing.T) {
-	for protocol, sdk := range openCodeProviderUtils {
-		want := "opencode/" + openCodeClientVersion + " ai-sdk/provider-utils/" + sdk +
-			" runtime/bun/" + openCodeRuntimeVersion
+	want := "opencode/latest/" + openCodeClientVersion + "/cli"
+	for _, protocol := range []string{"chat", "responses", "anthropic", "gemini"} {
 		if got := openCodeUserAgent(protocol); got != want {
 			t.Fatalf("UA(%s) = %q, want %q", protocol, got, want)
 		}
 	}
-	// An unknown protocol falls back to the chat segment rather than sending
-	// an empty ai-sdk version.
-	if got, want := openCodeUserAgent("gemini"), openCodeUserAgent("chat"); got != want {
-		t.Fatalf("unknown protocol UA = %q, want the chat segment %q", got, want)
-	}
-	if openCodeClientVersion != "1.19.0" {
-		t.Fatalf("client version = %q, want the captured 1.19.0", openCodeClientVersion)
+	if openCodeClientVersion != "2.0.25" {
+		t.Fatalf("client version = %q, want the captured 2.0.25", openCodeClientVersion)
 	}
 }
 
 func TestEnsureGateToolsChat(t *testing.T) {
-	// No tools at all: both injected + tool_choice none.
+	// No tools at all: all five injected + tool_choice none.
 	body := map[string]any{"model": "x"}
-	if n := ensureGateTools(body, false); n != 2 {
-		t.Fatalf("injected = %d, want 2", n)
+	if n := ensureGateTools(body, false); n != len(gateToolNames) {
+		t.Fatalf("injected = %d, want %d", n, len(gateToolNames))
 	}
 	tools := body["tools"].([]any)
 	names := map[string]bool{}
@@ -98,10 +91,10 @@ func TestEnsureGateToolsChat(t *testing.T) {
 	if body["tool_choice"] != "none" {
 		t.Fatalf("tool-less chat lane must pin tool_choice=none: %v", body["tool_choice"])
 	}
-	// Client brought bash: only read injected; tool_choice untouched.
+	// Client brought bash: the remaining four injected; tool_choice untouched.
 	body2 := map[string]any{"tools": []any{gateToolChat("bash")}, "tool_choice": "auto"}
-	if n := ensureGateTools(body2, false); n != 1 {
-		t.Fatalf("second injection = %d, want 1 (read)", n)
+	if n := ensureGateTools(body2, false); n != len(gateToolNames)-1 {
+		t.Fatalf("second injection = %d, want %d (everything but bash)", n, len(gateToolNames)-1)
 	}
 	if body2["tool_choice"] != "auto" {
 		t.Fatalf("existing tool_choice must not change: %v", body2["tool_choice"])

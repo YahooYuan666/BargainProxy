@@ -21,6 +21,31 @@ func FixEnumTypes(schema any) bool {
 	switch s := schema.(type) {
 	case map[string]any:
 		changed := false
+		// BP-128: a oneOf whose every branch is an object (or a $ref) needs
+		// "type":"object" at this level too — Kimi answers 400 "Invalid
+		// request parameters" to an untyped object union (magpie workbuddy
+		// 0.1.33 / qoder 0.2.35). A schema already carrying a type is left
+		// alone; anyOf has no field evidence yet and stays untouched.
+		if branches, ok := s["oneOf"].([]any); ok && len(branches) > 0 && s["type"] == nil {
+			allObjects := true
+			for _, b := range branches {
+				bm, ok := b.(map[string]any)
+				if !ok {
+					allObjects = false
+					break
+				}
+				if t, _ := bm["type"].(string); t != "object" {
+					if _, hasRef := bm["$ref"]; !hasRef {
+						allObjects = false
+						break
+					}
+				}
+			}
+			if allObjects {
+				s["type"] = "object"
+				changed = true
+			}
+		}
 		// Only a schema that actually carries an enum needs typing.
 		if raw, ok := s["enum"]; ok {
 			if vals, ok := raw.([]any); ok && len(vals) > 0 {

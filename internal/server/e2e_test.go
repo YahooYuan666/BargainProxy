@@ -235,15 +235,26 @@ func TestQuotaExhaustedAndRotation(t *testing.T) {
 	if up.requests < 2 {
 		t.Fatalf("expected 2 upstream attempts, got %d", up.requests)
 	}
-	// The failing account must now be cooling.
+	// BP-125: an antigravity 429 holds the MODEL, not the account — Gemini
+	// and the 3P family run separate quota ledgers upstream, so a Gemini 429
+	// must not freeze the account's healthy Claude quota. The failing
+	// account must carry exactly one model-scoped hold (keyed by the
+	// UPSTREAM model id, e.g. gemini-pro-agent) and no account-level
+	// cooldown; re-dispatching the same model there would just 429 again.
 	cooling := 0
 	for _, a := range p.Accounts(model.ChannelAntigravity) {
 		if time.Now().Before(a.AccountCooldownUntil) {
 			cooling++
 		}
+		for k, mc := range a.ModelCooldowns {
+			if time.Now().Before(mc.Until) {
+				cooling++
+				t.Logf("model hold: acct=%s model=%s until=%s", a.ID, k, mc.Until)
+			}
+		}
 	}
 	if cooling != 1 {
-		t.Fatalf("expected exactly 1 cooling account, got %d", cooling)
+		t.Fatalf("expected exactly 1 cooling scope (model-level since BP-125), got %d", cooling)
 	}
 }
 

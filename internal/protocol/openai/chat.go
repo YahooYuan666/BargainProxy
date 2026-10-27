@@ -102,6 +102,15 @@ func ParseChatRequest(body []byte) (*ir.ChatRequest, error) {
 				req.Stop = append(req.Stop, str)
 			}
 		}
+	case []string:
+		// Strongly-typed callers (convert paths reusing the wire struct)
+		// hand over []string directly; JSON decoding always produces []any,
+		// but the typed branch used to be dropped silently (new-api bc795cc).
+		for _, s := range v {
+			if s != "" {
+				req.Stop = append(req.Stop, s)
+			}
+		}
 	}
 	if w.Thinking != nil && (w.Thinking.Type == "enabled" || w.Thinking.BudgetTokens > 0) {
 		req.Thinking = &ir.ThinkingConfig{Enabled: true, BudgetTokens: w.Thinking.BudgetTokens}

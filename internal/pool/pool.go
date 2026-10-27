@@ -184,7 +184,10 @@ type Pool struct {
 	// deadModels records channel+model pairs the upstream explicitly said it
 	// no longer serves, counted by DISTINCT accounts (see deadmodel.go).
 	deadModels map[string]*deadModelVerdict
-	closed     bool
+	// lastRestricted remembers the last upstream restriction per channel, for
+	// the BP-146 escalation: two bans inside a window park the channel.
+	lastRestricted map[string]time.Time
+	closed         bool
 }
 
 type sessionBinding struct {
@@ -245,21 +248,22 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 		params.ModelRateHoldCap = 2 * time.Hour
 	}
 	p := &Pool{
-		params:      params,
-		accounts:    map[string]*model.Account{},
-		byChan:      map[string][]string{},
-		sessions:    map[string]sessionBinding{},
-		inflight:    map[string]int{},
-		waiters:     map[string]chan struct{}{},
-		limits:      limits,
-		onChange:    onChange,
-		uses:        map[string][]string{},
-		lastExplore: map[string]time.Time{},
-		busyUntil:   map[string]time.Time{},
-		deadModels:  map[string]*deadModelVerdict{},
-		pending:     map[string]*model.Account{},
-		persistWake: make(chan struct{}, 1),
-		persistDone: make(chan struct{}),
+		params:         params,
+		accounts:       map[string]*model.Account{},
+		byChan:         map[string][]string{},
+		sessions:       map[string]sessionBinding{},
+		inflight:       map[string]int{},
+		waiters:        map[string]chan struct{}{},
+		limits:         limits,
+		onChange:       onChange,
+		uses:           map[string][]string{},
+		lastExplore:    map[string]time.Time{},
+		busyUntil:      map[string]time.Time{},
+		deadModels:     map[string]*deadModelVerdict{},
+		pending:        map[string]*model.Account{},
+		lastRestricted: map[string]time.Time{},
+		persistWake:    make(chan struct{}, 1),
+		persistDone:    make(chan struct{}),
 	}
 	if onChange != nil {
 		go p.persistLoop()
@@ -913,7 +917,7 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		}
 		if upstreamErr.Model != "" {
 			// Model-scoped soft rate: same hold semantics as model_rate (BP-49).
-			h := p.setModelCooldown(a, upstreamErr.Model, upstreamErr.ResetAt, "429 rate limit", upstreamErr.Message, now)
+			h := p.setModelCooldownHard(a, upstreamErr.Model, upstreamErr.ResetAt, upstreamErr.ResetHard, "429 rate limit", upstreamErr.Message, now)
 			upstreamErr.HoldUntil = h
 		} else {
 			by := "fixed"
@@ -985,8 +989,17 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// is what made a pool of 3 accounts look dead while 1 was healthy
 		// (sticky conversations stayed bound to the banned ones). Disabled is
 		// the honest terminal state — the panel shows it and a human decides
-		// whether to re-login. Rotatable stays true, so this request retries
-		// another account of the same channel immediately.
+		// whether to re-login.
+		//
+		// BP-146: this account leaving is NOT permission to walk the rest of
+		// the pool. The ban is per account (or per egress IP when several
+		// accounts share one), so `uperr.Rotatable` now refuses to try another
+		// account of the same channel inside this request — Coding2API
+		// measured one request leaving a risk record on three accounts, the
+		// third banned three minutes later (f428e33). A second restriction on
+		// this channel inside RestrictedChannelWindow also pauses the whole
+		// channel briefly: two bans in minutes means the pattern, not the
+		// account, is what upstream is reacting to.
 		a.Disabled = true
 		a.Paused = false
 		a.AccountCooldownReason = "restricted by upstream"
@@ -996,6 +1009,7 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		if a.ModelCooldowns != nil {
 			delete(a.ModelCooldowns, model)
 		}
+		p.noteRestrictedLocked(a.Channel, now, model)
 	case uperr.ClassEdgeBlock:
 		// A CDN/WAF edge refused the request before it reached the vendor:
 		// request-level, not the account's. Pausing the channel briefly stops
@@ -1422,11 +1436,18 @@ func (p *Pool) SetPaused(id string, paused bool) bool {
 // the historical bounded 60s hold. Returns the effective barrier. Callers
 // must hold the lock.
 func (p *Pool) setModelCooldown(a *model.Account, m string, resetAt time.Time, reason, message string, now time.Time) time.Time {
+	return p.setModelCooldownHard(a, m, resetAt, false, reason, message, now)
+}
+
+func (p *Pool) setModelCooldownHard(a *model.Account, m string, resetAt time.Time, resetHard bool, reason, message string, now time.Time) time.Time {
 	if a.ModelCooldowns == nil {
 		a.ModelCooldowns = map[string]model.ModelCooldown{}
 	}
 	until := resetAt
-	if cap := p.params.ModelRateHoldCap; cap > 0 {
+	// The 2h cap bounds OUR invented/guessed holds. An upstream-stated hard
+	// window (ResetHard) is the quota bucket's own boundary and is honored
+	// as-is (BP-135); premature unblocking there just re-hits the same 429.
+	if cap := p.params.ModelRateHoldCap; cap > 0 && !resetHard {
 		if c := now.Add(cap); until.IsZero() || c.Before(until) {
 			until = c
 		}

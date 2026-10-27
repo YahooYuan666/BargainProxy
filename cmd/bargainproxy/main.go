@@ -290,6 +290,10 @@ func main() {
 			log.Printf("route: %s", line)
 		}
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			// log.Fatalf skips defers: persist the pool state before dying, or
+			// the next boot starts from a stale snapshot (misakano 1e7a693).
+			p.Close()
+			_ = st.Close()
 			log.Fatalf("server: %v", err)
 		}
 	}()
@@ -310,7 +314,10 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 	<-stop
 	log.Printf("shutting down…")
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 30s (was 10): in-flight SSE legs legitimately run minutes; 10s cut the
+	// drain short and clients saw "完成但空" tails. Configurable later if a
+	// deployment needs faster restarts (misakano 1e7a693 ships the same bump).
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
 	sched.Stop()

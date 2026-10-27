@@ -135,8 +135,9 @@ func TestRenderMessageShape(t *testing.T) {
 	if len(out.Content) != 2 || out.Content[0].Type != "text" || out.Content[1].Type != "tool_use" {
 		t.Fatalf("content blocks: %+v", out.Content)
 	}
-	if out.Content[1].Input.(map[string]any)["x"].(float64) != 1 {
-		t.Fatalf("tool input: %+v", out.Content[1].Input)
+	// BP-128: arguments ride as raw JSON — byte-for-byte, no float64 rounding.
+	if in, ok := out.Content[1].Input.(json.RawMessage); !ok || string(in) != `{"x":1}` {
+		t.Fatalf("tool input: %T %+v, want the raw arguments", out.Content[1].Input, out.Content[1].Input)
 	}
 	if *out.StopReason != "tool_use" {
 		t.Fatalf("stop: %v", *out.StopReason)

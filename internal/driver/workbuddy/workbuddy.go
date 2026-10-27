@@ -33,6 +33,8 @@ import (
 	"bargainproxy/internal/model"
 	"bargainproxy/internal/prompt"
 	"bargainproxy/internal/uperr"
+	"regexp"
+	"strconv"
 )
 
 // Creds is the persisted credential shape for a workbuddy account.
@@ -45,6 +47,37 @@ type Creds struct {
 	EnterpriseID string `json:"enterprise_id,omitempty"`
 	Realm        string `json:"realm,omitempty"`        // "cn" | "global"
 	DeviceToken  string `json:"device_token,omitempty"` // X-Device-Token when available
+	// APIKey marks an account signed in with a key minted on the build's own
+	// keys page (www.workbuddy.cn/profile/keys) instead of a browser/desktop
+	// OAuth session (BP-144, magpie workbuddy 0.1.37 / #407).
+	//
+	// A key is NOT a refreshable token: it goes out as both
+	// `X-API-Key: <key>` and `Authorization: Bearer <key>`, the account is
+	// personal with no domain and no enterprise, and there is nothing to
+	// renew. Treating one as OAuth made three things wrong at once — the
+	// upstream saw no X-API-Key, an X-Domain it never expects, and a 401
+	// triggered a refresh of a key that cannot be refreshed.
+	APIKey string `json:"api_key,omitempty"`
+}
+
+// IsAPIKey reports whether this account signs in with a key rather than an
+// OAuth session.
+func (c *Creds) IsAPIKey() bool { return c.APIKey != "" }
+
+// apiKeyUserID is the identity the official CLI presents for a key account:
+// "anonymous_" + the key's last 8 characters. Never a real uid.
+func apiKeyUserID(key string) string {
+	if len(key) <= 8 {
+		return "anonymous_" + key
+	}
+	return "anonymous_" + key[len(key)-8:]
+}
+
+// hasRemoteCatalogKey reports whether the key may ask /v3/config for the
+// model catalogue. The CLI's shouldLoadRemoteConfig only does that for ck_/pt_
+// keys; any other key keeps the built-in list, and asking would just 401.
+func hasRemoteCatalogKey(key string) bool {
+	return strings.HasPrefix(key, "ck_") || strings.HasPrefix(key, "pt_")
 }
 
 // RealmOrDefault normalizes the realm.
@@ -58,9 +91,14 @@ func (c *Creds) RealmOrDefault() string {
 // business codes observed in upstream bodies.
 const (
 	codeModelRate   = 6004  // model-scoped rate limit, body carries reset wall-clock
+	codeModelQuota  = 6000  // quota refusal; the wording picks model-level vs account-level (misakano cdad965)
 	codeBadParams   = 11101 // invalid params: do not penalize the account
 	codeSessionDead = 12153 // session dead: needs re-login
 	codeQueueFull   = 6021  // inference cluster queue full ("queue.full.title"): upstream capacity event, NOT an account problem — rotating accounts at request pace miskilled a whole pool in seconds in the field (2026-10-15); the right response is wait, not switch
+	// codeQueueWaiting 6020 ("queue.waiting.title") is the same capacity event
+	// one step earlier in the queue (misakano 1e70717): same wait-don't-switch
+	// handling, no account penalty.
+	codeQueueWaiting = 6020
 	// codePromptTooLong: the prompt exceeds the model's context window. The
 	// same body fails on every account, so this is request-level: no rotation,
 	// no account penalty (2026-10-19).
@@ -86,8 +124,12 @@ type Driver struct {
 	// promptReplace is the hot-switchable system-prompt replacement (panel
 	// setting; default on). Off falls back to StripSystem like passthrough.
 	promptReplace atomic.Bool
-	refreshMu     sync.Mutex
-	refreshes     map[string]*refreshFlight
+	// messagesAllowed gates the Anthropic-native /v1/messages lane (BP-131).
+	// Starts true; a 404/route refusal degrades it to false for the process,
+	// after which claude models ride the chat lane exactly as before.
+	messagesAllowed atomic.Bool
+	refreshMu       sync.Mutex
+	refreshes       map[string]*refreshFlight
 }
 
 // New builds the driver.
@@ -97,6 +139,7 @@ func New(cfg config.WorkBuddySettings, httpClient *http.Client) *Driver {
 	}
 	d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
 	d.promptReplace.Store(true)
+	d.messagesAllowed.Store(true)
 	return d
 }
 
@@ -161,6 +204,9 @@ func (d *Driver) chatBase(c *Creds) string {
 	return strings.TrimRight(d.cfg.ChatBaseCN, "/")
 }
 
+// chatCompletionsPath is the classic OpenAI-shaped lane.
+const chatCompletionsPath = "/v2/chat/completions"
+
 // Stream implements driver.Driver. Upstream is forced to stream:true; the
 // gateway aggregates for non-streaming clients.
 func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
@@ -172,11 +218,27 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		return nil, uperr.New(uperr.ClassAuth, 401, "workbuddy: missing access token")
 	}
 
+	// BP-131: CN Claude models ride the Anthropic-native /v1/messages route,
+	// where the effort gears (max included) actually work. A missing route or
+	// a channel-check refusal degrades once, then permanently for the
+	// process; a genuine upstream error surfaces for the pool.
+	if claudeOnMessages(creds, call.UpstreamModel) && d.messagesAllowed.Load() {
+		resp2, ok, merr := d.tryMessages(ctx, call, creds)
+		if merr != nil {
+			return nil, merr
+		}
+		if ok {
+			streamBody := httpx.WatchIdle(resp2.Body, httpx.IdleTimeout())
+			defer streamBody.Close()
+			return d.parseMessagesSSE(ctx, streamBody, call, emit)
+		}
+	}
+
 	body, err := d.buildBody(call, creds, false)
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "workbuddy: build body: %v", err)
 	}
-	resp, err := d.postChat(ctx, creds, call, body)
+	resp, err := d.postChat(ctx, creds, call, body, chatCompletionsPath)
 	if err != nil {
 		// 11128 "illegal API invocation from an unapproved channel" is the
 		// channel check refusing the caller's *system prompt* — not the
@@ -190,7 +252,25 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 			moved, berr := d.buildBody(call, creds, true)
 			if berr == nil {
 				log.Printf("workbuddy: 11128 channel refusal; resending with the system prompt as the user's instructions")
-				resp, err = d.postChat(ctx, creds, call, moved)
+				resp, err = d.postChat(ctx, creds, call, moved, chatCompletionsPath)
+			}
+		}
+		// BP-130: a 401 is worth one PROVEN retry. Upstream sometimes
+		// invalidates a still-fresh token (misakano #66: transient edge
+		// interception reads as 401; magpie workbuddy 0.1.31 renewed once and
+		// re-sent). A forced single-flight refresh either fixes the token —
+		// and this exact request succeeds — or confirms the account really is
+		// dead; without it every transient 401 cost a 10-minute pool rest for
+		// nothing.
+		if ue, ok := err.(*uperr.Error); ok && ue.Class == uperr.ClassAuth && ue.Status == 401 && !creds.IsAPIKey() {
+			if rerr := d.refresh(ctx, call.Account, true); rerr == nil {
+				if fresh, perr := ParseCreds(call.Account.Credentials()); perr == nil &&
+					fresh.AccessToken != "" && fresh.AccessToken != creds.AccessToken {
+					if body2, berr := d.buildBody(call, fresh, false); berr == nil {
+						log.Printf("workbuddy: 401; renewed credentials once and resending")
+						resp, err = d.postChat(ctx, fresh, call, body2, chatCompletionsPath)
+					}
+				}
 			}
 		}
 		if err != nil {
@@ -202,17 +282,33 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	return d.parseStream(ctx, streamBody, call, emit)
 }
 
+// applyAuth sets the credential headers for either sign-in shape (BP-144).
+//
+// A key account (www.workbuddy.cn/profile/keys) presents the key twice —
+// `Authorization: Bearer <key>` and `X-API-Key: <key>` — exactly as
+// @tencent-ai/codebuddy-code does with CODEBUDDY_API_KEY. An OAuth account
+// presents only the bearer, and must never carry X-API-Key (the SDK's own
+// empty key header is what magpie's loader deletes).
+func applyAuth(req *http.Request, creds *Creds) {
+	if creds.IsAPIKey() {
+		req.Header.Set("Authorization", "Bearer "+creds.APIKey)
+		req.Header.Set("X-API-Key", creds.APIKey)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+}
+
 // postChat sends one chat request and returns the open response body on 200.
 // Any non-200 is classified into *uperr.Error.
-func (d *Driver) postChat(ctx context.Context, creds *Creds, call driver.ChatCall, body []byte) (*http.Response, error) {
-	url := d.chatBase(creds) + "/v2/chat/completions"
+func (d *Driver) postChat(ctx context.Context, creds *Creds, call driver.ChatCall, body []byte, path string) (*http.Response, error) {
+	url := d.chatBase(creds) + path
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
+	applyAuth(req, creds)
 	if creds.DeviceToken != "" {
 		req.Header.Set("X-Device-Token", creds.DeviceToken)
 	}
@@ -370,10 +466,23 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool
 		// is rejected upstream, so it is pinned (misakano upstream parity,
 		// 2026-10-21).
 		effort := req.RequestedEffort
-		if creds.RealmOrDefault() == "global" {
-			effort = "high"
+		// BP-130: "off"/"none" is not a gear upstream — sending it gets the
+		// model default, and field evidence says DeepSeek still produced 150+
+		// chars of thinking (misakano e7d1e70 honorClose). The upstream's own
+		// way to switch thinking off is thinking:{"type":"disabled"} with NO
+		// reasoning_effort. DeepSeek-family models only: GLM has no observed
+		// disabled switch, so for it we just stop sending an invalid gear.
+		if effort == "off" || effort == "none" || effort == "disabled" {
+			delete(body, "reasoning_effort")
+			if strings.HasPrefix(strings.ToLower(call.UpstreamModel), "deepseek") {
+				body["thinking"] = map[string]any{"type": "disabled"}
+			}
+		} else {
+			if creds.RealmOrDefault() == "global" {
+				effort = "high"
+			}
+			body["reasoning_effort"] = effort
 		}
-		body["reasoning_effort"] = effort
 	}
 	// prompt_cache_key injection (per-account stable key, panel parity).
 	prompt.InjectPromptCacheKey(body, creds.UID, sessionFromReq(req))
@@ -692,15 +801,17 @@ func mapFinish(reason string) ir.StopReason {
 // every billing error's text (ticket 30: the checkin duplicate rejection
 // arrived as code=10001 with the reason only in `msg`).
 func detectBusinessError(raw []byte) (int, string, bool) {
+	// The "error" key carries TWO shapes: the /v1/messages envelope's flat
+	// string ({"code":11102,"error":"11158:model … is not allowed …"}, live
+	// 2026-10-27) and the nested object ({"error":{"code":6004,…}}). One
+	// RawMessage + shape dispatch — two same-tag fields make encoding/json
+	// treat the pair as ambiguous and fill NEITHER, silently losing every
+	// nested error.
 	var doc struct {
-		Code    any    `json:"code"`
-		Msg     string `json:"msg"`
-		Message string `json:"message"`
-		Error   struct {
-			Code    any    `json:"code"`
-			Msg     string `json:"msg"`
-			Message string `json:"message"`
-		} `json:"error"`
+		Code    any             `json:"code"`
+		Msg     string          `json:"msg"`
+		Message string          `json:"message"`
+		Error   json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return 0, "", false
@@ -713,9 +824,23 @@ func detectBusinessError(raw []byte) (int, string, bool) {
 	}
 	code := toInt(doc.Code)
 	msg := pick(doc.Msg, doc.Message)
-	if code == 0 {
-		code = toInt(doc.Error.Code)
-		msg = pick(doc.Error.Msg, doc.Error.Message)
+	if len(doc.Error) > 0 && code == 0 || msg == "" && len(doc.Error) > 0 {
+		if len(doc.Error) > 0 && doc.Error[0] == '{' {
+			var nested struct {
+				Code    any    `json:"code"`
+				Msg     string `json:"msg"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(doc.Error, &nested) == nil && code == 0 {
+				code = toInt(nested.Code)
+				msg = pick(nested.Msg, nested.Message)
+			}
+		} else if msg == "" {
+			var es string
+			if json.Unmarshal(doc.Error, &es) == nil {
+				msg = es
+			}
+		}
 	}
 	if code == 0 {
 		return 0, "", false
@@ -750,11 +875,27 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		e.Code = fmt.Sprint(code)
 		e.ResetAt = parseResetWallClock(msg)
 		return e
-	case codeQueueFull:
+	case codeModelQuota:
+		// misakano cdad965: 6000 whose message names the escape hatch
+		// ("切换其他模型") means THIS model's quota is gone — same model-scoped
+		// handling as 6004. Without the hint it is the account's own quota
+		// window: account-level rest with the stated reset, no disable.
+		if strings.Contains(msg, "切换其他模型") {
+			e := uperr.New(uperr.ClassModelRate, 200, "workbuddy: %s", msg)
+			e.Model = upstreamModel
+			e.Code = fmt.Sprint(code)
+			e.ResetAt = parseResetWallClock(msg)
+			return e
+		}
+		e := uperr.New(uperr.ClassSoftRate, 429, "workbuddy: %s", msg)
+		e.Code = fmt.Sprint(code)
+		e.ResetAt = parseResetWallClock(msg)
+		return e
+	case codeQueueFull, codeQueueWaiting:
 		// Upstream capacity, not the account: no rotation, no account
 		// penalty; the pool marks the channel+model busy so follow-up
 		// requests fail fast until the queue drains.
-		e := uperr.New(uperr.ClassUpstreamBusy, 429, "workbuddy: upstream queue full: %s", msg)
+		e := uperr.New(uperr.ClassUpstreamBusy, 429, "workbuddy: upstream queue busy: %s", msg)
 		e.Model = upstreamModel
 		return e
 	case codeBadParams:
@@ -785,6 +926,20 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		// code 11115 ("prompt is too long") lands in the generic internal
 		// bucket and the status branch never sees it.
 		lowerMsg := strings.ToLower(msg)
+		// 11158 "model not allowed for user type": live 2026-10-27 on the CN
+		// deployment — the route KNOWS the claude ids (the error echoes the
+		// name) but refuses them for personal_free_user accounts, and the
+		// /v1/messages envelope wraps it as code 11102 with "11158:…" in the
+		// error string. The account is fine on its other models: model-scoped
+		// hold, account untouched (the /v1/messages wrapper classification is
+		// what the messages lane actually surfaces).
+		if code == 11158 || code == 11102 || strings.HasPrefix(msg, "11158:") ||
+			strings.Contains(lowerMsg, "not allowed for user type") {
+			e := uperr.New(uperr.ClassModelRate, 200, "workbuddy: model not allowed for this account type (11158): %s", msg)
+			e.Model = upstreamModel
+			e.Code = "11158"
+			return e
+		}
 		if code == codePromptTooLong || isPromptTooLong(lowerMsg) {
 			return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: prompt too long: %s", msg)
 		}
@@ -798,9 +953,40 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 	}
 }
 
-// parseResetWallClock extracts "将在 2026-10-14 15:30:00 重置" style reset
-// moments from a 6004 message (Asia/Shanghai wall clock).
+// resetWallClockRe captures date, the UTC sign/offset when stated, and the
+// time of a reset moment.
+var resetWallClockRe = regexp.MustCompile(
+	`(\d{4}[-/]\d{2}[-/]\d{2})[ T](\d{2}:\d{2}:\d{2})(?:\s*\(?\s*UTC([+-])(\d{1,2})(?::(\d{2}))?\)?)?`)
+
+// parseResetWallClock extracts reset moments from a rate-limit message. Two
+// shapes exist: CN bare wall clock (CST) — "将在 2026-10-14 15:30:00 重置" —
+// and the international one with an explicit offset — "usage will reset at
+// 2026-10-25 22:34:25 UTC+8" (Coding2API 9ba8b80; the old scanner only knew
+// the bare form, so every intl reset fell back to the constant backoff and
+// the account re-hit the wall until the real reset passed).
 func parseResetWallClock(msg string) time.Time {
+	if m := resetWallClockRe.FindStringSubmatch(msg); m != nil {
+		layout := "2006-01-02 15:04:05"
+		if strings.Contains(m[1], "/") {
+			layout = "2006/01/02 15:04:05"
+		}
+		loc := time.FixedZone("CST", 8*3600)
+		if m[3] != "" { // groups: 1 date, 2 time, 3 sign, 4 hours, 5 minutes
+			off, _ := strconv.Atoi(m[4])
+			mins := 0
+			if m[5] != "" {
+				mins, _ = strconv.Atoi(m[5])
+			}
+			if m[3] == "-" {
+				off = -off
+				mins = -mins
+			}
+			loc = time.FixedZone("UTC±", off*3600+mins*60)
+		}
+		if t, err := time.ParseInLocation(layout, m[1]+" "+m[2], loc); err == nil {
+			return t
+		}
+	}
 	layouts := []string{"2006-01-02 15:04:05", "2006/01/02 15:04:05"}
 	for i := 0; i+19 <= len(msg); i++ {
 		seg := msg[i : i+19]
@@ -862,8 +1048,16 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 	req.Header.Set("X-IDE-Name", "WorkBuddy")
 	req.Header.Set("X-IDE-Type", "WorkBuddy")
 	req.Header.Set("X-IDE-Version", workBuddyClientVersion(global))
-	req.Header.Set("X-Domain", strings.TrimPrefix(origin, "https://"))
-	if creds.UID != "" {
+	// BP-144: a key account is personal with no domain and no enterprise, and
+	// the CLI sends neither — an X-Domain on a key request is a shape upstream
+	// never sees from its own client.
+	if !creds.IsAPIKey() {
+		req.Header.Set("X-Domain", strings.TrimPrefix(origin, "https://"))
+	}
+	if creds.IsAPIKey() {
+		// The CLI's key identity: "anonymous_" + the key's last 8 characters.
+		req.Header.Set("X-User-Id", apiKeyUserID(creds.APIKey))
+	} else if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
 	}
 	// Browser/CLI-shaped headers the desktop client never sends on chat:
@@ -1144,6 +1338,15 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
+	}
+	// BP-144: a key account has no billing endpoint — the key's credits are
+	// simply unknown. Reporting an error here would paint the account red for
+	// something that is not a fault, so the probe answers "unknown" instead.
+	if creds.IsAPIKey() {
+		return &driver.ProbeResult{
+			Credits: &model.Credits{BalanceOnly: true, NotReported: true, UpdatedAt: time.Now()},
+			Note:    "API key account: credit balance is not reported by upstream",
+		}, nil
 	}
 	body := map[string]any{
 		"PageNumber":  1,

@@ -146,7 +146,7 @@ type AntigravitySettings struct {
 // WorkBuddySettings configures the Tencent CodeBuddy channel.
 type WorkBuddySettings struct {
 	Enabled     bool   `json:"enabled"`
-	ChatBaseCN  string `json:"chat_base_cn"`  // default https://copilot.tencent.com
+	ChatBaseCN  string `json:"chat_base_cn"`  // default https://www.workbuddy.cn (BP-130: the official desktop client's primary CN endpoint; copilot.tencent.com is only the fallback)
 	ChatBaseGL  string `json:"chat_base_gl"`  // default https://www.workbuddy.ai
 	WebBaseCN   string `json:"web_base_cn"`   // default https://www.workbuddy.cn (growth claim / web events)
 	MaxInFlight int    `json:"max_in_flight"` // default 2
@@ -223,6 +223,14 @@ type QoderSettings struct {
 	// falls back to the top-level data_dir. The salt must never change once
 	// generated: it seeds every account's virtual device identity.
 	DataDir string `json:"data_dir"`
+	// DesktopProtocol switches the request headers from the CLI family
+	// (cosy-clienttype 5 / 0.1.43) to the official desktop client's family
+	// (cosy-clienttype 10 / 1.1.69 / user-agent undici / cosy-scene app /
+	// cosy-business-product app), which is what unlocks the flagship models
+	// (Sonus/Cantus/Fast) in /algo/api/v2/model/list (Zhengyuuuui/qoder2api
+	// 2671a21). Default off: it changes the account's client fingerprint, so
+	// flip it after an A/B probe, not on faith.
+	DesktopProtocol bool `json:"desktop_protocol"`
 }
 
 // OpenAICompatSettings configures the generic fallback channel.
@@ -238,7 +246,7 @@ type OpenAICompatSettings struct {
 // directory sync and the panel page read this switch.
 type OpenCodeZenSettings struct {
 	Enabled bool   `json:"enabled"`
-	BaseURL string `json:"base_url"` // default https://opencode.ai/zen (tests override)
+	BaseURL string `json:"base_url"` // default https://opencode.ai/inference/v1 (tests override)
 }
 
 // LobsterSettings configures the NetEase Youdao LobsterAI (有道龙虾) channel
@@ -320,7 +328,7 @@ func Default() *Config {
 			},
 			WorkBuddy: WorkBuddySettings{
 				Enabled:     true,
-				ChatBaseCN:  "https://copilot.tencent.com",
+				ChatBaseCN:  "https://www.workbuddy.cn",
 				ChatBaseGL:  "https://www.workbuddy.ai",
 				WebBaseCN:   "https://www.workbuddy.cn",
 				MaxInFlight: 2,
@@ -350,7 +358,7 @@ func Default() *Config {
 			},
 			OpenCodeZen: OpenCodeZenSettings{
 				Enabled: true,
-				BaseURL: "https://opencode.ai/zen",
+				BaseURL: "https://opencode.ai/inference/v1",
 			},
 			Lobster: LobsterSettings{
 				// Enabled by default so the panel offers the login flow; the

@@ -42,7 +42,7 @@ var (
 )
 
 const (
-	zenModelsPath = "/v1/models"
+	zenModelsPath = "/models"
 	dirSettingKey = "opencodezen_catalog"
 	directoryTTL  = 30 * time.Minute
 )
@@ -104,7 +104,13 @@ type Catalog struct {
 
 // NewCatalog builds the catalog. st may be nil (tests): no persistence.
 func NewCatalog(hc *http.Client, st store.Store, baseURL string) *Catalog {
-	c := &Catalog{hc: hc, st: st, base: strings.TrimRight(baseURL, "/")}
+	base := strings.TrimRight(baseURL, "/")
+	// Same legacy mapping as Driver.base: stale configs name the pre-BP-127
+	// /zen default the free lane no longer answers on.
+	if base == "" || strings.HasSuffix(base, "opencode.ai/zen") || strings.HasSuffix(base, "opencode.ai/zen/v1") {
+		base = zenUpstreamBase
+	}
+	c := &Catalog{hc: hc, st: st, base: base}
 	c.loadPersisted()
 	return c
 }

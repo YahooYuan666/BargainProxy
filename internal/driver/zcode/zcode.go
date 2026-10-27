@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
@@ -20,6 +21,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -135,7 +137,10 @@ func (d *Driver) base() string { return strings.TrimRight(d.cfg.BaseURL, "/") }
 const messagesPath = "/api/v1/zcode-plan/anthropic/v1/messages"
 
 // identityHeaders is the official-client header set (order-insensitive).
-func identityHeaders(req *http.Request, c *Creds, appVersion string) {
+// sessionID is the conversation's bare-UUID x-session-id: BigModel keeps the
+// prompt cache per (session, device) and seldom for requests that name none
+// (magpie zcode #388 — hit rate went 1/19 → 13/16 once it was sent).
+func identityHeaders(req *http.Request, c *Creds, appVersion, sessionID string) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+c.JWT)
@@ -154,6 +159,7 @@ func identityHeaders(req *http.Request, c *Creds, appVersion string) {
 		req.Header.Set("X-Device-Mid", c.DeviceMID)
 	}
 	req.Header.Set("x-zcode-session-type", "main")
+	req.Header.Set("x-session-id", sessionID)
 	if c.Captcha != "" {
 		req.Header.Set("X-Aliyun-Captcha-Verify-Param", c.Captcha)
 		if c.CaptchaRegion != "" {
@@ -181,12 +187,13 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "zcode: build body: %v", err)
 	}
+	sessionID := sessionIDFor(creds, accountIDOf(call), call.Request.SessionKey)
 	do := func(wire []byte) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.base()+messagesPath, bytes.NewReader(wire))
 		if err != nil {
 			return nil, err
 		}
-		identityHeaders(req, creds, defaultAppVersion)
+		identityHeaders(req, creds, defaultAppVersion, sessionID)
 		return d.http.Do(req)
 	}
 	resp, err := do(body)
@@ -312,7 +319,7 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds, withThinkingH
 				if err := json.Unmarshal([]byte(tc.Arguments), &input); err != nil {
 					input = map[string]any{}
 				}
-				parts = append(parts, map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": input})
+				parts = append(parts, map[string]any{"type": "tool_use", "id": tc.ID, "name": toolOutName(tc.Name), "input": input})
 			}
 		}
 		if m.Role == ir.RoleTool {
@@ -355,21 +362,41 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds, withThinkingH
 		messages = append(messages, wire)
 	}
 
-	// Official identity blocks + dynamic currentModel block.
+	// Official identity blocks + dynamic text merged into the LAST block.
+	// zcode.z.ai rejects a fourth system block with 405/3012 (magpie #343),
+	// and ZCode's own client joins every dynamic section into the third
+	// block's text with "\n\n" — so the model declaration and the caller's
+	// system prompts must never become blocks of their own.
 	var system []map[string]any
 	var official []map[string]any
-	if err := json.Unmarshal(embeddedSystem, &official); err == nil {
+	if err := json.Unmarshal(embeddedSystem, &official); err == nil && len(official) > 0 {
 		system = append(system, official...)
 	}
+	var dynamic []string
 	if strings.TrimSpace(upstreamModel) != "" {
-		system = append(system, map[string]any{
-			"type":          "text",
-			"text":          "- You are powered by the model named " + upstreamModel + ".",
-			"cache_control": map[string]any{"type": "ephemeral"},
-		})
+		dynamic = append(dynamic, "- You are powered by the model named "+upstreamModel+".")
 	}
 	for _, us := range userSystem {
-		system = append(system, map[string]any{"type": "text", "text": us})
+		if strings.TrimSpace(us) != "" {
+			dynamic = append(dynamic, us)
+		}
+	}
+	if len(dynamic) > 0 {
+		if len(system) > 0 {
+			last := system[len(system)-1]
+			prev, _ := last["text"].(string)
+			last["text"] = prev + "\n\n" + strings.Join(dynamic, "\n\n")
+			if _, ok := last["cache_control"]; !ok {
+				last["cache_control"] = map[string]any{"type": "ephemeral"}
+			}
+		} else {
+			// Embedded asset missing: one merged block, still within the cap.
+			system = append(system, map[string]any{
+				"type":          "text",
+				"text":          strings.Join(dynamic, "\n\n"),
+				"cache_control": map[string]any{"type": "ephemeral"},
+			})
+		}
 	}
 
 	// cache_control ephemeral on the last content block of the last
@@ -404,7 +431,7 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds, withThinkingH
 	if len(req.Tools) > 0 {
 		var tools []map[string]any
 		for _, t := range req.Tools {
-			tool := map[string]any{"name": t.Name}
+			tool := map[string]any{"name": toolOutName(t.Name)}
 			if t.Description != "" {
 				tool["description"] = t.Description
 			}
@@ -427,11 +454,18 @@ func (d *Driver) normalizeBody(call driver.ChatCall, creds *Creds, withThinkingH
 		// the client did not send an Anthropic thinking block (BP-69).
 		body["thinking"] = map[string]any{"type": "enabled", "budget_tokens": budget}
 	}
-	if tc := anthropicToolChoice(req.ToolChoice, req.ToolChoiceName, req.DisableParallel); tc != nil {
+	if tc := anthropicToolChoice(req.ToolChoice, toolOutName(req.ToolChoiceName), req.DisableParallel); tc != nil {
 		body["tool_choice"] = tc
 	}
-	if uid := JWTSub(creds.JWT); uid != "" {
-		body["metadata"] = map[string]any{"user_id": uid}
+	// metadata.user_id as the official client puts it: a JSON STRING naming
+	// the device, no account uuid, and the request's x-session-id (magpie
+	// zcode 0.1.30 / #387 — the plan endpoint keeps its prompt cache per
+	// machine and mostly misses without it).
+	if device := deviceIDFor(creds, accountIDOf(call)); device != "" {
+		userID, _ := json.Marshal(map[string]any{
+			"device_id": device, "account_uuid": "", "session_id": sessionIDFor(creds, accountIDOf(call), req.SessionKey),
+		})
+		body["metadata"] = map[string]any{"user_id": string(userID)}
 	}
 	raw, err := json.Marshal(body)
 	return raw, hadThinking, hadUnsigned, err
@@ -565,7 +599,7 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 				tc := &ir.ToolCall{ID: ev.ContentBlock.ID, Name: ev.ContentBlock.Name}
 				tools[ev.Index] = tc
 				toolOrder = append(toolOrder, ev.Index)
-				if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: ev.Index, ToolCall: &ir.ToolCall{ID: tc.ID, Name: tc.Name}}); err != nil {
+				if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: ev.Index, ToolCall: &ir.ToolCall{ID: tc.ID, Name: toolInName(tc.Name)}}); err != nil {
 					return nil, err
 				}
 			}
@@ -715,8 +749,29 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		e.ResetAt = time.Now().Add(6 * time.Hour)
 		return e
 	case code == 3012:
-		// Identity/content inspection rejection: payload problem, not account.
-		return uperr.New(uperr.ClassContentBlocked, 200, "zcode: content inspection rejected: %s", msg)
+		// 405 {"code":3012,"msg":"request has been blocked due to unusual
+		// activity."} is upstream risk control on the ACCOUNT (magpie zcode
+		// 0.1.27: failRestricted), not a property of the payload — the same
+		// body passes on a healthy account. Terminal here, matching the
+		// 11140 discipline: the user re-enables after a manual look.
+		return uperr.New(uperr.ClassAccountRestricted, 405, "zcode: upstream risk control (3012): %s", msg)
+	case code == 3008 || code == 3009:
+		// BP-148: 3008 "user concurrency limit exceeded" / 3009 "model
+		// concurrency limit exceeded" arrive on a 429 when one account has more
+		// in flight than its plan serves (magpie zcode 0.1.32 / #395). That is
+		// throughput backpressure, not an exhausted plan: the account is
+		// healthy and will answer once a slot frees. Classifying it as
+		// ClassInternal (or letting the bare 429 branch give it a 1-hour
+		// ResetAt) took a working account out of service for an hour over a
+		// sub-second collision.
+		//
+		// ClassUpstreamBusy is the pool's "wait, don't switch" class: no account
+		// penalty, and a short channel+model pause so follow-up requests do not
+		// stampede the same full concurrency window.
+		e := uperr.New(uperr.ClassUpstreamBusy, 429, "zcode: concurrency limit (code=%d, transient): %s", code, msg)
+		e.Code = fmt.Sprint(code)
+		e.Model = ResolveModel(upstreamModel)
+		return e
 	case code == 401 || code == 403:
 		return uperr.New(uperr.ClassAuth, code, "zcode: %s", msg)
 	default:
@@ -763,7 +818,7 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	if err != nil {
 		return nil, err
 	}
-	identityHeaders(req, creds, defaultAppVersion)
+	identityHeaders(req, creds, defaultAppVersion, bareUUID(deviceIDFor(creds, acc.ID)))
 	req.Header.Set("Accept", "application/json")
 	resp, err := d.rpc.Do(req)
 	if err != nil {
@@ -835,4 +890,79 @@ func newUUID() string {
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// accountIDOf is a nil-safe read of the account id.
+func accountIDOf(call driver.ChatCall) string {
+	if call.Account != nil {
+		return call.Account.ID
+	}
+	return ""
+}
+
+// ToolSearch rename: Claude Code 2.1+ subagents carry a tool named
+// ToolSearch, and the endpoint hides Bash/Read/Write once a tool with that
+// exact name is declared (magpie zcode 0.1.24). Outbound it goes as
+// ToolSearchTool; the model's calls come back under the alias and are
+// restored before they reach the client.
+const (
+	toolSearchName  = "ToolSearch"
+	toolSearchAlias = "ToolSearchTool"
+)
+
+func toolOutName(name string) string {
+	if name == toolSearchName {
+		return toolSearchAlias
+	}
+	return name
+}
+
+func toolInName(name string) string {
+	if name == toolSearchAlias {
+		return toolSearchName
+	}
+	return name
+}
+
+var uuidRe = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// bareUUID renders a conversation id as the bare UUID the official client
+// sends in x-session-id: an already-UUID key goes as it is, anything else
+// becomes a stable UUID derived from it (magpie zcode sessionOf). BigModel
+// keeps a prompt's cache for requests naming the same session and seldom for
+// those naming none.
+func bareUUID(seed string) string {
+	s := strings.ToLower(strings.TrimSpace(seed))
+	if uuidRe.MatchString(s) {
+		return s
+	}
+	sum := sha256.Sum256([]byte("zcode-session:" + s))
+	b := sum[:16]
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// deviceIDFor names the machine the way the official client's metadata does:
+// the sign-in's device id when we have one, else a stable UUID-shaped stand-in
+// derived from the account identity.
+func deviceIDFor(creds *Creds, accountID string) string {
+	if creds != nil && creds.DeviceMID != "" {
+		return creds.DeviceMID
+	}
+	if creds != nil {
+		if sub := JWTSub(creds.JWT); sub != "" {
+			return bareUUID(sub)
+		}
+	}
+	return bareUUID(accountID)
+}
+
+// sessionIDFor is the request's x-session-id: the ingress session key when
+// there is one, else a per-device stable id (magpie zcode sessionOf).
+func sessionIDFor(creds *Creds, accountID, sessionKey string) string {
+	if k := strings.TrimSpace(sessionKey); k != "" {
+		return bareUUID(k)
+	}
+	return bareUUID(deviceIDFor(creds, accountID))
 }

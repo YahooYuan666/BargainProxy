@@ -85,13 +85,20 @@ const (
 
 // Error is the normalized upstream failure.
 type Error struct {
-	Class    string
-	Status   int
-	Message  string
-	ResetAt  time.Time // precise upstream reset when known
-	Model    string    // set when the error is scoped to a single model
-	Channel  string    // binding that produced the failure (final one for pool errors)
-	Sentinel string    // matched sentinel text for ClassSentinel
+	Class   string
+	Status  int
+	Message string
+	ResetAt time.Time // precise upstream reset when known
+	// ResetHard marks ResetAt as an UPSTREAM-STATED hard window (the body
+	// itself named the moment/duration, e.g. antigravity's RetryInfo or its
+	// 5h/weekly quota buckets). The pool then holds the model until exactly
+	// that moment instead of applying the 2h ModelRateHoldCap — the cap is a
+	// guard against OUR invented/guessed durations, not against upstream's
+	// own numbers (BP-135: user ruling, antigravity buckets are hard).
+	ResetHard bool   `json:"-"`
+	Model     string // set when the error is scoped to a single model
+	Channel   string // binding that produced the failure (final one for pool errors)
+	Sentinel  string // matched sentinel text for ClassSentinel
 	// Code is the upstream business code when the body carried one (e.g.
 	// workbuddy "6004"); the panel shows it as the rate-limit label (BP-49).
 	Code          string
@@ -140,11 +147,18 @@ func New(class string, status int, format string, args ...any) *Error {
 // would walk the whole pool and penalize nothing while spending every
 // account's request budget on a dead route; the binding loop still cascades to
 // another channel, which is where a working route may live.
+//
+// BP-146: an upstream-restricted account is not rotatable WITHIN its channel.
+// CodeBuddy's 403/11140 is a per-account (or per-egress-IP) blacklist, and
+// one request used to walk three accounts of the same pool, leaving a risk
+// record on each — Coding2API measured a fresh account banned three minutes
+// later after exactly that (f428e33). The binding loop still cascades to
+// another CHANNEL: a different upstream is a different verdict.
 func Rotatable(class string) bool {
 	switch class {
 	case ClassBadRequest, ClassContentBlocked, ClassSentinel, ClassUpstreamBusy,
 		ClassUpstreamTimeout, ClassCanceled, ClassNotFound, ClassEdgeBlock,
-		ClassTransportDead:
+		ClassTransportDead, ClassAccountRestricted:
 		return false
 	default:
 		return true

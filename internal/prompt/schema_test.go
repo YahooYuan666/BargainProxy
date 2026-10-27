@@ -94,3 +94,62 @@ func TestFixEnumTypesLeavesMixedAlone(t *testing.T) {
 		t.Fatal("mixed enum must stay untyped")
 	}
 }
+
+// BP-128: a oneOf whose every branch is an object needs "type":"object" at
+// the union level — Kimi 400s on an untyped object union (magpie workbuddy
+// 0.1.33 / qoder 0.2.35).
+func TestFixOneOfObjectUnionTyped(t *testing.T) {
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"target": map[string]any{
+				"oneOf": []any{
+					map[string]any{"type": "object", "properties": map[string]any{"a": map[string]any{"type": "string"}}},
+					map[string]any{"type": "object", "properties": map[string]any{"b": map[string]any{"type": "number"}}},
+				},
+			},
+		},
+	}
+	if !FixEnumTypes(schema) {
+		t.Fatal("expected a change")
+	}
+	target := schema["properties"].(map[string]any)["target"].(map[string]any)
+	if target["type"] != "object" {
+		t.Fatalf("union type = %v, want object", target["type"])
+	}
+}
+
+// A $ref-only union counts as object-typed too; a mixed union does not get
+// typed, and a schema already carrying a type is left alone.
+func TestFixOneOfUnionEdges(t *testing.T) {
+	refOnly := map[string]any{
+		"oneOf": []any{
+			map[string]any{"$ref": "#/$defs/a"},
+			map[string]any{"$ref": "#/$defs/b"},
+		},
+	}
+	if !FixEnumTypes(refOnly) || refOnly["type"] != "object" {
+		t.Fatalf("ref-only union: type = %v, want object", refOnly["type"])
+	}
+	mixed := map[string]any{
+		"oneOf": []any{
+			map[string]any{"type": "object"},
+			map[string]any{"type": "string"},
+		},
+	}
+	FixEnumTypes(mixed)
+	if _, has := mixed["type"]; has {
+		t.Fatalf("mixed union must stay untyped, got %v", mixed["type"])
+	}
+	typed := map[string]any{
+		"type": "object",
+		"oneOf": []any{
+			map[string]any{"type": "object"},
+			map[string]any{"type": "object"},
+		},
+	}
+	FixEnumTypes(typed)
+	if typed["type"] != "object" {
+		t.Fatalf("existing type must be kept, got %v", typed["type"])
+	}
+}

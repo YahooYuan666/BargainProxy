@@ -49,6 +49,9 @@ type Result struct {
 	// before succeeding (1 = no cascade). On failure the tally is read off
 	// the request Trace instead (see TraceFrom).
 	Attempts int
+	// ToolsDeclared rides the request's tool count so the log row can record
+	// it next to the calls actually made (BP-133).
+	ToolsDeclared int
 }
 
 // Trace records how a request was attempted across bindings, so the request
@@ -363,7 +366,14 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 			// All are only safe while nothing reached the client.
 			switch ue.Class {
 			case uperr.ClassUpstreamTimeout, uperr.ClassCanceled, uperr.ClassNotFound,
-				uperr.ClassContentBlocked, uperr.ClassSentinel, uperr.ClassBadRequest:
+				uperr.ClassContentBlocked, uperr.ClassSentinel, uperr.ClassBadRequest,
+				uperr.ClassAccountRestricted:
+				// BP-146: a restricted account means "this ACCOUNT is banned
+				// upstream", not "the request is bad". Never retry another
+				// account of the same channel (each attempt leaves a risk
+				// record and the next account gets banned too — Coding2API
+				// f428e33), but a different channel is a different upstream
+				// and may well serve the turn.
 				if !(req.Stream && firstEvent) {
 					continue
 				}
@@ -563,6 +573,17 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 	// do not inflate the number.
 	tr.note(binding.Channel)
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
+		// BP-129: a ceiling an upstream stated in a 400 binds this channel+model
+		// until it expires — later requests clamp upfront instead of paying the
+		// 400 + repaired retry again. The channel is only known here (routing
+		// happens above; the ClampOutput spot runs pre-routing).
+		if req.MaxTokens > 0 {
+			if ceil := config.LearnedOutputCeiling(binding.Channel, req.Model); ceil > 0 && req.MaxTokens > ceil {
+				log.Printf("gateway: clamped max_tokens %d → %d for %s/%s (learned ceiling)",
+					req.MaxTokens, ceil, binding.Channel, req.Model)
+				req.MaxTokens = ceil
+			}
+		}
 		// Queue wait is deliberately OUTSIDE the first-byte window: Acquire
 		// blocks while every account of the pool is at max_in_flight, and that
 		// wait says nothing about how slow the upstream's first byte is. The
@@ -641,6 +662,20 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 					retryCall.Request = &raised
 					log.Printf("gateway: %s rejected max_tokens=%d, retrying with %d (upstream minimum)",
 						binding.Channel, req.MaxTokens, floor)
+					started = time.Now()
+					resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
+				} else if ceil := config.CeilingFromMessage(ue.Message); ceil > 0 && req.MaxTokens > ceil {
+					// BP-129: the mirror repair — "Range of max_tokens should
+					// be [1, N]" names the model's real output maximum. Clamp,
+					// retry once on the same account (a bad_request means the
+					// turn never started), and remember for later turns.
+					config.LearnOutputCeiling(binding.Channel, req.Model, ceil)
+					clamped := *req
+					clamped.MaxTokens = ceil
+					retryCall := call
+					retryCall.Request = &clamped
+					log.Printf("gateway: %s rejected max_tokens=%d, retrying with %d (upstream maximum, learned)",
+						binding.Channel, req.MaxTokens, ceil)
 					started = time.Now()
 					resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
 				}
@@ -750,7 +785,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				g.pool.RecordCostTier(lease.Account, binding.UpstreamModel, tier)
 			}
 			g.persistCreds(lease.Account)
-			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts}
+			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts, ToolsDeclared: len(req.Tools)}
 			if degraded {
 				res.Degraded = binding.Channel
 			}

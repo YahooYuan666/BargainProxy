@@ -208,6 +208,14 @@ func classifyCode(code int, message string) *uperr.Error {
 	case 40301:
 		// Model not entitled for this account (subscription / plan gate).
 		return uperr.New(uperr.ClassHardCredit, 403, "lobster: %s", message)
+	case 40302:
+		// Server-side risk-control ban ("账号已被禁用"). Coding2API ran the
+		// same experiment on 2026-10-26 and reverted the channel: a fresh
+		// account answered 40302 on its FIRST call, client-shape fixes did not
+		// help, and the login endpoint keeps issuing tokens regardless — so
+		// this is terminal for the account, not a request fault. Leave routing
+		// instead of hammering a dead number.
+		return uperr.New(uperr.ClassAccountRestricted, 403, "lobster: account banned upstream: %s", message)
 	}
 	// Limit wording appears in plain 400-shaped messages too; treat it as a
 	// rate event so the pool rests instead of striking the account.

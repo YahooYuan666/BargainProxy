@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -29,32 +30,28 @@ const AnonymousKey = "public"
 // tightens against old versions; bump here when it does (2026-10-18: the
 // free lane started answering 400 FreeTierError to 1.18.31).
 //
-// 1.19.0 is the version the reference implementation reproduces byte for byte
-// (magpie-community/plugins packages/zen-free), captured from the release
-// binary's own requests. Our previous "1.19.3 (windows amd64; node20)" string
-// was invented: the real CLI reports ai-sdk provider-utils and Bun runtime
-// segments instead, so the whole UA differed in shape, not just in version
-// (BP-97). That also explains why bumping the version number alone (BP-72) did
-// not lift the gate.
-const openCodeClientVersion = "1.19.0"
+// 2.0.25 is what magpie-community/plugins packages/zen-free captured from
+// OpenCode's own requests (2026-10-25). 2026-10-26 Zen's free tier started
+// answering 429 FreeUsageLimitError ("Free models work in OpenCode") to the
+// exact UA the 1.19.0 disguise sent — while the same request under ANY other
+// string, 2.0.25's included, is served — and 2.x unified the UA across
+// protocols to `opencode/<channel>/<version>/<name>`, so the per-protocol
+// ai-sdk provider-utils segments the 1.x UA carried are history (BP-97 kept
+// them accurate for 1.19.0; BP-127 follows the 2.x format).
+const openCodeClientVersion = "2.0.25"
 
-// openCodeRuntimeVersion is the Bun runtime segment of the real UA.
-const openCodeRuntimeVersion = "1.3.14"
-
-// openCodeProviderUtils is the ai-sdk provider-utils version, which differs per
-// protocol because each protocol's ai-sdk package bundles its own copy (values
-// captured from the release binary).
-var openCodeProviderUtils = map[string]string{
-	"chat":      "4.0.23",
-	"responses": "4.0.40",
-	"anthropic": "4.0.46",
-}
-
-// gateToolNames are the two function tools the free lane requires on every
+// gateToolNames are the function tools the free lane requires on every
 // request (live 2026-10-16: a request without them answers 403
-// FreeTierError). When the client did not bring them we inject shadow
+// FreeTierError). magpie zen-free 0.1.15 carries OpenCode's full five-tool
+// core set, each stand-in declaring the parameter OpenCode's own declaration
+// leads with — when the client did not bring them we inject shadow
 // definitions and strip the model's calls to them from the response.
-var gateToolNames = [2]string{"bash", "read"}
+var gateToolNames = []string{"bash", "edit", "glob", "grep", "read"}
+
+// gateToolParam is each gate tool's leading parameter, as OpenCode declares it.
+var gateToolParam = map[string]string{
+	"bash": "command", "edit": "filePath", "glob": "pattern", "grep": "pattern", "read": "filePath",
+}
 
 // acceptedEfforts are the reasoning_effort values the upstream actually
 // accepts; anything else (off/none/unknown) must be omitted, not passed
@@ -64,6 +61,128 @@ var acceptedEfforts = map[string]bool{
 }
 
 const gateDescription = "Reserved for the host runtime; do not call it."
+
+// gateToolSchema renders the stand-in's parameter schema: one required string
+// property, OpenCode's own shape for that tool.
+func gateToolSchema(name string) map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			gateToolParam[name]: map[string]any{"type": "string"},
+		},
+		"additionalProperties": false,
+	}
+}
+
+// --- OpenCode environment block ---------------------------------------------
+
+// zenEnvironment is OpenCode's environment block: every OpenCode prompt ends
+// with `<env>…Working directory:…</env>`, and Zen's free tier serves a
+// request as OpenCode's own only when one of its SYSTEM messages carries it
+// (magpie zen-free 0.1.15, live 2026-10-25 against deepseek-v4.1-flash-free
+// and glm-5.3-flash-free). A request without one gets a small daily
+// allowance, then 429 FreeUsageLimitError until 00:00 UTC, whatever its
+// headers say. In a user message or a tool description it does not count,
+// and `<ENV>` / `working directory:` don't either. The directory isn't known
+// here, so it is told as unknown rather than as a path that would mislead
+// the model.
+const zenEnvironment = "<env>\n  Working directory: unknown\n</env>"
+
+var zenHasEnvironment = regexp.MustCompile(`(?s)<env>.*Working directory:.*</env>`)
+
+// injectEnvironment appends the block to the request's own system text —
+// chat lane: the first system message (content stays one message so its
+// cache holds); responses lane: the instructions string. A request that
+// already carries an env block is left alone; with no system message at all
+// one is put first.
+func injectEnvironment(body map[string]any, responsesLane bool) {
+	if responsesLane {
+		s, _ := body["instructions"].(string)
+		if zenHasEnvironment.MatchString(s) {
+			return
+		}
+		body["instructions"] = withEnvironment(s)
+		return
+	}
+	// The chat build stores messages as []map[string]any (a concrete []any
+	// here once silently replaced every real message — the ensureGateTools
+	// lesson), so both shapes are handled in place.
+	switch msgs := body["messages"].(type) {
+	case []map[string]any:
+		for _, mm := range msgs {
+			if role, _ := mm["role"].(string); role != "system" {
+				continue
+			}
+			switch c := mm["content"].(type) {
+			case string:
+				if zenHasEnvironment.MatchString(c) {
+					return
+				}
+				mm["content"] = withEnvironment(c)
+			case []any:
+				if partsHaveEnvironment(c) {
+					return
+				}
+				mm["content"] = append(c, map[string]any{"type": "text", "text": zenEnvironment})
+			case nil:
+				mm["content"] = zenEnvironment
+			}
+			return
+		}
+		body["messages"] = append([]map[string]any{{"role": "system", "content": zenEnvironment}}, msgs...)
+	case []any:
+		for _, m := range msgs {
+			mm, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			if role, _ := mm["role"].(string); role != "system" {
+				continue
+			}
+			switch c := mm["content"].(type) {
+			case string:
+				if zenHasEnvironment.MatchString(c) {
+					return
+				}
+				mm["content"] = withEnvironment(c)
+			case []any:
+				if partsHaveEnvironment(c) {
+					return
+				}
+				mm["content"] = append(c, map[string]any{"type": "text", "text": zenEnvironment})
+			case nil:
+				mm["content"] = zenEnvironment
+			}
+			return
+		}
+		body["messages"] = append([]any{map[string]any{"role": "system", "content": zenEnvironment}}, msgs...)
+	default:
+		body["messages"] = []any{map[string]any{"role": "system", "content": zenEnvironment}}
+	}
+}
+
+// partsHaveEnvironment scans array-shaped message content for an env block.
+func partsHaveEnvironment(parts []any) bool {
+	for _, p := range parts {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		if txt, _ := pm["text"].(string); zenHasEnvironment.MatchString(txt) {
+			return true
+		}
+	}
+	return false
+}
+
+// withEnvironment appends the block to a system text the way the reference
+// implementation does: `content\n\n<env>…`, or just the block when empty.
+func withEnvironment(content string) string {
+	if strings.TrimSpace(content) == "" {
+		return zenEnvironment
+	}
+	return content + "\n\n" + zenEnvironment
+}
 
 // --- identity: canonical session/request/project ids ---
 
@@ -273,20 +392,15 @@ func randomHex32() string {
 	return hex.EncodeToString(b[:])
 }
 
-// openCodeUserAgent is the CLI's own User-Agent for one protocol:
+// openCodeUserAgent is the CLI's own User-Agent. 1.x sent per-protocol
+// ai-sdk segments; 2.x sends ONE UA on every protocol:
 //
-//	opencode/<ver> ai-sdk/provider-utils/<sdk> runtime/bun/<bun>
+//	opencode/<channel>/<version>/<name>   →   opencode/latest/2.0.25/cli
 //
-// The ai-sdk segment differs per protocol because each protocol's ai-sdk
-// package bundles its own provider-utils copy (BP-97, values captured from the
-// release binary). An unknown protocol falls back to the chat segment.
+// (magpie zen-free captured it from the release binary and its live requests,
+// 2026-10-25.) The protocol argument is kept for call-site compatibility.
 func openCodeUserAgent(protocol string) string {
-	sdk, ok := openCodeProviderUtils[protocol]
-	if !ok {
-		sdk = openCodeProviderUtils["chat"]
-	}
-	return fmt.Sprintf("opencode/%s ai-sdk/provider-utils/%s runtime/bun/%s",
-		openCodeClientVersion, sdk, openCodeRuntimeVersion)
+	return fmt.Sprintf("opencode/latest/%s/cli", openCodeClientVersion)
 }
 
 // disguiseHeaders returns the full header set every upstream request carries.
@@ -313,7 +427,7 @@ func gateToolChat(name string) map[string]any {
 		"function": map[string]any{
 			"name":        name,
 			"description": gateDescription,
-			"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+			"parameters":  gateToolSchema(name),
 		},
 	}
 }
@@ -323,7 +437,7 @@ func gateToolResponses(name string) map[string]any {
 		"type":        "function",
 		"name":        name,
 		"description": gateDescription,
-		"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
+		"parameters":  gateToolSchema(name),
 	}
 }
 
@@ -402,7 +516,13 @@ func ensureGateTools(body map[string]any, responsesLane bool) int {
 
 // gateToolSet is the set of names we may have injected; calls to them are
 // stripped from the response before it reaches the client.
-var gateToolSet = map[string]bool{gateToolNames[0]: true, gateToolNames[1]: true}
+var gateToolSet = func() map[string]bool {
+	m := map[string]bool{}
+	for _, n := range gateToolNames {
+		m[n] = true
+	}
+	return m
+}()
 
 // isGateToolName reports whether name is one of the free-lane gate tools.
 func isGateToolName(name string) bool { return gateToolSet[name] }

@@ -205,22 +205,32 @@ func TestPlanLimit1005(t *testing.T) {
 		Request:       &ir.ChatRequest{Model: "glm-5.2", Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "x"}}}}},
 	}, func(ev ir.StreamEvent) error { return nil })
 	ue, ok := uperr.As(err)
-	if !ok || ue.Class != uperr.ClassSoftRate {
-		t.Fatalf("expected soft_rate for 1005, got %v", err)
+	if !ok || ue.Class != uperr.ClassModelRate {
+		t.Fatalf("expected model_rate for 1005, got %v", err)
 	}
-	if delay := time.Until(ue.ResetAt); delay < 11*time.Hour {
-		t.Fatalf("1005 cooldown should be ~12h, got %s", delay)
+	if delay := time.Until(ue.ResetAt); delay < 30*time.Minute || delay > 2*time.Hour {
+		t.Fatalf("1005 cooldown should be ~1h (plan paywall is per-model), got %s", delay)
 	}
 }
 
 func TestCheckinFlow(t *testing.T) {
+	// BP-147: the claim is now confirmed by re-reading the status page, so the
+	// mock must behave like the upstream and flip checked_in (with the new
+	// balance) once the claim lands. Calls are therefore 3: status, claim,
+	// status.
 	calls := 0
+	claimed := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		switch r.URL.Path {
 		case "/trae/api/v2/ug/checkin_credits/status":
+			if claimed {
+				fmt.Fprint(w, `{"checked_in":true,"credits":200,"enable":true}`)
+				return
+			}
 			fmt.Fprint(w, `{"checked_in":false,"credits":100,"enable":true}`)
 		case "/trae/api/v2/ug/checkin_credits/claim":
+			claimed = true
 			fmt.Fprint(w, `{"code":0}`)
 		default:
 			t.Errorf("unexpected path %s", r.URL.Path)
@@ -233,8 +243,8 @@ func TestCheckinFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkin: %v", err)
 	}
-	if !checkedIn || credits != 100 || calls != 2 {
-		t.Fatalf("checkedIn=%v credits=%d calls=%d", checkedIn, credits, calls)
+	if !checkedIn || credits != 200 || calls != 3 {
+		t.Fatalf("checkedIn=%v credits=%d calls=%d (want true/200/3 — the post-claim status read)", checkedIn, credits, calls)
 	}
 }
 
@@ -439,8 +449,8 @@ func TestStreamSOLOErrorEvent(t *testing.T) {
 		Request:       &ir.ChatRequest{Model: "glm-5.3-flashx", Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "x"}}}}},
 	}, func(ev ir.StreamEvent) error { return nil })
 	ue, ok := uperr.As(err)
-	if !ok || ue.Class != uperr.ClassSoftRate {
-		t.Fatalf("expected soft_rate from event:error, got %v", err)
+	if !ok || ue.Class != uperr.ClassModelRate {
+		t.Fatalf("expected model_rate from event:error, got %v", err)
 	}
 }
 
@@ -482,6 +492,12 @@ func TestCheckin9074RushRetriesThenClaims(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/trae/api/v2/ug/checkin_credits/status":
+			// BP-147: after the claim lands the status page reports the day
+			// as checked in and carries the new balance.
+			if claims > 0 {
+				fmt.Fprint(w, `{"checked_in":true,"credits":200,"enable":true}`)
+				return
+			}
 			fmt.Fprint(w, `{"checked_in":false,"credits":100,"enable":true}`)
 		case "/trae/api/v2/ug/checkin_credits/claim":
 			claims++
@@ -501,8 +517,8 @@ func TestCheckin9074RushRetriesThenClaims(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkin: %v", err)
 	}
-	if !checked || credits != 100 || !enable {
-		t.Fatalf("checkedIn=%v credits=%d enable=%v, want true/100/true", checked, credits, enable)
+	if !checked || credits != 200 || !enable {
+		t.Fatalf("checkedIn=%v credits=%d enable=%v, want true/200/true (post-claim balance)", checked, credits, enable)
 	}
 	if claims != 2 {
 		t.Fatalf("claim attempts = %d, want 2 (one rush refusal, then the claim)", claims)

@@ -148,14 +148,17 @@ func tierChannel(source string) string {
 //   - Trae/ZCode: glm-5.3-flash per models.dev (text+image+video+pdf).
 var routedSpecs = map[string]tierRow{
 	// Qoder 倍率取一手接口 model/list 的 price_factor（2026-10-18 核实；
-	// DeepSeek-Flash 0.1 / Kimi-K3 1.4。
+	// 2026-10-26 872d9b9 复核：Kimi-K3.1-Pro 由 Kimi-K3 原位升级，倍率
+	// 1.4 → 1.0）：GLM-5.3 0.8 / GLM-5.3-Flash 0.1 / Qwen3.8-Flash 0（免费）/
+	// Qwen3.8-Max 0.5（错峰 22:00-08:00 打 4 折）/ DeepSeek-V4-Pro 0.5 /
+	// DeepSeek-Flash 0.1 / Kimi-K3.1-Pro 1.0。
 	"qoder|GLM-5.3":              {Billing: "x0.8", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"qoder|GLM-5.3-Flash":        {Billing: "x0.1", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"qoder|Qwen3.8-Flash":        {Billing: "免费（折前 x0.1）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "关闭 + low/medium/xhigh", ToolCall: true, Structured: true},
 	"qoder|Qwen3.8-Max":          {Billing: "x0.5（错峰 22:00-08:00 → x0.2）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "关闭 + low/medium/xhigh", ToolCall: true, Structured: true},
 	"qoder|DeepSeek-V4-Pro":      {Billing: "x0.5", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "关闭 + high/max", ToolCall: true, Structured: true},
 	"qoder|DeepSeek-Flash":       {Billing: "x0.1", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: true, Structured: true},
-	"qoder|Kimi-K3":              {Billing: "x1.4", ContextLen: 1048576, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
+	"qoder|Kimi-K3.1-Pro":        {Billing: "x1.0", ContextLen: 1048576, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"autoclaw|zaicoding_glm-5.3": {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 307200, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	"autoclaw|glm-5.3-flash":     {Billing: "按次扣点数", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	// Lobster（有道龙虾，BP-136）：倍率取自公开价格目录
