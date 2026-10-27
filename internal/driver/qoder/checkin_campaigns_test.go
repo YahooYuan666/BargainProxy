@@ -63,8 +63,10 @@ func TestCheckinCampaignsFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("checkin: %v", err)
 	}
-	if !checkedIn || credits != 100 || !enable {
-		t.Fatalf("campaigns claim result = %v/%v/%v, want true/100/true", checkedIn, credits, enable)
+	// BP-151: landed claims report the reward (false/100/true), not
+	// "already checked in".
+	if checkedIn || credits != 100 || !enable {
+		t.Fatalf("campaigns claim result = %v/%v/%v, want false/100/true", checkedIn, credits, enable)
 	}
 	if campaignHits < 2 {
 		t.Fatalf("campaigns list+claim not both called: %d", campaignHits)

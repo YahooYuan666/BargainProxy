@@ -59,8 +59,9 @@ func TestCheckinDisabledFallsBackToCampaigns(t *testing.T) {
 	if !claimed {
 		t.Fatal("DISABLED must fall through to the campaigns claim — Qoder CN moved the daily 100 credits there")
 	}
-	if !checkedIn || credits != 100 || !enable {
-		t.Fatalf("result = (%v, %d, %v), want (true, 100, true)", checkedIn, credits, enable)
+	// BP-151: landed claims report the reward (false/100/true).
+	if checkedIn || credits != 100 || !enable {
+		t.Fatalf("result = (%v, %d, %v), want (false, 100, true)", checkedIn, credits, enable)
 	}
 }
 
@@ -208,8 +209,11 @@ func TestCampaignsClaimReadsNestedBenefit(t *testing.T) {
 	if claimHits != 1 {
 		t.Fatalf("claim called %d times, want 1", claimHits)
 	}
-	if !checkedIn || !enable {
-		t.Fatalf("result = (%v, %v), want (true, true)", checkedIn, enable)
+	// BP-151: a landed claim reports checkedIn=false + the reward, so the
+	// task ledger renders "+100 credits" (and taskRunCredits books it)
+	// instead of an uninformative "already checked in today".
+	if checkedIn || !enable {
+		t.Fatalf("result = (%v, %v), want (false, true)", checkedIn, enable)
 	}
 	if credits != 100 {
 		t.Fatalf("reward = %d, want 100 from the nested benefit.amount", credits)

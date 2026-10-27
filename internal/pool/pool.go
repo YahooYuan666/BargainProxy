@@ -272,13 +272,101 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 }
 
 // Upsert installs or replaces one account (used at boot and by the panel).
+//
+// BP-150: re-registering an account must not destroy what the pool has LEARNED
+// about it. Onboarding paths build a fresh *model.Account from the upstream's
+// answer — credentials only, no runtime state — and upsert it over the live
+// one. Before this, that replaced the whole object: the credit high-water mark
+// (BP-122), the cost tiers, the cooldowns and the failure counters all reset to
+// zero, so an account that had once held 13000 points showed "12673/12673"
+// after the next AutoClaw re-import — the historical peak the user watches for
+// a top-up was simply gone.
+//
+// The merge rule is per field: the incoming object owns identity, credentials
+// and the operator's switches; the existing object owns anything it OBSERVED
+// (balances, windows, cost tiers, cooldown deadlines, failure counts). A field
+// the caller explicitly set is never overwritten by the old one.
 func (p *Pool) Upsert(acc *model.Account) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_, existed := p.accounts[acc.ID]
+	if prev, existed := p.accounts[acc.ID]; existed && prev != nil {
+		mergeLearnedState(prev, acc)
+		p.accounts[acc.ID] = acc
+		return
+	}
 	p.accounts[acc.ID] = acc
-	if !existed {
-		p.byChan[acc.Channel] = append(p.byChan[acc.Channel], acc.ID)
+	p.byChan[acc.Channel] = append(p.byChan[acc.Channel], acc.ID)
+}
+
+// mergeLearnedState copies the observations held by prev into next, for every
+// field next left empty. Credentials and identity are never touched: those
+// belong to the incoming registration.
+func mergeLearnedState(prev, next *model.Account) {
+	// Credit snapshot: take the whole block when the incoming one carries no
+	// observation at all (a fresh registration), otherwise keep whichever is
+	// newer — and always keep the higher peak, which is a high-water mark and
+	// therefore monotonic by definition.
+	if next.Credits.UpdatedAt.IsZero() && prev.Credits.UpdatedAt.IsZero() == false {
+		next.Credits = prev.Credits
+	} else if !next.Credits.UpdatedAt.IsZero() && !prev.Credits.UpdatedAt.IsZero() {
+		peak, peakAt := prev.Credits.Peak, prev.Credits.PeakAt
+		if next.Credits.Peak > peak {
+			peak, peakAt = next.Credits.Peak, next.Credits.PeakAt
+		}
+		if next.Credits.UpdatedAt.Before(prev.Credits.UpdatedAt) {
+			next.Credits = prev.Credits
+		}
+		next.Credits.Peak = peak
+		next.Credits.PeakAt = peakAt
+	}
+	// Peak survives even when only one side knows it.
+	if next.Credits.Peak == 0 && prev.Credits.Peak > 0 {
+		next.Credits.Peak = prev.Credits.Peak
+		next.Credits.PeakAt = prev.Credits.PeakAt
+	}
+
+	if len(next.Windows) == 0 && len(prev.Windows) > 0 {
+		next.Windows = prev.Windows
+	}
+	if len(next.CostTiers) == 0 && len(prev.CostTiers) > 0 {
+		next.CostTiers = prev.CostTiers
+	}
+	if len(next.ModelCooldowns) == 0 && len(prev.ModelCooldowns) > 0 {
+		next.ModelCooldowns = prev.ModelCooldowns
+	}
+	// Cooldown deadlines only ever extend: a fresh registration must not
+	// shorten a rest the pool decided on.
+	if next.AccountCooldownUntil.IsZero() && !prev.AccountCooldownUntil.IsZero() {
+		next.AccountCooldownUntil = prev.AccountCooldownUntil
+		next.AccountCooldownReason = prev.AccountCooldownReason
+		next.AccountCooldownBy = prev.AccountCooldownBy
+	}
+	if next.ConsecutiveFails == 0 {
+		next.ConsecutiveFails = prev.ConsecutiveFails
+	}
+	if next.BreakerFails == 0 {
+		next.BreakerFails = prev.BreakerFails
+	}
+	if next.LastUsedAt.IsZero() {
+		next.LastUsedAt = prev.LastUsedAt
+	}
+	if next.RateLimitedAt.IsZero() {
+		next.RateLimitedAt = prev.RateLimitedAt
+	}
+	// The operator's switches survive a silent re-registration: a fresh struct
+	// carries Disabled/Paused == false, which would silently re-enable an
+	// account someone turned off. A caller that MEANS to flip them sets the
+	// field through the panel's toggle endpoint, not through a re-import.
+	if prev.Disabled {
+		next.Disabled = true
+	}
+	if prev.Paused {
+		next.Paused = true
+	}
+	// UpdatedAt orders persistence writes: keep the later one so the merge is
+	// not mistaken for an older state and skipped by SaveAccountState.
+	if next.UpdatedAt.Before(prev.UpdatedAt) {
+		next.UpdatedAt = prev.UpdatedAt
 	}
 }
 

@@ -1396,11 +1396,20 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 	rawList, _ := list["campaigns"].([]any)
 	now := time.Now().Unix()
 	var claimable map[string]any
+	// BP-151: whether ANY daily-benefit campaign exists decides what "nothing
+	// claimable" means. The benefit refreshes daily at 10:00 UTC+8 (read live,
+	// 2026-10-26), and our check-in slot runs at 01:05 — hours BEFORE the
+	// refresh. At that hour the campaign answers "not claimable yet", and
+	// reporting that as a settled "not available" ok locked the day's later
+	// slots (11:05, 21:05) behind the idempotency ledger: the daily credits
+	// could then only ever be claimed by hand.
+	benefitSeen := false
 	for _, it := range rawList {
 		c, ok := it.(map[string]any)
 		if !ok || toString(c["actionType"]) != "CLAIM_BENEFIT" {
 			continue
 		}
+		benefitSeen = true
 		start := toInt64(c["startAt"])
 		end := toInt64(c["endAt"])
 		active := (start == 0 || start <= now) && (end == 0 || end > now)
@@ -1416,7 +1425,19 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 		}
 	}
 	if claimable == nil {
-		return false, 0, true, nil // no active campaign: inactive, not an error
+		if benefitSeen {
+			// The programme exists but today's share is not on the counter
+			// yet. NOT a settled answer: come back at a later slot.
+			return false, 0, true, &campaignRetryableError{
+				msg: "qoder campaigns: daily benefit exists but is not claimable yet — retry at a later slot",
+			}
+		}
+		// No daily-benefit campaign AT ALL: the channel genuinely has no
+		// check-in programme right now. enable=false so the task ledger says
+		// "not available" (settled) instead of a misleading "checkin ok (+0
+		// credits)" — and so this stays a quiet ok rather than a daily
+		// failure row for an upstream that retired the programme.
+		return false, 0, false, nil
 	}
 	id := toString(claimable["id"])
 	if id == "" {
@@ -1445,13 +1466,24 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 	if reward == 0 {
 		reward = campaignBenefit(claimable)
 	}
-	// A fresh campaigns claim IS the day's check-in done: the task ledger
-	// must record it as ok/checked-in so the next slot does not re-run it
-	// (the legacy path returned false here because its status endpoint
-	// reports CLAIMED the next time; the campaigns page has no such
-	// re-read in the same day).
-	return true, reward, true, nil
+	// A fresh campaigns claim pays credits, so the task ledger must say so:
+	// checkedIn=false + the reward rides the SAME "+N credits" phrasing the
+	// legacy path uses, which is what taskRunCredits books into the ledger.
+	// (Returning checkedIn=true here used to render "already checked in
+	// today" — a landed +100 that read as if nothing had been claimed.)
+	// The day is still settled: the ok status locks the later slots.
+	return false, reward, true, nil
 }
+
+// campaignRetryableError marks "the programme exists but today's share is not
+// on the counter yet". The task ledger records it as a failure — which is
+// exactly what makes the day's LATER check-in slots (11:05, 21:05) retry it,
+// instead of the first "not available" answer locking them out (BP-151).
+type campaignRetryableError struct {
+	msg string
+}
+
+func (e *campaignRetryableError) Error() string { return e.msg }
 
 // campaignBenefit reads the NESTED benefit.amount (magpie:
 // claim.benefit.amount ?? claim.data.benefit.amount ?? campaign.benefit.amount).
