@@ -204,9 +204,21 @@ func classifyCode(code int, message string) *uperr.Error {
 	case 40300:
 		return uperr.New(uperr.ClassWAF, 403, "lobster: %s", message)
 	case 42900:
-		return uperr.New(uperr.ClassSoftRate, 429, "lobster: %s", message)
+		// "请求过于频繁" is a rolling-window throttle, not an allowance:
+		// seconds-level rest (sub2api #8286) instead of the pool's 10-minute
+		// soft base (BP-153).
+		e := uperr.New(uperr.ClassSoftRate, 429, "lobster: %s", message)
+		e.ResetAt = time.Now().Add(5 * time.Second)
+		return e
 	case 40301:
 		// Model not entitled for this account (subscription / plan gate).
+		return uperr.New(uperr.ClassHardCredit, 403, "lobster: %s", message)
+	case 40201:
+		// BP-156: the free allowance is used up ("免费额度已用完，请升级套餐"),
+		// arriving inside an event:error frame on an HTTP 200 stream
+		// (jacek4yang/lobsterai-proxy f1b4b1a). It used to fall through to
+		// ClassBadRequest — no cooldown, the drained account stayed
+		// selectable and the client saw a bare 400.
 		return uperr.New(uperr.ClassHardCredit, 403, "lobster: %s", message)
 	case 40302:
 		// Server-side risk-control ban ("账号已被禁用"). Coding2API ran the
@@ -218,9 +230,13 @@ func classifyCode(code int, message string) *uperr.Error {
 		return uperr.New(uperr.ClassAccountRestricted, 403, "lobster: account banned upstream: %s", message)
 	}
 	// Limit wording appears in plain 400-shaped messages too; treat it as a
-	// rate event so the pool rests instead of striking the account.
+	// rate event so the pool rests instead of striking the account. The
+	// wording here is purely frequency-shaped (限流/频率/过快/rate limit), so a
+	// seconds-level rest matches what the wall actually asks for (BP-153).
 	if limitWords.MatchString(message) {
-		return uperr.New(uperr.ClassSoftRate, 429, "lobster: %s", message)
+		e := uperr.New(uperr.ClassSoftRate, 429, "lobster: %s", message)
+		e.ResetAt = time.Now().Add(5 * time.Second)
+		return e
 	}
 	return uperr.New(uperr.ClassBadRequest, 400, "lobster: %s", message)
 }

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -211,6 +212,15 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			Usage *struct {
 				PromptTokens     int `json:"prompt_tokens"`
 				CompletionTokens int `json:"completion_tokens"`
+				// BP-161: cached-input counts, two shapes. OpenAI-family
+				// upstreams use prompt_tokens_details.cached_tokens; DeepSeek
+				// uses the flat prompt_cache_hit_tokens (its prompt_tokens
+				// already sums hit+miss). Losing these zeroes the sticky
+				// session's cache metrics.
+				PromptTokensDetails *struct {
+					CachedTokens int `json:"cached_tokens"`
+				} `json:"prompt_tokens_details"`
+				PromptCacheHitTokens int `json:"prompt_cache_hit_tokens"`
 			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
@@ -253,6 +263,15 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 		}
 		if chunk.Usage != nil {
 			usage = ir.Usage{InputTokens: chunk.Usage.PromptTokens, OutputTokens: chunk.Usage.CompletionTokens}
+			// BP-161: the OpenAI details shape wins, the DeepSeek flat field
+			// is the fallback.
+			if chunk.Usage.PromptTokensDetails != nil {
+				usage.CachedInputTokens = chunk.Usage.PromptTokensDetails.CachedTokens
+				usage.CacheKnown = true
+			} else if chunk.Usage.PromptCacheHitTokens > 0 {
+				usage.CachedInputTokens = chunk.Usage.PromptCacheHitTokens
+				usage.CacheKnown = true
+			}
 			gotUsage = true
 		}
 	}
@@ -343,6 +362,11 @@ func detectFrameError(payload string) *uperr.Error {
 		switch hint := strings.ToLower(doc.Error.Type + " " + toStr(doc.Error.Code)); {
 		case strings.Contains(hint, "rate") || strings.Contains(hint, "limit") || strings.Contains(hint, "overload"):
 			status = 429
+		case minuteLimitBody(strings.ToLower(doc.Error.Message) + " " + hint):
+			// A per-minute wall that avoided the words "rate"/"limit" (BP-153:
+			// Gemini's "…quotaId …PerMinute" said only "quota" and used to
+			// reach the 402 branch as a balance death).
+			status = 429
 		case strings.Contains(hint, "quota") || strings.Contains(hint, "insufficient"):
 			status = 402
 		case strings.Contains(hint, "invalid") || strings.Contains(hint, "param"):
@@ -361,6 +385,29 @@ func toStr(v any) string {
 	return ""
 }
 
+// minuteMarkers name a per-minute / per-second window: the frequency-family
+// 429 (magpie d83f887a, sub2api #8286). Vendors word them as quotas —
+// Gemini's "…quotaId …PerMinute", Vertex's "requests_per_minute…",
+// DashScope's "Allocated quota exceeded…" — so a bare "quota" must never
+// turn one into a balance death.
+var urlNoise = regexp.MustCompile(`https?://\S+`)
+
+var minuteMarkers = regexp.MustCompile(
+	`(?i)\bper[ -_]?minute\b|\bper[ -_]?second\b|\bperminute\b|requests?_per_minute|tokens? per minute|` +
+		`\b(tpm|rpm)\b|每分钟|每秒|过于频繁|频率`)
+
+// longWindowWords are the plan/period resets that must NOT be read as a
+// minute-level throttle even when the same body also says "quota".
+var longWindowWords = regexp.MustCompile(`(?i)per[ -_]?(hour|day|week|month)|monthly|weekly|daily|每小时|每天|每月`)
+
+// minuteLimitBody reports whether an error body describes a minute-or-less
+// frequency throttle. Links are stripped first: "aka.ms/oai/quotaincrease"
+// inside a help URL must not decide the class.
+func minuteLimitBody(lower string) bool {
+	text := urlNoise.ReplaceAllString(lower, " ")
+	return minuteMarkers.MatchString(text) && !longWindowWords.MatchString(text)
+}
+
 func classifyHTTP(status int, body []byte) *uperr.Error {
 	text := string(body)
 	lower := strings.ToLower(text)
@@ -368,7 +415,22 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	case status == 401:
 		return uperr.WithFields(uperr.New(uperr.ClassAuth, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 429:
-		return uperr.WithFields(uperr.New(uperr.ClassSoftRate, status, "openaicompat: %s", truncate(body, 300)), body)
+		e := uperr.WithFields(uperr.New(uperr.ClassSoftRate, status, "openaicompat: %s", truncate(body, 300)), body)
+		// A frequency-shaped 429 asks for seconds (sub2api #8286), not the
+		// pool's 10-minute soft base. DashScope words its TPM wall
+		// "Allocated quota exceeded / increase your quota limit" with no
+		// window word at all (magpie d83f887a); that phrase is only trusted
+		// under a 429 status — as a 402 it keeps meaning a balance death.
+		if minuteLimitBody(lower) || strings.Contains(lower, "allocated quota exceeded") || strings.Contains(lower, "increase your quota limit") {
+			e.ResetAt = time.Now().Add(5 * time.Second)
+		}
+		return e
+	case minuteLimitBody(lower):
+		// A frequency throttle wearing quota wording (BP-153): rest for a
+		// few seconds, not the balance death the old quota match gave it.
+		e := uperr.New(uperr.ClassSoftRate, status, "openaicompat: %s", truncate(body, 300))
+		e.ResetAt = time.Now().Add(5 * time.Second)
+		return uperr.WithFields(e, body)
 	case status == 402 || strings.Contains(lower, "insufficient") || strings.Contains(text, "余额"):
 		return uperr.WithFields(uperr.New(uperr.ClassHardCredit, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 403:

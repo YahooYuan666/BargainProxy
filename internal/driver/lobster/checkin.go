@@ -45,8 +45,11 @@ const (
 
 // checkinClientVersion is the desktop client version advertised to the
 // activity endpoints. The upstream hides the whole activity when this is too
-// old, so it is a hard gate, not a cosmetic header.
-const checkinClientVersion = "2026.9.4"
+// old, so it is a hard gate, not a cosmetic header. 2026.10.16 is the
+// currently shipped build (modelmux PROTOCOL.md: 2026.8.1 → slotState=empty,
+// 2026.10.16 → available); the previous constant 2026.9.4 still worked but
+// dies the moment the server tightens the floor (BP-166).
+const checkinClientVersion = "2026.10.16"
 
 // CheckinResult is the outcome of one check-in attempt.
 type CheckinResult struct {
@@ -59,6 +62,9 @@ type CheckinResult struct {
 	TotalDays   int64
 	// PeriodKey is the server's day key ("2026-10-23"), in Asia/Shanghai.
 	PeriodKey string
+	// claimedTodaySeen is the claimedToday flag from the claim response's own
+	// context, when the response carried one (nil = absent).
+	claimedTodaySeen *bool
 }
 
 // Checkin performs the daily check-in for one account.
@@ -104,6 +110,22 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (*CheckinResul
 			return &CheckinResult{AlreadyClaimed: true, ClaimedDays: state.claimedDays, TotalDays: state.totalDays}, nil
 		}
 		return nil, err
+	}
+	// BP-157: a claim POST can answer 200 with nothing granted (idempotent
+	// replay, activity reconfigured mid-flight — magpie-veyra 0e35525). When
+	// the response's own context says claimedToday is still false, re-read
+	// once; if it still says false, the day did NOT land and reporting
+	// success would hide a missing reward. An unreadable context keeps the
+	// old "POST success means claimed" behaviour.
+	if res.claimedTodaySeen != nil && !*res.claimedTodaySeen {
+		st2, rerr := d.activityContext(ctx, c.AccessToken, code, revision)
+		if rerr == nil {
+			if !st2.claimedToday {
+				return nil, uperr.New(uperr.ClassTransport, 0,
+					"lobster: check-in POST answered ok but claimedToday is still false; treated as not landed")
+			}
+			res.ClaimedDays, res.TotalDays = st2.claimedDays, st2.totalDays
+		}
 	}
 	return res, nil
 }
@@ -181,6 +203,9 @@ func (d *Driver) activityCheckIn(ctx context.Context, token, code string, revisi
 		if st, ok := ctxg["state"].(map[string]any); ok {
 			out.ClaimedDays = toInt64(st["claimedDays"])
 			out.TotalDays = toInt64(st["totalDays"])
+			if v, ok := st["claimedToday"].(bool); ok {
+				out.claimedTodaySeen = &v
+			}
 		}
 	}
 	// A successful POST with a replayed flag and no new credits still means

@@ -8,13 +8,14 @@ import (
 	"bargainproxy/internal/ir"
 )
 
-// BP-132: the client's gear must reach Trae as its own levels
-// light/high/extra_high (magpie trae 0.2.20) — before, reasoning_effort was
-// never sent and every model ran at its default.
+// BP-132: the client's gear must reach Trae as its own levels (magpie trae
+// 0.2.20) — before, reasoning_effort was never sent and every model ran at
+// its default. BP-165 supersedes the old medium→high / max→extra_high fold:
+// the client bundle names five levels and medium/max pass through.
 func TestTraeEffortMapping(t *testing.T) {
 	cases := map[string]string{
-		"minimal": "light", "low": "light", "medium": "high", "high": "high",
-		"xhigh": "extra_high", "max": "extra_high", "off": "", "none": "", "": "",
+		"minimal": "light", "low": "light", "medium": "medium", "high": "high",
+		"xhigh": "extra_high", "max": "max", "off": "", "none": "", "": "",
 	}
 	for in, want := range cases {
 		if got := traeEffort(in); got != want {

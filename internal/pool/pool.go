@@ -1051,7 +1051,13 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// exhausted free allowance into "the whole account is broke until 4am".
 		// An account-wide balance exhaustion arrives as a plain 402 with NO
 		// business code, and still takes the account path below.
-		if upstreamErr.Model == "" && upstreamErr.Code != "" && model != "" {
+		//
+		// BP-152: a driver that sets an explicit ResetAt on a hard-credit
+		// wall owns the wall's scope and end (qoder 110/112 are account-level
+		// usage counters, qoder2api-hub #108) — the request's model must NOT
+		// be filled in, and the account rest must run to that ResetAt, not to
+		// a blanket 04:00.
+		if upstreamErr.Model == "" && upstreamErr.Code != "" && upstreamErr.ResetAt.IsZero() && model != "" {
 			upstreamErr.Model = model
 		}
 		if upstreamErr.Model != "" {
@@ -1064,7 +1070,11 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 			a.BreakerFails = 0
 			break
 		}
-		p.restAccount(a, NextDay4AM(now), "out of credit", "upstream", now)
+		until := NextDay4AM(now)
+		if !upstreamErr.ResetAt.IsZero() && upstreamErr.ResetAt.After(now) {
+			until = upstreamErr.ResetAt
+		}
+		p.restAccount(a, until, "out of credit", "upstream", now)
 		a.BreakerFails = 0
 	case uperr.ClassAuth:
 		// Grace self-heal: short stop instead of permanent disable; the

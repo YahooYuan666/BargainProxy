@@ -392,17 +392,24 @@ func traeRequestID() string {
 
 // buildSOLOBody converts the IR request into the SOLO chat body:
 // {messages, function:"solo_work_lite", stream:true, model}.
-// traeEffort maps the portable gear onto Trae's three levels
-// light/high/extra_high (magpie trae 0.2.20). medium sits closer to high than
-// to light; off/none send nothing rather than an invented value.
+// traeEffort maps the portable gear onto Trae's levels. BP-165: the client
+// bundle names FIVE levels (reasoning_effort.{low,medium,high,extra_high,max},
+// handed out per model by remote config — plugins trae 0.2.23, issue #434),
+// so medium and max now pass through as themselves; the old fold to
+// high/extra_high threw away DeepSeek V4.1 Flash's max band. The server
+// validates the level against the model's own config.
 func traeEffort(effort string) string {
 	switch effort {
 	case "minimal", "low":
 		return "light"
-	case "medium", "high":
+	case "medium":
+		return "medium"
+	case "high":
 		return "high"
-	case "xhigh", "max":
+	case "xhigh":
 		return "extra_high"
+	case "max":
+		return "max"
 	}
 	return ""
 }

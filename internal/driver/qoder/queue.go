@@ -249,7 +249,7 @@ func (d *Driver) queueStatus(ctx context.Context, sess *sessionContext, requestS
 	if err != nil {
 		return queueState{}, err
 	}
-	req.Header = bearerHeaders(sess, dateUnix, bearer, "application/json")
+	req.Header = bearerHeaders(sess, dateUnix, bearer, "application/json", false)
 	applyDesktopHeaders(req.Header, d.desktop)
 	req.Header.Del("content-type")
 	callCtx, cancel := context.WithTimeout(ctx, queuePollAsk)

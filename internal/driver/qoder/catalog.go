@@ -17,6 +17,10 @@ import (
 type ModelCaps struct {
 	IsReasoning     bool
 	MaxOutputTokens int
+	// MaxInputTokens (BP-163): the listing's input ceiling. The official
+	// client puts it in model_config.max_input_tokens; without it the server
+	// caps at its ~200K default even for models opened to 1M.
+	MaxInputTokens int
 	// Pricing (BP-98 Qoder-3, magpie-community/plugins packages/qoder 0.2.30
 	// freeOf/rateOf): Rate is the credits multiple the client shows ("0.5×");
 	// RateWas is the struck-through price while a discount runs (0 = none);
@@ -367,9 +371,11 @@ func extractCatalog(raw map[string]interface{}) *ModelCatalog {
 		if !ok {
 			maxOut = defaultMaxOutputTokens
 		}
+		maxIn, _ := positiveInt(m["max_input_tokens"])
 		rate, rateWas, free := parsePricing(m)
 		efforts, defEffort := parseEfforts(m)
 		caps[key] = &ModelCaps{IsReasoning: reasoningCapability(m), MaxOutputTokens: maxOut,
+			MaxInputTokens: maxIn,
 			Rate: rate, RateWas: rateWas, Free: free, Efforts: efforts, DefaultEffort: defEffort}
 	}
 	if len(modelMap) == 0 {

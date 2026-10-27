@@ -18,7 +18,12 @@ type usage struct {
 	CompletionTokensDetails *detail `json:"completion_tokens_details,omitempty"`
 	Credits                 float64 `json:"credits"`
 	OriginalCredits         float64 `json:"original_credits"`
-	Billable                bool    `json:"-"`
+	// Model (BP-167): the upstream's own "what actually billed" name. Qoder
+	// has been seen silently billing a different model than requested
+	// (qoder2api-hub #105: kmodel_latest recorded as auto); parsing it makes
+	// the mismatch warnable instead of invisible.
+	Model    string `json:"model,omitempty"`
+	Billable bool   `json:"-"`
 }
 
 type detail struct {
@@ -38,6 +43,9 @@ func extractUsageObj(v interface{}) *usage {
 		Credits:          toFloat(m["credits"]),
 		OriginalCredits:  toFloat(m["original_credits"]),
 		Billable:         true,
+	}
+	if s, ok := m["model"].(string); ok {
+		u.Model = s
 	}
 	if b, ok := m["billable"].(bool); ok {
 		u.Billable = b

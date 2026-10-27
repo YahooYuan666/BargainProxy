@@ -225,7 +225,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "antigravity: build payload: %v", err)
 	}
 
-	resp, err := d.doStream(ctx, creds.AccessToken, body)
+	resp, err := d.doStream(ctx, creds.AccessToken, call.UpstreamModel, body)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +256,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		if err != nil {
 			return nil, ue
 		}
-		resp, err = d.doStream(ctx, creds.AccessToken, body)
+		resp, err = d.doStream(ctx, creds.AccessToken, call.UpstreamModel, body)
 		if err != nil {
 			return nil, err
 		}
@@ -283,7 +283,8 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 // AIClient2API reference (baseURLs[0] = daily): the daily host serves chat
 // from a separate quota pool — pinned to prod, exhausted accounts 429 even
 // while daily still has headroom (observed live 2026-10-15).
-func (d *Driver) doStream(ctx context.Context, token string, body []byte) (*http.Response, error) {
+func (d *Driver) doStream(ctx context.Context, token, upstreamModel string, body []byte) (*http.Response, error) {
+	ua := uaForModel(upstreamModel)
 	hosts := []string{d.cfg.BaseURL}
 	if d.cfg.DailyURL != "" && d.cfg.DailyURL != d.cfg.BaseURL {
 		hosts = append([]string{d.cfg.DailyURL}, hosts...) // daily first, prod fallback
@@ -295,7 +296,7 @@ func (d *Driver) doStream(ctx context.Context, token string, body []byte) (*http
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("User-Agent", antigravityUA)
+	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/event-stream")
 	resp, err := d.http.Do(req)
 	if err != nil {
@@ -321,7 +322,7 @@ func (d *Driver) doStream(ctx context.Context, token string, body []byte) (*http
 		if rerr == nil {
 			req2.Header.Set("Content-Type", "application/json")
 			req2.Header.Set("Authorization", "Bearer "+token)
-			req2.Header.Set("User-Agent", antigravityUA)
+			req2.Header.Set("User-Agent", ua)
 			req2.Header.Set("Accept", "text/event-stream")
 			if resp2, err2 := d.http.Do(req2); err2 == nil {
 				return resp2, nil
@@ -390,7 +391,8 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 				Content      geminiContent `json:"content"`
 				FinishReason string        `json:"finishReason"`
 			} `json:"candidates"`
-			UsageMetadata *geminiUsage `json:"usageMetadata"`
+			UsageMetadata  *geminiUsage    `json:"usageMetadata"`
+			PromptFeedback *promptFeedback `json:"promptFeedback"`
 		}
 		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
 			continue // tolerate unknown frames
@@ -402,6 +404,18 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 				gr.Candidates = append(gr.Candidates, geminiCandidate{Content: c.Content, FinishReason: c.FinishReason})
 			}
 			gr.UsageMetadata = frame.UsageMetadata
+			if frame.PromptFeedback != nil {
+				gr.PromptFeedback = frame.PromptFeedback
+			}
+		}
+		// BP-155: a safety block arrives as promptFeedback.blockReason with NO
+		// candidates and NO error object. The old path read the clean stream
+		// end as "no terminal signal" (transport) and cross-account-retried a
+		// request no account could answer. No account penalty, no rotation.
+		if pf := gr.PromptFeedback; pf != nil && pf.BlockReason != "" &&
+			!strings.EqualFold(pf.BlockReason, "BLOCK_REASON_UNSPECIFIED") {
+			return nil, uperr.New(uperr.ClassContentBlocked, 400,
+				"antigravity: prompt blocked by safety filter (%s): %s", pf.BlockReason, pf.BlockReasonMessage)
 		}
 		for _, cand := range gr.Candidates {
 			for _, part := range cand.Content.Parts {
@@ -453,6 +467,16 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 			}
 			if cand.FinishReason != "" {
 				terminated = true
+				// BP-154: MALFORMED_FUNCTION_CALL is an upstream sampling
+				// glitch, not a valid end — mapping it to STOP used to hand
+				// the client an empty 200 success with no retry chance
+				// (sub2api #8362). Only while nothing has reached the client;
+				// once frames flowed, ending cleanly is the least-bad exit.
+				if strings.EqualFold(cand.FinishReason, "MALFORMED_FUNCTION_CALL") &&
+					textBuf.Len() == 0 && thinkBuf.Len() == 0 && len(toolCalls) == 0 {
+					return nil, uperr.New(uperr.ClassTransport, 200,
+						"antigravity: upstream returned a malformed function call (finishReason=MALFORMED_FUNCTION_CALL)")
+				}
 				stop = mapFinish(cand.FinishReason)
 			}
 		}
@@ -596,6 +620,18 @@ func (d *Driver) fetchQuota(ctx context.Context, accID, token string) (map[strin
 // or generic User-Agent gets 429-limited on chat and 403 on quota (both
 // observed live); the reference clients always send the full CLI string.
 const antigravityUA = "antigravity/2.8.1 windows/amd64"
+
+// argonCLIUA is the identity the Argon band requires (BP-162): requests for
+// gemini-4-argon-* must come from the CLI fingerprint, not the IDE one.
+const argonCLIUA = "antigravity/cli/1.4.2 darwin/arm64"
+
+// uaForModel picks the request identity for a model.
+func uaForModel(upstreamModel string) string {
+	if strings.HasPrefix(upstreamModelName(upstreamModel), "gemini-4-argon") {
+		return argonCLIUA
+	}
+	return antigravityUA
+}
 
 func (d *Driver) fetchQuotaHost(ctx context.Context, host, token string) (map[string]model.Window, error) {
 	u := strings.TrimRight(host, "/") + "/v1internal:retrieveUserQuotaSummary"
@@ -767,8 +803,15 @@ type geminiUsage struct {
 }
 
 type geminiResponse struct {
-	Candidates    []geminiCandidate `json:"candidates"`
-	UsageMetadata *geminiUsage      `json:"usageMetadata"`
+	Candidates     []geminiCandidate `json:"candidates"`
+	UsageMetadata  *geminiUsage      `json:"usageMetadata"`
+	PromptFeedback *promptFeedback   `json:"promptFeedback"`
+}
+
+// promptFeedback is Google's pre-candidate safety verdict (BP-155).
+type promptFeedback struct {
+	BlockReason        string `json:"blockReason"`
+	BlockReasonMessage string `json:"blockReasonMessage"`
 }
 
 type v1InternalRequest struct {
@@ -843,6 +886,12 @@ func ensureAntigravityToolIDs(contents []geminiContent) {
 func upstreamModelName(model string) string {
 	if after, ok := strings.CutPrefix(model, "gemini-claude-"); ok {
 		return "claude-" + after
+	}
+	// BP-162: the Argon band only answers through the CLI/App client and is
+	// served as "-medium" upstream (AIClient2API e272a83); the IDE client
+	// never sees it.
+	if strings.HasPrefix(model, "gemini-4-argon") {
+		return "gemini-4-argon-medium"
 	}
 	return model
 }

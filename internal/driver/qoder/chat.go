@@ -43,6 +43,10 @@ type modelConfig struct {
 	IsVL        bool   `json:"is_vl"`
 	IsReasoning bool   `json:"is_reasoning"`
 	Source      string `json:"source"`
+	// MaxInputTokens (BP-163): the official client declares the model's input
+	// ceiling here; omitted means the server's ~200K default, which walls off
+	// models opened to 1M.
+	MaxInputTokens int `json:"max_input_tokens,omitempty"`
 }
 
 type business struct {

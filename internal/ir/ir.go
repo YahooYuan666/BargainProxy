@@ -78,6 +78,12 @@ type Message struct {
 	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`   // assistant messages
 	ToolCallID string        `json:"tool_call_id,omitempty"` // tool messages
 	ToolName   string        `json:"tool_name,omitempty"`    // tool messages
+	// Reasoning is an earlier assistant turn's thinking text as OpenAI-family
+	// clients carry it back (reasoning_content / reasoning / details). The
+	// ingress must keep it: WorkBuddy's own converter replays it as the
+	// `reasoning` field, and its host silently drops reasoning_content
+	// (BP-159, plugins wb 7f99447e).
+	Reasoning string `json:"reasoning,omitempty"`
 	// Thinking carries replayable assistant reasoning blocks (Anthropic
 	// history). Only anthropic-shaped upstream drivers may replay them; the
 	// ingress never drops them before routing (BP-69).

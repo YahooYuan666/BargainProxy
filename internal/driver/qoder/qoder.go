@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
 	"encoding/hex"
@@ -26,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	goruntime "runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -327,7 +329,7 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header = bearerHeaders(sess, date, bearer, "text/event-stream")
+	req.Header = bearerHeaders(sess, date, bearer, "text/event-stream", true) // chat shape
 	applyDesktopHeaders(req.Header, d.desktop)
 	req.Header.Set("x-model-key", qoderKey)
 	req.Header.Set("x-model-source", "system")
@@ -480,6 +482,14 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	out.Thinking = thinkBuf.String()
 	out.StopReason = mapStop(acc.finalFinishReason())
 	if usageObj != nil {
+		// BP-167: the upstream can silently bill a different model than the
+		// one requested (qoder2api-hub #105: kmodel_latest recorded as auto).
+		// A warn here makes the mismatch visible in the gateway log without
+		// touching the wire.
+		if usageObj.Model != "" && usageObj.Model != display && usageObj.Model != qoderKey {
+			log.Printf("qoder: upstream billed a different model: requested=%s billed=%s (account=%s)",
+				display, usageObj.Model, call.Account.ID)
+		}
 		u := irUsageFromUsageObj(usageObj)
 		out.Usage = u
 		if err := emit(ir.StreamEvent{Kind: ir.EvUsage, Usage: &u}); err != nil {
@@ -632,6 +642,12 @@ func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCata
 	b.AliyunUserType = ut
 	b.ModelConfig.Key = qoderKey
 	b.ChatContext.Extra.ModelConfig.Key = qoderKey
+	// BP-163: declare the model's real input ceiling on the top-level
+	// model_config when the catalogue names one — without it the server
+	// truncates at its ~200K default.
+	if caps := cat.Caps[qoderKey]; caps != nil && caps.MaxInputTokens > 0 {
+		b.ModelConfig.MaxInputTokens = caps.MaxInputTokens
+	}
 
 	effort, effErr := resolveReasoningEffort(payload)
 	if effErr != nil {
@@ -1072,7 +1088,12 @@ func applyDesktopHeaders(h http.Header, desktop bool) {
 }
 
 // bearerHeaders builds the COSY-signed chat/model-list request headers.
-func bearerHeaders(sess *sessionContext, dateUnix int64, bearer, accept string) http.Header {
+// chat=true switches to the official client's chat shape (plugins qoder
+// 0.2.41, #443, diffed against Qoder.app 0.4.3's prepareInferRequest): no
+// forged machine token/type (the desktop sends its native device identity's
+// umid, or nothing), plus Cosy-MachineHostname/Cosy-MachineOS. Listing,
+// usage and queue status keep the shared prepareRequest set.
+func bearerHeaders(sess *sessionContext, dateUnix int64, bearer, accept string, chat bool) http.Header {
 	h := http.Header{}
 	h.Set("cosy-data-policy", "AGREE")
 	h.Set("content-type", "application/json")
@@ -1089,7 +1110,67 @@ func bearerHeaders(sess *sessionContext, dateUnix int64, bearer, accept string) 
 	h.Set("cosy-machinetoken", sess.machineToken)
 	h.Set("login-version", "v2")
 	h.Set("user-agent", "Go-http-client/2.0")
+	if chat {
+		h.Del("cosy-machinetype")
+		h.Del("cosy-machinetoken")
+		if hn := qoderMachineHostname(); hn != "" {
+			h.Set("cosy-machinehostname", hn)
+		}
+		h.Set("cosy-machineos", qoderMachineOS())
+	}
 	return h
+}
+
+// qoderMachineHostname renders os.Hostname the way Qoder's own wasm makes it
+// safe: lowercase, invalid characters as '-', collapsed runs, at most 96
+// characters; a name with nothing safe left falls back to a hash mark.
+func qoderMachineHostname() string {
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		return ""
+	}
+	h := strings.ToLower(strings.TrimSpace(host))
+	var b strings.Builder
+	for _, r := range h {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	safe := b.String()
+	for strings.Contains(safe, "--") {
+		safe = strings.ReplaceAll(safe, "--", "-")
+	}
+	safe = strings.Trim(safe, "-")
+	if safe == "" {
+		sum := sha256.Sum256([]byte(h))
+		safe = hex.EncodeToString(sum[:8])
+	}
+	if len(safe) > 96 {
+		safe = safe[:96]
+	}
+	return safe
+}
+
+// qoderMachineOS renders Cosy-MachineOS as `${arch}_${platform}`
+// (Qoder.app 0.4.3 worker runtime: x64→x86_64, arm64→aarch64, ia32 stays).
+func qoderMachineOS() string {
+	arch := goruntime.GOARCH
+	switch goruntime.GOARCH {
+	case "amd64":
+		arch = "x86_64"
+	case "arm64":
+		arch = "aarch64"
+	case "386":
+		arch = "ia32"
+	}
+	platform := goruntime.GOOS
+	if goruntime.GOOS == "windows" {
+		platform = "win32"
+	}
+	return arch + "_" + platform
 }
 
 func (d *Driver) postEncoded(ctx context.Context, url string, obj any, c *Creds) (map[string]any, error) {
@@ -1160,7 +1241,7 @@ func (d *Driver) fetchModelCatalog(ctx context.Context, sess *sessionContext) (m
 	if err != nil {
 		return nil, err
 	}
-	req.Header = bearerHeaders(sess, dateUnix, bearer, "application/json")
+	req.Header = bearerHeaders(sess, dateUnix, bearer, "application/json", false)
 	applyDesktopHeaders(req.Header, d.desktop)
 	resp, err := d.rpc.Do(req)
 	if err != nil {
@@ -1777,6 +1858,32 @@ func qoderNestedPermission(body string) bool {
 	return true
 }
 
+// qoderQuotaFallback recovers the quota codes 110/112 when the body hides
+// them: the HTTP 403's message field can carry the code inside a nested or
+// escaped JSON document, or state it as prose with no parseable code at all
+// (qoder2api-hub #108: `pricingUrl` / `"code":"112"` for the drained credit
+// pool, `Billing daily count exceeded` / `"code":"110"` for the daily
+// billing cap). Without this the walls fell through to the generic 403 →
+// ClassAuth, which pauses the account as if the token were bad and fires a
+// pointless refresh.
+func qoderQuotaFallback(body string) string {
+	if strings.Contains(body, `"code":"110"`) || strings.Contains(body, "Billing daily count exceeded") {
+		return "110"
+	}
+	if strings.Contains(body, `"code":"112"`) || strings.Contains(body, "pricingUrl") {
+		return "112"
+	}
+	return ""
+}
+
+// nextLocal04 is the house daily-reset boundary (pool.NextDay4AM): the next
+// 04:00 local. The Qoder daily billing counter clears at local midnight, so
+// this is a conservative overnight rest.
+func nextLocal04(now time.Time) time.Time {
+	n := now.AddDate(0, 0, 1)
+	return time.Date(n.Year(), n.Month(), n.Day(), 4, 0, 0, 0, now.Location())
+}
+
 func classifyQoder(status int, body string) *uperr.Error {
 	text := clip(body, 300)
 	if qoderNestedPermission(body) {
@@ -1792,10 +1899,25 @@ func classifyQoder(status int, body string) *uperr.Error {
 	}
 	// The business code inside the body decides before the HTTP status does.
 	code := qoderBodyCode(body)
+	if !quotaCodes[code] {
+		code = qoderQuotaFallback(body)
+	}
 	switch {
 	case quotaCodes[code]:
 		e := uperr.New(uperr.ClassHardCredit, 429, "qoder: usage limit reached (%s): %s", code, text)
 		e.Code = code
+		// BP-152: the usage counters behind 110/112 are account-level (one
+		// plan's daily count / credit pool, qoder2api-hub #108), not a
+		// per-model allowance. The explicit ResetAt tells the pool to keep
+		// the whole account resting until then instead of folding this into
+		// a 60-second model hold, after which the drained account would be
+		// picked again and hit the same wall every minute.
+		switch code {
+		case "110":
+			e.ResetAt = nextLocal04(time.Now())
+		case "112":
+			e.ResetAt = time.Now().Add(30 * time.Minute)
+		}
 		return e
 	case upstreamFailedRe.MatchString(body):
 		e := uperr.New(uperr.ClassTransport, 502, "qoder: upstream vendor failed: %s", text)

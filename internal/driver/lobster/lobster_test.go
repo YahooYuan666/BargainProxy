@@ -508,7 +508,7 @@ func TestCheckinHappyPath(t *testing.T) {
 		case strings.HasPrefix(r.URL.Path, "/api/client-activities/slot"):
 			gotVersion = r.URL.Query().Get("clientVersion")
 			gotUA = r.Header.Get("User-Agent")
-			if gotVersion != "2026.9.4" {
+			if gotVersion != "2026.10.16" {
 				// The upstream's real behaviour: an old version yields an empty
 				// slot, which is indistinguishable from "no activity".
 				io.WriteString(w, `{"code":0,"data":{"slotState":"empty"}}`)
@@ -547,8 +547,8 @@ func TestCheckinHappyPath(t *testing.T) {
 	// The clientVersion gate is what makes the activity appear at all. Assert
 	// the literal, not the constant: comparing against checkinClientVersion
 	// would move with the code and catch nothing.
-	if gotVersion != "2026.9.4" {
-		t.Fatalf("clientVersion = %q, want the 2026.9.4 gate", gotVersion)
+	if gotVersion != "2026.10.16" {
+		t.Fatalf("clientVersion = %q, want the 2026.10.16 gate", gotVersion)
 	}
 	if !strings.HasPrefix(gotUA, "LobsterAI/") {
 		t.Fatalf("User-Agent = %q, must carry the client identity", gotUA)

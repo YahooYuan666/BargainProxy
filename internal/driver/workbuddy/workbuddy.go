@@ -393,6 +393,14 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool
 		if m.ToolName != "" {
 			wire["name"] = m.ToolName
 		}
+		// BP-159: an earlier assistant turn's thinking must ride the
+		// `reasoning` field — WorkBuddy's own client sets that one and skips
+		// its reasoning_content backfill, and the host silently drops
+		// reasoning_content (plugins wb 7f99447e). Never fold it into content
+		// as <think>: the official client does not send it that way.
+		if m.Role == ir.RoleAssistant && m.Reasoning != "" {
+			wire["reasoning"] = m.Reasoning
+		}
 		// An assistant message that carried only pruned tool calls and no
 		// content would serialize as {"role":"assistant"} — strictly-validated
 		// upstreams reject that. Drop the empty shell entirely.
@@ -1048,6 +1056,13 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 	req.Header.Set("X-IDE-Name", "WorkBuddy")
 	req.Header.Set("X-IDE-Type", "WorkBuddy")
 	req.Header.Set("X-IDE-Version", workBuddyClientVersion(global))
+	// BP-158: WorkBuddy 5.9's desktop local transport announces the agent
+	// runtime; the international 5.8.4 build sends no such header (magpie
+	// 74dcf40a, diffed against both update feeds). Adding it to the global
+	// edge would be a fingerprint of its own.
+	if !global {
+		req.Header.Set("X-Agent-Runtime", "local-agent")
+	}
 	// BP-144: a key account is personal with no domain and no enterprise, and
 	// the CLI sends neither — an X-Domain on a key request is a shape upstream
 	// never sees from its own client.
@@ -1087,6 +1102,8 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 	req.Header.Set("X-Stainless-Runtime", "node")
 	req.Header.Set("X-Stainless-Runtime-Version", stainlessNodeVersion)
 	req.Header.Set("X-Stainless-Retry-Count", "0")
+	// BP-158: the official SDK's own timeout header, present on both builds.
+	req.Header.Set("X-Stainless-Timeout", "1200")
 
 	// Conversation header family. Every id here has the shape the real client
 	// sends: a dashed UUID v4 for the conversation, millisecond-prefixed 32-hex

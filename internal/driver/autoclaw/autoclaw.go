@@ -1319,13 +1319,26 @@ func buildBodyWith(call driver.ChatCall, scrubIdentity bool) ([]byte, string, er
 				}
 			}
 			wire["content"] = parts
+		} else {
+			// BP-160: the CN gateway's parser throws 500 {"message":"parse
+			// response failed"} on a message with a null/missing content
+			// (plugins autoclaw 0.2.9 tidyBody) — an assistant turn that only
+			// carries tool calls is exactly that shape. Always send the key.
+			wire["content"] = ""
 		}
 		if len(m.ToolCalls) > 0 {
 			var tcs []map[string]any
 			for _, tc := range m.ToolCalls {
+				args := tc.Arguments
+				if strings.TrimSpace(args) == "" {
+					// A tool call with empty arguments must carry "{}": an
+					// empty string is not JSON and the gateway 500s on it
+					// (plugins autoclaw 0.2.9, issue #437).
+					args = "{}"
+				}
 				tcs = append(tcs, map[string]any{
 					"id": tc.ID, "type": "function",
-					"function": map[string]any{"name": tc.Name, "arguments": tc.Arguments},
+					"function": map[string]any{"name": tc.Name, "arguments": args},
 				})
 			}
 			wire["tool_calls"] = tcs

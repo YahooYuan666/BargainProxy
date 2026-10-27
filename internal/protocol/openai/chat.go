@@ -51,6 +51,39 @@ type WireMessage struct {
 	ToolCalls  []WireToolCall  `json:"tool_calls,omitempty"`
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 	Name       string          `json:"name,omitempty"`
+	// Reasoning fields some clients send back on assistant turns (BP-159):
+	// DeepSeek/Grok Build use reasoning_content, WorkBuddy's own converter
+	// sets reasoning, and some SDKs wrap the text in reasoning_details.
+	ReasoningContent string          `json:"reasoning_content,omitempty"`
+	Reasoning        string          `json:"reasoning,omitempty"`
+	ReasoningDetails json.RawMessage `json:"reasoning_details,omitempty"`
+}
+
+// ReasoningText normalizes the three reasoning shapes into one text. The
+// first the client set wins (plugins wb 7f99447e), and a details array
+// contributes its text entries.
+func (m *WireMessage) ReasoningText() string {
+	if m.ReasoningContent != "" {
+		return m.ReasoningContent
+	}
+	if m.Reasoning != "" {
+		return m.Reasoning
+	}
+	if len(m.ReasoningDetails) == 0 {
+		return ""
+	}
+	var details []struct {
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(m.ReasoningDetails, &details) != nil {
+		return ""
+	}
+	for _, d := range details {
+		if d.Text != "" {
+			return d.Text
+		}
+	}
+	return ""
 }
 
 // WireToolCall is an assistant tool call in wire form.
@@ -130,6 +163,7 @@ func ParseChatRequest(body []byte) (*ir.ChatRequest, error) {
 		}
 		msg.ToolCallID = m.ToolCallID
 		msg.ToolName = m.Name
+		msg.Reasoning = m.ReasoningText()
 		req.Messages = append(req.Messages, msg)
 	}
 	for _, t := range w.Tools {
