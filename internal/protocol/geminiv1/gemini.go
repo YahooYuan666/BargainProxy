@@ -296,6 +296,9 @@ type StreamWriter struct {
 	done      bool
 	tools     map[int]*geminiToolState
 	toolOrder []int
+	// toolIndexBase shifts incoming driver tool indexes after a mid-call
+	// truncation (BP-139, see the EvToolRestart branch).
+	toolIndexBase int
 }
 
 type geminiToolState struct {
@@ -363,19 +366,29 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 			return nil
 		}
 		return s.frame([]Part{{Text: ev.Delta, Thought: true}}, "", nil)
+	case ir.EvToolRestart:
+		// BP-139: a continuation is splicing in after a mid-call truncation.
+		// Retire the partial buffers (the finalize step would otherwise parse
+		// the truncated half-JSON and fail the whole turn) and shift the index
+		// space for the continuation's fresh call.
+		s.toolIndexBase += len(s.toolOrder)
+		s.tools = nil
+		s.toolOrder = nil
+		return nil
 	case ir.EvToolStart:
 		if s.tools == nil {
 			s.tools = map[int]*geminiToolState{}
 		}
-		if _, ok := s.tools[ev.ToolIndex]; !ok {
-			s.toolOrder = append(s.toolOrder, ev.ToolIndex)
+		idx := ev.ToolIndex + s.toolIndexBase
+		if _, ok := s.tools[idx]; !ok {
+			s.toolOrder = append(s.toolOrder, idx)
 		}
 		st := &geminiToolState{id: ev.ToolCall.ID, name: ev.ToolCall.Name}
 		st.args.WriteString(ev.ToolCall.Arguments)
-		s.tools[ev.ToolIndex] = st
+		s.tools[idx] = st
 		return nil
 	case ir.EvToolArgs:
-		if st := s.tools[ev.ToolIndex]; st != nil {
+		if st := s.tools[ev.ToolIndex+s.toolIndexBase]; st != nil {
 			st.args.WriteString(ev.Delta)
 		}
 		return nil

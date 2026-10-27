@@ -321,6 +321,15 @@ const (
 	// attempt's arguments would concatenate onto the dead attempt's partial
 	// JSON. Writers that stream everything immediately may ignore it.
 	EvAttemptReset StreamEventKind = "attempt_reset"
+	// EvToolRestart is emitted by the gateway when a mid-stream CONTINUATION
+	// begins after tool-call fragments were truncated (BP-139). Unlike the
+	// retry reset it must NOT clear delivered text/thinking state — the
+	// client has those blocks open — it only retires the INCOMPLETE tool
+	// buffers: writers drop the partial arguments and shift subsequent tool
+	// indexes past the dead ones, so the continuation's fresh tool call
+	// cannot concatenate onto the truncated half-JSON. The continuation
+	// request explicitly asks the model to REDO the interrupted call.
+	EvToolRestart StreamEventKind = "tool_restart"
 )
 
 // StreamEvent is one incremental event from a driver stream.

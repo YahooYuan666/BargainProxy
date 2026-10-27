@@ -89,6 +89,12 @@ func (l *streamLedger) record(ev ir.StreamEvent) {
 		// would permanently disqualify the continuation for a LATER attempt
 		// that legitimately streamed prose and then dropped.
 		l.sawTool = false
+	case ir.EvToolRestart:
+		// BP-139: the continuation explicitly REDOES the interrupted tool
+		// call (fresh, complete arguments) instead of splicing half-JSON —
+		// so the truncation no longer disqualifies the continuation. The
+		// text/thinking anchors stay: they are what the redo builds on.
+		l.sawTool = false
 	}
 }
 
@@ -116,9 +122,14 @@ func (l *streamLedger) canContinue(class string, segs int) bool {
 	if l.text.Len() == 0 && l.thinking.Len() == 0 {
 		return false // nothing on the wire to anchor on
 	}
-	if l.sawTool {
-		return false // truncated tool arguments cannot be spliced
-	}
+	// BP-139: a sawTool cut no longer disqualifies the continuation. The
+	// partial arguments are DISCARDED (writers retire the buffered fragment,
+	// the client never saw it on buffered protocols) and the continuation
+	// request asks the model to REDO the call from scratch — so what the
+	// client experiences is one continuous stream whose tool call arrives
+	// complete. The old blanket refusal traded a recoverable drop for a lost
+	// turn (field 2026-10-27 20:22:06: workbuddy EOF at 117s mid-call, whole
+	// turn lost).
 	switch class {
 	case uperr.ClassTransport, uperr.ClassUpstreamTimeout:
 		// Dropped socket (vendor edge closed it) and idle stall (no bytes for
@@ -130,13 +141,22 @@ func (l *streamLedger) canContinue(class string, segs int) bool {
 	return false
 }
 
+// continueToolNudge is the mid-call variant of the continuation instruction
+// (BP-139): the previous segment was cut while the model was emitting a tool
+// call. The partial arguments were discarded (the client never saw them), so
+// the model must REDO the call from scratch — continuing a half-JSON blob is
+// impossible and useless.
+const continueToolNudge = "你上一条回复在调用工具时因连接中断被截断，那次工具调用的参数不完整、已被丢弃。请重新发起你当时要调用的工具调用（完整、从头生成参数）；之前已输出的正文内容保持有效，不要重复，不要道歉或解释。"
+
 // continuationRequest builds the request for one more segment: the caller's
 // history, what the client already saw as an assistant turn, then the nudge.
+// When the cut happened mid-tool-call (sawTool), the nudge asks the model to
+// redo the call instead of continuing prose (BP-139).
 //
 // The caller's request is CLONED — the gateway is on a shared code path and a
 // mutated request would leak the synthetic assistant turn into the next binding
 // and into the caller's own retries.
-func continuationRequest(req *ir.ChatRequest, ledger *streamLedger) *ir.ChatRequest {
+func continuationRequest(req *ir.ChatRequest, ledger *streamLedger, redoTool bool) *ir.ChatRequest {
 	clone := *req
 	msgs := make([]ir.Message, 0, len(req.Messages)+2)
 	msgs = append(msgs, req.Messages...)
@@ -146,9 +166,13 @@ func continuationRequest(req *ir.ChatRequest, ledger *streamLedger) *ir.ChatRequ
 			Content: []ir.ContentPart{{Kind: "text", Text: txt}},
 		})
 	}
+	nudge := continueNudge
+	if redoTool {
+		nudge = continueToolNudge
+	}
 	msgs = append(msgs, ir.Message{
 		Role:    ir.RoleUser,
-		Content: []ir.ContentPart{{Kind: "text", Text: continueNudge}},
+		Content: []ir.ContentPart{{Kind: "text", Text: nudge}},
 	})
 	clone.Messages = msgs
 	return &clone

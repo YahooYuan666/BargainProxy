@@ -91,7 +91,10 @@ func (d *scriptedDriver) nudgeCalls() int {
 			continue
 		}
 		for _, m := range c.Request.Messages {
-			if m.Role == ir.RoleUser && strings.Contains(ir.TextOf(m.Content), continueNudge) {
+			// Either nudge counts (BP-139 added the tool-redo variant).
+			if m.Role == ir.RoleUser &&
+				(strings.Contains(ir.TextOf(m.Content), continueNudge) ||
+					strings.Contains(ir.TextOf(m.Content), continueToolNudge)) {
 				n++
 				break
 			}
@@ -244,15 +247,16 @@ func TestDroppedStreamIsContinuedOnTheSameChannel(t *testing.T) {
 	}
 }
 
-// TestTruncatedToolArgumentsAreNotContinued: half a JSON arguments blob cannot
-// be spliced onto the rest — the client would receive invalid JSON, which is
-// worse than an honest failure.
+// TestTruncatedToolArgumentsAreRedone (BP-139 supersedes the old refusal):
+// half a JSON arguments blob cannot be spliced, but it does not have to be —
+// the client never saw the fragment (buffered protocols), so the gateway
+// discards it and the continuation asks the model to REDO the call from
+// scratch. The turn survives; the client sees one continuous stream whose
+// tool call arrives complete.
 //
 // The segment deliberately carries BOTH prose and a truncated tool call: that
-// is the real shape (the model narrates, then starts a tool) and it is the only
-// shape that exercises the sawTool guard — a segment with tool output and no
-// prose is already rejected by the "nothing on the wire" rule.
-func TestTruncatedToolArgumentsAreNotContinued(t *testing.T) {
+// is the real shape (the model narrates, then starts a tool).
+func TestTruncatedToolArgumentsAreRedone(t *testing.T) {
 	drv := &scriptedDriver{segs: []func(driver.ChatCall, driver.Emit) (*ir.ChatResponse, error){
 		func(_ driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
 			if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: pad("Let me write that file.")}); err != nil {
@@ -267,15 +271,52 @@ func TestTruncatedToolArgumentsAreNotContinued(t *testing.T) {
 			}
 			return nil, uperr.New(uperr.ClassTransport, 0, "connection reset")
 		},
+		func(call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
+			// The continuation request must carry the REDO nudge, not the
+			// prose one.
+			found := false
+			for _, m := range call.Request.Messages {
+				if m.Role == ir.RoleUser && strings.Contains(ir.TextOf(m.Content), "重新发起你当时要调用的工具调用") {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatal("continuation after a mid-call cut must ask for a tool REDO")
+			}
+			if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: 0,
+				ToolCall: &ir.ToolCall{ID: "call_2", Name: "write_file"}}); err != nil {
+				return nil, err
+			}
+			if err := emit(ir.StreamEvent{Kind: ir.EvToolArgs, ToolIndex: 0, Delta: `{"path":"a.txt","content":"whole"}`}); err != nil {
+				return nil, err
+			}
+			_ = emit(ir.StreamEvent{Kind: ir.EvDone, Stop: ir.StopToolUse})
+			return &ir.ChatResponse{
+				Message:    ir.Message{ToolCalls: []ir.ToolCall{{ID: "call_2", Name: "write_file", Arguments: `{"path":"a.txt","content":"whole"}`}}},
+				StopReason: ir.StopToolUse,
+			}, nil
+		},
 	}}
 	g := newContinueGateway(t, drv)
 	rec := &recorder{}
 
-	if _, err := g.Execute(context.Background(), streamReq(), rec.emit); err == nil {
-		t.Fatal("a truncated tool call must surface the error, not continue")
+	res, err := g.Execute(context.Background(), streamReq(), rec.emit)
+	if err != nil {
+		t.Fatalf("a mid-call cut must be auto-continued with a redo: %v", err)
 	}
-	if n := drv.nudgeCalls(); n != 0 {
-		t.Fatalf("continuation calls = %d, want 0 (truncated tool arguments)", n)
+	if n := drv.nudgeCalls(); n != 1 {
+		t.Fatalf("continuation calls = %d, want 1 (the redo)", n)
+	}
+	if res.Response == nil || len(res.Response.Message.ToolCalls) != 1 {
+		t.Fatalf("final answer must carry the redone call: %+v", res.Response)
+	}
+	// The truncated fragment must NOT leak into the client stream or the
+	// aggregated answer.
+	if strings.Contains(rec.text.String(), "half") {
+		t.Fatalf("partial fragment leaked to the client: %q", rec.text.String())
+	}
+	if len(res.Response.Message.ToolCalls) == 1 && strings.Contains(res.Response.Message.ToolCalls[0].Arguments, "half") {
+		t.Fatalf("partial fragment leaked into the final tool call: %+v", res.Response.Message.ToolCalls[0])
 	}
 }
 

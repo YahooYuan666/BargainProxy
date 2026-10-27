@@ -84,18 +84,15 @@ func TestFBBudgetCountsToolsAndImages(t *testing.T) {
 }
 
 // fbCeiling resolution: per-channel override → legacy AutoClaw field →
-// global setting → 90s default (BP-72).
+// fbWindowCeiling. BP-138 removed the panel value from this chain: it is now
+// the BASE of the dynamic formula (see TestFBDynamicWindowGrowsWithContext),
+// not a cap — its old place here is what kept clamping big prompts back to 30s.
 func TestFBCeilingPerChannel(t *testing.T) {
 	g := &Gateway{cfg: config.Default()}
 	for _, ch := range []string{model.ChannelWorkBuddy, model.ChannelAutoClaw, model.ChannelTrae, model.ChannelQoder} {
 		if got := g.fbCeiling(ch); got != fbWindowCeiling {
-			t.Fatalf("%s default ceiling = %s, want 90s", ch, got)
+			t.Fatalf("%s default ceiling = %s, want %s", ch, got, fbWindowCeiling)
 		}
-	}
-
-	g.cfg.FirstByteWindow = config.Duration(120 * time.Second)
-	if got := g.fbCeiling(model.ChannelWorkBuddy); got != 120*time.Second {
-		t.Fatalf("global ceiling = %s, want 120s", got)
 	}
 
 	g.cfg.ChannelFirstByteWindows = map[string]config.Duration{
@@ -104,26 +101,60 @@ func TestFBCeilingPerChannel(t *testing.T) {
 	if got := g.fbCeiling(model.ChannelWorkBuddy); got != 180*time.Second {
 		t.Fatalf("workbuddy override = %s, want 180s", got)
 	}
-	if got := g.fbCeiling(model.ChannelAutoClaw); got != 120*time.Second {
-		t.Fatalf("autoclaw should follow global = %s, want 120s", got)
+	if got := g.fbCeiling(model.ChannelAutoClaw); got != fbWindowCeiling {
+		t.Fatalf("autoclaw should follow the default = %s", got)
 	}
 
-	// Legacy BP-71 field still wins over the global setting for AutoClaw.
+	// Legacy BP-71 field still wins for AutoClaw.
 	g.cfg.Channels.AutoClaw.FirstByteWindow = config.Duration(240 * time.Second)
 	if got := g.fbCeiling(model.ChannelAutoClaw); got != 240*time.Second {
 		t.Fatalf("legacy autoclaw ceiling = %s, want 240s", got)
 	}
 
-	// Panel hot setting wins over the config global but not per-channel map.
-	g.SetFirstByteWindow(150 * time.Second)
-	if got := g.fbCeiling(model.ChannelQoder); got != 150*time.Second {
-		t.Fatalf("hot global ceiling = %s, want 150s", got)
+	// BP-138: the panel value must NOT act as a ceiling any more.
+	g.SetFirstByteWindow(30 * time.Second)
+	if got := g.fbCeiling(model.ChannelQoder); got != fbWindowCeiling {
+		t.Fatalf("panel value leaked into the ceiling: %s (it is the BASE now)", got)
 	}
-	if got := g.fbCeiling(model.ChannelWorkBuddy); got != 180*time.Second {
-		t.Fatalf("channel override must survive the hot global = %s, want 180s", got)
+	if got := g.fbBaseFor(); got != 30*time.Second {
+		t.Fatalf("panel value must be the base: %s, want 30s", got)
 	}
 	g.SetFirstByteWindow(0)
-	if got := g.fbCeiling(model.ChannelQoder); got != 120*time.Second {
-		t.Fatalf("cleared hot ceiling = %s, want the config global 120s", got)
+	if got := g.fbBaseFor(); got == 30*time.Second {
+		t.Fatal("clearing the panel value must fall back to the config default")
+	}
+}
+
+// TestFBDynamicWindowGrowsWithContext is the BP-138 regression test.
+//
+// Field 2026-10-27 20:20:29: a 56.8万-token prompt went workbuddy → trae →
+// qoder → lobster and died on all four. The workbuddy leg was cancelled at
+// exactly 30.000s because the DB panel value 30 was the CAP; the measured
+// prefill rate (33万 tokens = 31.9s, BP-118) says that prompt needed ~50s.
+func TestFBDynamicWindowGrowsWithContext(t *testing.T) {
+	g := &Gateway{cfg: config.Default()}
+	g.SetFirstByteWindow(30 * time.Second) // the operator's base, as stored
+
+	small := &ir.ChatRequest{Messages: []ir.Message{{
+		Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: strings.Repeat("a", 4000)}},
+	}}}
+	big := &ir.ChatRequest{Messages: []ir.Message{{
+		Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: strings.Repeat("a", 1_120_000)}},
+	}}}
+
+	smallWin := fbWaitFor(g.fbBaseFor(), small, g.fbCeiling(model.ChannelWorkBuddy))
+	bigWin := fbWaitFor(g.fbBaseFor(), big, g.fbCeiling(model.ChannelWorkBuddy))
+
+	// A ~2k-token prompt keeps the operator's base (plus at most a second).
+	if smallWin < 30*time.Second || smallWin > 32*time.Second {
+		t.Fatalf("small prompt window = %s, want the base 30-32s", smallWin)
+	}
+	// 56万 tokens needs ~280s at 2k/s, so the window must reach the ceiling —
+	// NOT stop at the operator's 30s base.
+	if bigWin != g.fbCeiling(model.ChannelWorkBuddy) {
+		t.Fatalf("560k-token window = %s, want the %s ceiling (the base must not cap it)", bigWin, g.fbCeiling(model.ChannelWorkBuddy))
+	}
+	if bigWin <= 30*time.Second {
+		t.Fatalf("560k-token window = %s: the fixed 30s cap is back", bigWin)
 	}
 }

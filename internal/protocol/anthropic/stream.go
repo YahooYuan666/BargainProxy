@@ -41,6 +41,12 @@ type StreamWriter struct {
 	openKind   string // "", "text", "thinking"
 	toolOrder  []int
 	toolStates map[int]*toolBlock
+	// toolIndexBase shifts incoming driver tool indexes (BP-139): after a
+	// mid-call truncation the continuation re-emits ITS tool call at index 0,
+	// which would collide with the dead attempt's buffered fragment. The
+	// restart event retires the partial blocks and records how many tool
+	// slots were consumed, so incoming index i maps to i+toolIndexBase.
+	toolIndexBase int
 
 	// usage is the upstream's authoritative accounting for this response,
 	// kept whole so message_delta can emit the Anthropic split (UsageFromIR).
@@ -191,12 +197,24 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 			"type": "content_block_delta", "index": s.blockIdx,
 			"delta": map[string]any{"type": "signature_delta", "signature": ev.Delta},
 		})
+	case ir.EvToolRestart:
+		// BP-139: the gateway is splicing a continuation after a mid-call
+		// truncation. Retire every partial tool buffer — their arguments are
+		// a truncated half-JSON the client must never see — and shift the
+		// index space so the continuation's fresh call (the driver restarts
+		// at index 0) lands in new blocks. Delivered text/thinking state is
+		// untouched: those blocks are already on the client's wire.
+		s.toolIndexBase += len(s.toolOrder)
+		s.toolStates = map[int]*toolBlock{}
+		s.toolOrder = nil
+		return nil
 	case ir.EvToolStart:
-		st := s.toolStates[ev.ToolIndex]
+		idx := ev.ToolIndex + s.toolIndexBase
+		st := s.toolStates[idx]
 		if st == nil {
 			st = &toolBlock{}
-			s.toolStates[ev.ToolIndex] = st
-			s.toolOrder = append(s.toolOrder, ev.ToolIndex)
+			s.toolStates[idx] = st
+			s.toolOrder = append(s.toolOrder, idx)
 		}
 		if ev.ToolCall != nil {
 			if ev.ToolCall.ID != "" {
@@ -208,13 +226,14 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 		}
 		return nil
 	case ir.EvToolArgs:
-		st := s.toolStates[ev.ToolIndex]
+		idx := ev.ToolIndex + s.toolIndexBase
+		st := s.toolStates[idx]
 		if st == nil {
 			// Arguments without a start event: keep them anyway (the client
 			// still gets a usable call with a synthetic id).
-			st = &toolBlock{id: fmt.Sprintf("call_%d", ev.ToolIndex)}
-			s.toolStates[ev.ToolIndex] = st
-			s.toolOrder = append(s.toolOrder, ev.ToolIndex)
+			st = &toolBlock{id: fmt.Sprintf("call_%d", idx)}
+			s.toolStates[idx] = st
+			s.toolOrder = append(s.toolOrder, idx)
 		}
 		st.args.WriteString(ev.Delta)
 		return nil

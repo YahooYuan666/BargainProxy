@@ -258,7 +258,7 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// The window is per binding: slow-to-first-byte channels (AutoClaw's
 		// sandbox relay) raise their own ceiling without making healthy quick
 		// channels wait longer (BP-71).
-		win := fbWaitFor(g.cfg.FallbackWait.D(), req, g.fbCeiling(binding.Channel))
+		win := fbWaitFor(g.fbBaseFor(), req, g.fbCeiling(binding.Channel))
 		if bi == len(bindings)-1 {
 			// The LAST binding has nowhere to cascade to, so a first-byte
 			// window can only hurt: it turns a slow-but-healthy upstream into a
@@ -448,9 +448,16 @@ const (
 	fbWindowCeilingHard = 120 * time.Second
 )
 
-// fbCeiling returns the first-byte window ceiling for one channel, most
+// fbCeiling returns the first-byte window CEILING for one channel, most
 // specific first: channel_first_byte_windows[channel] → legacy
-// channels.autoclaw.first_byte_window → global first_byte_window → 90s.
+// channels.autoclaw.first_byte_window → fbWindowCeiling.
+//
+// BP-138: the panel's first_byte_window_seconds is deliberately NOT in this
+// chain any more — it is the BASE of the dynamic formula (fbBaseFor), not a
+// cap. Its old place here is exactly what kept amputating big prompts: the
+// DB value 30 clamped the formula back down no matter what the context
+// needed. An operator who wants a different ceiling for a channel still has
+// channel_first_byte_windows; the global default remains fbWindowCeiling.
 func (g *Gateway) fbCeiling(channel string) time.Duration {
 	if g.cfg != nil {
 		if w := g.cfg.ChannelFirstByteWindows[channel].D(); w > 0 {
@@ -460,14 +467,6 @@ func (g *Gateway) fbCeiling(channel string) time.Duration {
 			if w := g.cfg.Channels.AutoClaw.FirstByteWindow.D(); w > 0 {
 				return w
 			}
-		}
-	}
-	if n := g.fbWindow.Load(); n > 0 {
-		return time.Duration(n)
-	}
-	if g.cfg != nil {
-		if w := g.cfg.FirstByteWindow.D(); w > 0 {
-			return w
 		}
 	}
 	return fbWindowCeiling
@@ -482,14 +481,28 @@ func (g *Gateway) SetFirstByteWindow(d time.Duration) {
 	g.fbWindow.Store(int64(d))
 }
 
-// fbWaitFor returns the first-byte window for this request: base plus one
-// second per 2k estimated prompt tokens, capped at ceiling (90s by default,
-// per-channel configurable). BP-72 narrowed the step twice (8k → 4k → 2k):
-// the 15:00 incident on a new 81k-token conversation gave AutoClaw only a 44s
-// window, its relay produced nothing, and Qoder absorbed the request after
-// 83s. 2k tokens/s is a realistic sandbox-relay prefill rate under a
-// congested uplink; requests that answer quickly never wait — the first
-// stream event stops the timer.
+// fbWaitFor returns the first-byte window for this request.
+//
+// BP-138 made the window DYNAMIC in earnest. The formula existed since BP-72
+// (base + 1s per 2k estimated prompt tokens; the step was narrowed 8k → 4k →
+// 2k after the 15:00 incident), but the panel value sat on top as a FLAT cap —
+// and field 2026-10-27 20:20 proved the cap was still doing the rejecting: a
+// 56.8万-token prompt needs ~50s of workbuddy prefill (33万 measured 31.9s,
+// BP-118), the DB panel value 30 cut it off at exactly 30.000s, and the
+// request cascaded through trae (context ceiling) and qoder (queue) to
+// lobster, which answered three empty 500s. Every leg died of the size the
+// window refused to acknowledge.
+//
+// The panel setting (first_byte_window_seconds) is therefore the BASE of the
+// formula, not the cap: window = clamp(base + tokens/2k, base, hard ceiling).
+// A small request keeps the operator's number exactly; a big one gets the
+// prefill time the measured rate says it needs. fbWindowCeilingHard (120s)
+// bounds a pathological prompt; the per-leg cascade cost is bounded by the
+// cheap-legs observation below, not by starving healthy legs.
+//
+// 2k tokens/s is a realistic prefill rate under a congested uplink (BP-72
+// measurement); requests that answer quickly never wait — the first stream
+// event stops the timer.
 func fbWaitFor(base time.Duration, req *ir.ChatRequest, ceiling time.Duration) time.Duration {
 	if ceiling <= 0 {
 		ceiling = fbWindowCeiling
@@ -506,6 +519,22 @@ func fbWaitFor(base time.Duration, req *ir.ChatRequest, ceiling time.Duration) t
 		w = ceiling
 	}
 	return w
+}
+
+// fbBaseFor resolves the BASE window for one channel: the panel value is the
+// operator's base (BP-138), falling back to the config default, then to
+// fallbackWait. Per-channel overrides remain what they always were — an
+// explicit ceiling for a channel whose prefill rate differs.
+func (g *Gateway) fbBaseFor() time.Duration {
+	if n := g.fbWindow.Load(); n > 0 {
+		return time.Duration(n)
+	}
+	if g.cfg != nil {
+		if w := g.cfg.FallbackWait.D(); w > 0 {
+			return w
+		}
+	}
+	return fallbackWait
 }
 
 // skipUnavailable is the pre-flight gate predicate (BP-64): a binding with
@@ -638,13 +667,31 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				break
 			}
 			contSegs++
-			log.Printf("gateway: %s stream dropped after %s (%s); continuing on the same account (segment %d/%d, %d chars replayed)",
+			log.Printf("gateway: %s stream dropped after %s (%s); continuing on the same account (segment %d/%d, %d chars replayed%s)",
 				binding.Channel, time.Since(started).Round(time.Millisecond), class,
-				contSegs, continueMaxSegments, ledger.text.Len())
+				contSegs, continueMaxSegments, ledger.text.Len(),
+				map[bool]string{true: ", redoing the interrupted tool call", false: ""}[ledger.sawTool])
+			// Decide the redo BEFORE the restart event clears the ledger
+			// flag: continuationRequest reads the same state.
+			redoTool := ledger.sawTool
+			if redoTool {
+				// BP-139: the truncation cut a tool call mid-arguments. The
+				// partial fragment is discarded everywhere (writers retire
+				// the buffered block and shift their index space; the ledger
+				// clears the flag) and the continuation request asks the
+				// model to redo the call. The client — on buffered
+				// protocols — never saw the fragment, so what it experiences
+				// is one continuous stream whose tool call simply arrives
+				// complete.
+				if err := attemptEmit(ir.StreamEvent{Kind: ir.EvToolRestart}); err != nil {
+					return nil, err
+				}
+			}
 			var contResp *ir.ChatResponse
+			contReq := continuationRequest(req, ledger, redoTool)
 			contResp, streamErr = drv.Stream(actx, driver.ChatCall{
 				Account: lease.Account, UpstreamModel: binding.UpstreamModel,
-				Request: continuationRequest(req, ledger),
+				Request: contReq,
 			}, attemptEmit)
 			if streamErr == nil {
 				resp = mergedResponse(ledger, contResp)

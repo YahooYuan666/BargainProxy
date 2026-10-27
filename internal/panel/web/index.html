@@ -595,8 +595,8 @@ tr:last-child td{border-bottom:none}
             <span class="hint">上游返回"请求太频繁"（429）时的起步冷却时长，连续撞限会翻倍、最长 1 小时。默认 600。</span>
           </div>
           <div class="row">
-            <label class="chk">首字窗口上限（秒）<input id="setFirstByteWindow" type="number" min="1" max="3600" style="max-width:100px"></label>
-            <span class="hint">所有号池通用：等待上游吐出第一个字的最长时间，超时才降级到下一渠道。实际等待 = 8 秒 + 每 2k 估算 token 加 1 秒，封顶这个值。默认 90。大上下文或上行带宽紧张时调大，可避免健康渠道被提前放弃。</span>
+            <label class="chk">首字窗口基准（秒）<input id="setFirstByteWindow" type="number" min="1" max="3600" style="max-width:100px"></label>
+            <span class="hint">所有号池通用：等待上游吐出第一个字的时间。BP-138 起此值为动态公式的基准：实际窗口 = 本值 + 每 2k 估算 token 加 1 秒（按上下文长度自动增长），封顶 60 秒（个别渠道可用 channel_first_byte_windows 单独覆盖）。小请求就是本值；大请求按 prefill 实测速率自动放宽，不再被固定值掐断。默认 60。</span>
           </div>
           <div class="row">
             <label class="chk">每渠道单号并发 <input id="setMaxInflight" type="text" style="max-width:260px" placeholder='{"workbuddy":3,"zcode":2}'></label>
