@@ -213,6 +213,7 @@ internal/cryptox      AES-256-GCM 凭据信封
 ## 文档
 
 - [跨国外网出口与 BBR2 调优](docs/跨国外网出口与BBR2调优.md)：Google / OpenCode 两条出境链路慢的根因与三步调优（BBR2、分流规则、DoH/QUIC），含回滚与验证流程。国模走国内直连，不要放进代理。
+- [Trae 通道模型路由修复](docs/Trae通道模型路由修复.md)：Trae 按 `config_name` 路由；缺这个字段时所有模型都由同一个火山引擎端点代答（返回 200 但模型是错的）。含自查方法（读响应的 `timing_cost.provider_model_name`）与"别用模型自述身份判断路由"的排查教训。
 - [ZCode 同步插件](plugins/bargainproxy-opencode/README.md)：把网关模型同步进 ZCode 的 9 个个人供应商。
 
 ## 换电脑 / 重装时怎么把调好的设置带过去

@@ -234,24 +234,6 @@
       "priority": 9
     },
     {
-      "canonical": "kimi-k3",
-      "channel": "trae",
-      "upstream_model": "kimi-k3",
-      "priority": 0
-    },
-    {
-      "canonical": "kimi-k3",
-      "channel": "workbuddy",
-      "upstream_model": "kimi-k3",
-      "priority": 1
-    },
-    {
-      "canonical": "kimi-k3",
-      "channel": "lobster",
-      "upstream_model": "kimi-k3",
-      "priority": 9
-    },
-    {
       "canonical": "mimo-v2.6-flash-free",
       "channel": "opencodezen",
       "upstream_model": "mimo-v2.6-flash-free",
@@ -298,6 +280,24 @@
       "channel": "lobster",
       "upstream_model": "qwen3.8-max",
       "priority": 9
+    },
+    {
+      "canonical": "kimi-k3.1-pro",
+      "channel": "workbuddy",
+      "upstream_model": "kimi-k3.1-pro",
+      "priority": 0
+    },
+    {
+      "canonical": "kimi-k3.1-pro",
+      "channel": "trae",
+      "upstream_model": "kimi-k3.1-pro",
+      "priority": 1
+    },
+    {
+      "canonical": "kimi-k3.1-pro",
+      "channel": "lobster",
+      "upstream_model": "kimi-k3.1-pro",
+      "priority": 9
     }
   ],
   "primary_models": [
@@ -308,7 +308,7 @@
     "glm-5.3-flash",
     "deepseek-v4.1-flash",
     "deepseek-v4-pro",
-    "kimi-k3",
+    "kimi-k3.1-pro",
     "qwen3.8-flash",
     "qwen3.8-max",
     "glm-5.3-flashx"
