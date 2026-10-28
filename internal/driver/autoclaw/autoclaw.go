@@ -21,6 +21,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -1214,7 +1215,16 @@ var refusedIdentities = []string{
 	"claude code",
 	"zcode",
 	"codex",
+	// BP-176 (plugins autoclaw 0.2.10, d8cfee3): "You are CodeBuddy Code" is
+	// a 406 on the CN gateway too — bisected directly against the upstream.
+	"codebuddy code",
 }
+
+// glmOpeningRe matches the WorkBuddy opening line ("This conversation is
+// powered by GLM-5.3 · …"), which the CN gateway 406s in ANY position
+// (plugins 0.2.10 #437 probes). The wording that passes is the neutral
+// "the GLM-x model" form.
+var glmOpeningRe = regexp.MustCompile(`(?i)this conversation is powered by GLM-([\w.-]+)`)
 
 // refusedIdentityClaim reports whether text carries a second-person identity
 // claim naming a refused product, and returns the text with just that claim
@@ -1227,6 +1237,11 @@ var refusedIdentities = []string{
 // instruction body is kept, whereas the old whole-prompt move produced 406 on
 // every attempt.
 func scrubRefusedIdentity(text string) string {
+	// BP-176: the GLM opening line is refused wherever it sits, and it is
+	// not a "you are" claim — rewrite it before the claim scrub.
+	if glmOpeningRe.MatchString(text) {
+		text = glmOpeningRe.ReplaceAllString(text, "This conversation is powered by the GLM-$1 model")
+	}
 	lower := strings.ToLower(text)
 	if !strings.Contains(lower, "you are") {
 		return text
@@ -1441,6 +1456,11 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			return nil, uperr.New(uperr.ClassCanceled, 0, "autoclaw: stream canceled: %v", err)
 		}
 		line := strings.TrimSpace(sc.Text())
+		// BP-180: a bare "[DONE]" without the "data:" prefix terminates too.
+		if line == "[DONE]" {
+			terminated = true
+			break
+		}
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}

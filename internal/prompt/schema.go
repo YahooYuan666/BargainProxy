@@ -1,5 +1,7 @@
 package prompt
 
+import "encoding/json"
+
 // Tool-schema repair for strict upstreams.
 //
 // Why: WorkBuddy (and the DeepSeek-family backends behind it) validate tool
@@ -48,7 +50,18 @@ func FixEnumTypes(schema any) bool {
 		}
 		// Only a schema that actually carries an enum needs typing.
 		if raw, ok := s["enum"]; ok {
-			if vals, ok := raw.([]any); ok && len(vals) > 0 {
+			vals, ok := raw.([]any)
+			if !ok {
+				// A hand-built Go map can carry a typed slice ([]string…);
+				// round-trip it into the JSON shape the inference expects.
+				if b, err := json.Marshal(raw); err == nil {
+					var conv []any
+					if json.Unmarshal(b, &conv) == nil {
+						vals = conv
+					}
+				}
+			}
+			if len(vals) > 0 {
 				if inferred := inferEnumType(vals); inferred != "" {
 					switch t := s["type"].(type) {
 					case nil:

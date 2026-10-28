@@ -82,8 +82,19 @@ type Model struct {
 	Reasoning         Reasoning `json:"reasoning"`
 	MaxInputTokens    int       `json:"maxInputTokens"`
 	MaxOutputTokens   int       `json:"maxOutputTokens"`
-	Tags              []string  `json:"tags,omitempty"`
-	Disabled          bool      `json:"disabled,omitempty"`
+	// ContextWindow (BP-184, magpie 9ba3f04): the CLI builds its 200K/1M
+	// context submenu ONLY from supportedLengths (two sizes or more, each no
+	// larger than maxInputTokens) — maxInputTokens alone hides the menu and
+	// clips the default budget to 200K.
+	ContextWindow *ContextWindow `json:"contextWindow,omitempty"`
+	Tags          []string       `json:"tags,omitempty"`
+	Disabled      bool           `json:"disabled,omitempty"`
+}
+
+// ContextWindow mirrors the app's own contextWindow shape.
+type ContextWindow struct {
+	SupportedLengths []int `json:"supportedLengths"`
+	DefaultLength    int   `json:"defaultLength"`
 }
 
 type Reasoning struct {
@@ -208,6 +219,13 @@ func FromCatalog(entries []EntryID, domestic, foreign []TierRow, panelURL, apiKe
 			MaxOutputTokens: a.out,
 			Tags:            []string{"custom"},
 		})
+		// BP-184: anything past the 200K base gets the two-size menu.
+		if entry := &out[len(out)-1]; entry.MaxInputTokens > 200000 {
+			entry.ContextWindow = &ContextWindow{
+				SupportedLengths: []int{200000, entry.MaxInputTokens},
+				DefaultLength:    entry.MaxInputTokens,
+			}
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil

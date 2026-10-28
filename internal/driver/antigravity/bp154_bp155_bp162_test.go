@@ -112,3 +112,16 @@ func RotatableForTest(class string) bool {
 }
 
 var _ io.Reader = (*strings.Reader)(nil)
+
+// BP-180: the bare "[DONE]" line (no "data:" prefix) terminates the stream —
+// missing it used to read the turn as "no terminal signal" (transport).
+func TestBP180BareDoneTerminatesAntigravity(t *testing.T) {
+	body := "data: {\"response\":{\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}}\n\n[DONE]\n\n"
+	resp, err := bp154Stream(t, body)
+	if err != nil {
+		t.Fatalf("bare [DONE] must terminate cleanly: %v", err)
+	}
+	if resp.Message.Content[0].Text != "hi" {
+		t.Fatalf("text lost: %q", resp.Message.Content[0].Text)
+	}
+}

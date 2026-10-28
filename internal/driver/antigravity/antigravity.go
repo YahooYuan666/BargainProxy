@@ -369,6 +369,11 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 		if line == "" || strings.HasPrefix(line, ":") {
 			continue
 		}
+		// BP-180: a bare "[DONE]" without the "data:" prefix terminates too.
+		if line == "[DONE]" {
+			terminated = true
+			break
+		}
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}

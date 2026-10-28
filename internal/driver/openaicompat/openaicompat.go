@@ -98,19 +98,38 @@ func buildBody(call driver.ChatCall) ([]byte, error) {
 		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
 			wire["content"] = m.Content[0].Text
 		} else if len(m.Content) > 0 {
-			var parts []map[string]any
+			// BP-179 (magpie 4cc331b): a content list made ONLY of text parts
+			// goes as the texts joined by a newline — strict OpenAI-compatible
+			// backends (vLLM shapes) answer a text-part array with 422 "input
+			// must be a valid string". Anything with an image stays a list.
+			allText := true
 			for _, p := range m.Content {
-				switch p.Kind {
-				case "text":
-					parts = append(parts, map[string]any{"type": "text", "text": p.Text})
-				case "image":
-					parts = append(parts, map[string]any{
-						"type":      "image_url",
-						"image_url": map[string]any{"url": "data:" + p.ImageMIME + ";base64," + p.ImageB64},
-					})
+				if p.Kind != "text" {
+					allText = false
+					break
 				}
 			}
-			wire["content"] = parts
+			if allText {
+				texts := make([]string, 0, len(m.Content))
+				for _, p := range m.Content {
+					texts = append(texts, p.Text)
+				}
+				wire["content"] = strings.Join(texts, "\n")
+			} else {
+				var parts []map[string]any
+				for _, p := range m.Content {
+					switch p.Kind {
+					case "text":
+						parts = append(parts, map[string]any{"type": "text", "text": p.Text})
+					case "image":
+						parts = append(parts, map[string]any{
+							"type":      "image_url",
+							"image_url": map[string]any{"url": "data:" + p.ImageMIME + ";base64," + p.ImageB64},
+						})
+					}
+				}
+				wire["content"] = parts
+			}
 		}
 		if len(m.ToolCalls) > 0 {
 			var tcs []map[string]any
@@ -180,6 +199,13 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			return nil, uperr.New(uperr.ClassCanceled, 0, "openaicompat: stream canceled: %v", err)
 		}
 		line := strings.TrimSpace(sc.Text())
+		// BP-180 (new-api 55515dba): some upstreams emit the bare "[DONE]"
+		// without the "data:" prefix — missing it read the whole stream as a
+		// transport failure even though the turn had completed.
+		if line == "[DONE]" {
+			terminated = true
+			break
+		}
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}

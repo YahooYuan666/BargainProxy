@@ -1,7 +1,9 @@
 package autoclaw
 
 import (
+	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"bargainproxy/internal/driver"
@@ -74,5 +76,51 @@ func TestBP160TidyBodyLeavesNormalShapes(t *testing.T) {
 	_ = json.Unmarshal(raw, &doc)
 	if doc.Messages[0]["content"] != "hello" {
 		t.Fatalf("content = %v", doc.Messages[0]["content"])
+	}
+}
+
+// BP-176: the WorkBuddy GLM opening line and "You are CodeBuddy Code" are
+// 406 on the CN gateway (plugins 0.2.10, d8cfee3) — the scrub rewrites the
+// opening line and drops the claim sentence.
+func TestBP176RefusedIdentitiesScrubbed(t *testing.T) {
+	rewritten := scrubRefusedIdentity("This conversation is powered by GLM-5.3 · AutoClaw 国内. Help the user code.")
+	if strings.Contains(rewritten, "powered by GLM-5.3 ·") {
+		t.Fatalf("GLM opening line survived: %q", rewritten)
+	}
+	if !strings.Contains(rewritten, "powered by the GLM-5.3 model") {
+		t.Fatalf("neutral rewrite missing: %q", rewritten)
+	}
+	if !strings.Contains(rewritten, "Help the user code.") {
+		t.Fatalf("surrounding text must survive: %q", rewritten)
+	}
+
+	dropped := scrubRefusedIdentity("You are CodeBuddy Code, Tencent's coding agent. Answer in Chinese.")
+	if strings.Contains(strings.ToLower(dropped), "codebuddy") {
+		t.Fatalf("CodeBuddy claim survived: %q", dropped)
+	}
+	if !strings.Contains(dropped, "Answer in Chinese.") {
+		t.Fatalf("surrounding text must survive: %q", dropped)
+	}
+}
+
+// BP-180: the bare "[DONE]" line (no "data:" prefix) terminates the stream.
+func TestBP180BareDoneTerminatesAutoclaw(t *testing.T) {
+	body := "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\n[DONE]\n\n"
+	call := driver.ChatCall{
+		Account:       &model.Account{ID: "ac-bd", Channel: model.ChannelAutoClaw},
+		UpstreamModel: "zai_glm-5.3-flash",
+		Request: &ir.ChatRequest{
+			Model:    "zai_glm-5.3-flash",
+			Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}}},
+		},
+	}
+	d := &Driver{}
+	_ = d
+	resp, err := parseSSE(context.Background(), strings.NewReader(body), call, func(ir.StreamEvent) error { return nil })
+	if err != nil {
+		t.Fatalf("bare [DONE] must terminate cleanly: %v", err)
+	}
+	if ir.TextOf(resp.Message.Content) != "ok" {
+		t.Fatalf("text lost: %q", ir.TextOf(resp.Message.Content))
 	}
 }

@@ -935,7 +935,9 @@ func parseResponsesSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.
 					return nil, err
 				}
 			}
-		case "response.completed", "response.incomplete":
+		case "response.completed", "response.incomplete", "response.cancelled", "response.canceled":
+			// BP-181: a cancelled terminal is still a terminal — the old
+			// fall-through read the rest of the stream as a transport death.
 			terminated = true
 			if ev.Response != nil {
 				if ev.Response.Status == "incomplete" {

@@ -197,7 +197,9 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 		s.usage = usageFromIR(*ev.Usage)
 		return nil
 	case ir.EvDone:
-		return s.finish()
+		// BP-181: a length-capped turn ends incomplete, not completed —
+		// Codex-class clients read the status to decide whether to continue.
+		return s.finish(ev.Stop == ir.StopLength)
 	}
 	return nil
 }
@@ -242,7 +244,7 @@ func (s *StreamWriter) announceToolItem(toolIndex int, st *toolItemState) error 
 	return s.event("response.output_item.added", map[string]any{"output_index": 1 + toolIndex, "item": item})
 }
 
-func (s *StreamWriter) finish() error {
+func (s *StreamWriter) finish(incomplete bool) error {
 	if err := s.ensureCreated(); err != nil {
 		return err
 	}
@@ -284,11 +286,22 @@ func (s *StreamWriter) finish() error {
 			return err
 		}
 	}
-	env := s.responseEnvelope("completed")
+	status := "completed"
+	event := "response.completed"
+	if incomplete {
+		// BP-181 (sub2api 9b540744): the terminal object carries the real
+		// status plus the standard incomplete_details reason.
+		status = "incomplete"
+		event = "response.incomplete"
+	}
+	env := s.responseEnvelope(status)
+	if incomplete {
+		env["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
 	if s.usage != nil {
 		env["usage"] = s.usage
 	}
-	if err := s.event("response.completed", map[string]any{"response": env}); err != nil {
+	if err := s.event(event, map[string]any{"response": env}); err != nil {
 		return err
 	}
 	s.completed = true

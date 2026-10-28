@@ -277,14 +277,21 @@ func splitDataURL(u string) (string, string, bool) {
 
 // ResponseObject is the non-streamed response body.
 type ResponseObject struct {
-	ID         string `json:"id"`
-	Object     string `json:"object"`
-	CreatedAt  int64  `json:"created_at"`
-	Status     string `json:"status"`
-	Model      string `json:"model"`
-	Output     []any  `json:"output"`
-	OutputText string `json:"output_text,omitempty"`
-	Usage      *Usage `json:"usage,omitempty"`
+	ID         string             `json:"id"`
+	Object     string             `json:"object"`
+	CreatedAt  int64              `json:"created_at"`
+	Status     string             `json:"status"`
+	Model      string             `json:"model"`
+	Output     []any              `json:"output"`
+	OutputText string             `json:"output_text,omitempty"`
+	Usage      *Usage             `json:"usage,omitempty"`
+	// IncompleteDetails (BP-181) names why a turn ended incomplete.
+	IncompleteDetails *IncompleteDetails `json:"incomplete_details,omitempty"`
+}
+
+// IncompleteDetails is the Responses API's standard truncation reason shape.
+type IncompleteDetails struct {
+	Reason string `json:"reason"`
 }
 
 // Usage is the Responses usage shape.
@@ -331,6 +338,12 @@ func Render(id, model string, createdAt int64, resp *ir.ChatResponse, outputText
 		CreatedAt: createdAt,
 		Status:    "completed",
 		Model:     model,
+	}
+	// BP-181: a length-capped turn reports incomplete/max_output_tokens
+	// instead of a completed status that claims the answer is whole.
+	if resp != nil && resp.StopReason == ir.StopLength {
+		out.Status = "incomplete"
+		out.IncompleteDetails = &IncompleteDetails{Reason: "max_output_tokens"}
 	}
 	msgItem := map[string]any{
 		"type":   "message",

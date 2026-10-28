@@ -67,6 +67,45 @@ type Trace struct {
 	// end up with an empty account column, leaving "which account dropped this
 	// connection?" unanswerable (BP-107 field report, 2026-10-24).
 	LastAccount *model.Account
+	// BadRequestResent pins the BP-168 flaky-400 resend to once per REQUEST
+	// (bindings included): a cascade that meets two lying 400s must not pay
+	// two resends.
+	BadRequestResent bool
+	// EffortRetried pins the BP-182 effort-downgrade retry to once per
+	// request.
+	EffortRetried bool
+}
+
+// effortRejected reports whether a 400 body names the effort gear as the
+// thing it refused. Deliberately narrow (BP-182): a generic "invalid
+// argument" must not trigger a downgrade.
+func effortRejected(msg string) bool {
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "reasoning_effort") || strings.Contains(lower, "reasoning.effort") {
+		return true
+	}
+	return strings.Contains(lower, "effort") &&
+		(strings.Contains(lower, "not support") || strings.Contains(lower, "unsupported") ||
+			strings.Contains(lower, "invalid") || strings.Contains(lower, "reject"))
+}
+
+// downgradeEffort steps the gear down one level; the bottom of the ladder
+// strips the gear entirely (the upstream's own default takes over). ok=false
+// for gears with no lower step.
+func downgradeEffort(effort string) (string, bool) {
+	switch strings.ToLower(effort) {
+	case "max":
+		return "xhigh", true
+	case "xhigh":
+		return "high", true
+	case "high":
+		return "medium", true
+	case "medium":
+		return "low", true
+	case "low", "minimal":
+		return "", true
+	}
+	return "", false
 }
 
 type traceKey struct{}
@@ -678,6 +717,96 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 						binding.Channel, req.MaxTokens, ceil)
 					started = time.Now()
 					resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
+				} else if (tr == nil || !tr.EffortRetried) && effortRejected(ue.Message) && req.RequestedEffort != "" {
+					// BP-182 (Coding2API 90a5d6f5): an upstream that refuses
+					// the effort gear downgrades ONE level on the SAME
+					// account instead of failing the turn — no rotation, no
+					// cooldown, no budget. Narrow match: only bodies that
+					// name the gear. Nothing reached the client (outer
+					// guard), so a clean retry is safe.
+					if tr != nil {
+						tr.EffortRetried = true
+					}
+					stepped, ok := downgradeEffort(req.RequestedEffort)
+					if ok {
+						downgraded := *req
+						downgraded.RequestedEffort = stepped
+						retryCall := call
+						retryCall.Request = &downgraded
+						log.Printf("gateway: %s rejected reasoning_effort=%q — retrying once with %q (same account)",
+							binding.Channel, req.RequestedEffort, map[bool]string{true: stepped, false: "no gear"}[stepped != ""])
+						started = time.Now()
+						resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
+					}
+				} else if (tr == nil || !tr.BadRequestResent) && req.Stream {
+					// BP-168: upstreams do emit LYING 400s. Field evidence
+					// 2026-10-28 23:46: Google's antigravity answered a generic
+					// INVALID_ARGUMENT to the 54th request of a healthy
+					// session — structurally identical to the 52 requests
+					// before it (dump-diffed: delta was one clean tool
+					// result), and the same content flowed fine 30 seconds
+					// later in a fresh session. bad_request never rotates, so
+					// one flaky 400 killed a whole 5-minute subagent run.
+					// Resend the IDENTICAL bytes to the SAME account once per
+					// request: a deterministic 400 costs 3 seconds, a flaky
+					// one gets through. Only while nothing reached the client
+					// (the outer guard) and only on streaming turns, where
+					// "no output yet" is meaningful.
+					//
+					// The AttemptReset first: whatever the dead attempt left
+					// buffered (sentinel hold-back, protocol writer state)
+					// must be discarded, or it would leak into the resent
+					// stream (BP-123 discipline; nothing was delivered, which
+					// is exactly this branch's guard).
+					if tr != nil {
+						tr.BadRequestResent = true
+					}
+					_ = emit(ir.StreamEvent{Kind: ir.EvAttemptReset})
+					log.Printf("gateway: %s returned bad_request with nothing emitted — resending once to the same account (flaky-400 guard)",
+						binding.Channel)
+					started = time.Now()
+					resp, streamErr = drv.Stream(actx, call, attemptEmit)
+				}
+			}
+		}
+		// BP-169 (user option A, misakano f07eba54): queue signals (6020/6021)
+		// are INTERMITTENT — field evidence 2026-10-28: two accounts answered
+		// 6021 and the same model recovered within 33s, so fail-fast turned a
+		// few-second wobble into a dead task. Retry the SAME lease with a
+		// short backoff (500ms, 1s — 3 upstream calls total), only while
+		// nothing reached the client; a queue naming a wait longer than 5s is
+		// too deep to ride out here and goes straight to the terminal error.
+		// No account rotation, no penalty (the pool's channel+model pause
+		// still applies to follow-up requests).
+		if streamErr != nil && !emitted() {
+			if ue, ok := uperr.As(streamErr); ok && ue.Class == uperr.ClassUpstreamBusy && ctx.Err() == nil {
+				for r := 0; r < 2; r++ {
+					if !ue.ResetAt.IsZero() {
+						if wait := time.Until(ue.ResetAt); wait > 5*time.Second {
+							break // deep queue: hand the wait to the client
+						}
+					}
+					backoff := 500 * time.Millisecond << r
+					select {
+					case <-actx.Done():
+					case <-time.After(backoff):
+					}
+					if actx.Err() != nil {
+						break
+					}
+					_ = emit(ir.StreamEvent{Kind: ir.EvAttemptReset})
+					log.Printf("gateway: %s queue busy — retrying on the same account in %s (attempt %d/3)",
+						binding.Channel, backoff, r+2)
+					started = time.Now()
+					resp, streamErr = drv.Stream(actx, call, attemptEmit)
+					if streamErr == nil {
+						break
+					}
+					next, ok := uperr.As(streamErr)
+					if !ok || next.Class != uperr.ClassUpstreamBusy {
+						break
+					}
+					ue = next
 				}
 			}
 		}
@@ -759,6 +888,15 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			}
 		}
 		if streamErr == nil {
+			// BP-185 (Coding2API 03d408e4): text volume far beyond the
+			// reported output tokens is the indirect signature of a swallowed
+			// usage frame or a silently served smaller model. Warn only.
+			if resp != nil && resp.Usage.OutputTokens > 0 {
+				if chars := ledger.text.Len(); chars > 200 && chars/resp.Usage.OutputTokens > 12 {
+					log.Printf("gateway: usage reconciliation: %s/%s produced %d text chars but reported %d output tokens — upstream may have swallowed usage or served a smaller model",
+						binding.Channel, binding.UpstreamModel, chars, resp.Usage.OutputTokens)
+				}
+			}
 			g.pool.ApplyResult(lease.Account, req.Model, nil)
 			// Tell the pool what this answer said about the vendor's prefix
 			// cache: stickiness is only worth keeping while that cache is warm
@@ -1109,17 +1247,20 @@ func DescribeError(err error) (status int, class string, message string) {
 		// still listening.
 		return 499, ue.Class, "request canceled before completion: " + ue.Message
 	case uperr.ClassUpstreamBusy:
-		// Capacity event: the account is healthy and the request is fine;
-		// 503 tells the client SDK to back off and retry shortly. When the
-		// upstream said how long the queue needs, say it: the client can then
-		// wait exactly that long instead of guessing (2026-10-21).
+		// Capacity event: the account is healthy and the request is fine.
+		// BP-169 (user option A): 429 + Retry-After, not 503 — the WorkBuddy
+		// CLI resends automatically on a 429's Retry-After and ABORTS the
+		// whole task on a 503 (misakano f07eba54); Anthropic-family SDKs
+		// behave the same way. When the upstream said how long the queue
+		// needs, say it (the header is attached by withRetryAfter from
+		// ResetAt/HoldUntil; the 5s default and 600s cap live there).
 		if !ue.ResetAt.IsZero() {
 			if wait := time.Until(ue.ResetAt); wait > 0 {
-				return 503, ue.Class, fmt.Sprintf("upstream queue is full; retry in %s: %s",
+				return 429, ue.Class, fmt.Sprintf("upstream queue is full; retry in %s: %s",
 					wait.Round(time.Second), ue.Message)
 			}
 		}
-		return 503, ue.Class, "upstream queue full (capacity), retry shortly: " + ue.Message
+		return 429, ue.Class, "upstream queue full (capacity), retry shortly: " + ue.Message
 	case uperr.ClassWAF:
 		return 502, ue.Class, "upstream edge blocked the request: " + ue.Message
 	case uperr.ClassEdgeBlock:

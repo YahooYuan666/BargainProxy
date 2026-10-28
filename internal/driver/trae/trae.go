@@ -23,8 +23,11 @@ import (
 	"fmt"
 	"io"
 	"log"
+
+	"bargainproxy/internal/prompt"
 	"math/big"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -390,6 +393,35 @@ func traeRequestID() string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// kimiRouted reports whether the routed upstream model is served by
+// Moonshot — those demand a fully-typed schema (BP-173).
+func kimiRouted(model string) bool {
+	return kimiRe.MatchString(strings.ToLower(model))
+}
+
+var kimiRe = regexp.MustCompile(`kimi|moonshot`)
+
+// billedModelOf extracts the model Trae says actually served the turn, from
+// the metadata frames' extra_info.model or timing_cost.provider_model_name
+// (BP-183). Empty when the frame names none.
+func billedModelOf(payload string) string {
+	var doc struct {
+		ExtraInfo struct {
+			Model string `json:"model"`
+		} `json:"extra_info"`
+		TimingCost struct {
+			ProviderModelName string `json:"provider_model_name"`
+		} `json:"timing_cost"`
+	}
+	if json.Unmarshal([]byte(payload), &doc) != nil {
+		return ""
+	}
+	if doc.ExtraInfo.Model != "" {
+		return doc.ExtraInfo.Model
+	}
+	return doc.TimingCost.ProviderModelName
+}
+
 // buildSOLOBody converts the IR request into the SOLO chat body:
 // {messages, function:"solo_work_lite", stream:true, model}.
 // traeEffort maps the portable gear onto Trae's levels. BP-165: the client
@@ -527,6 +559,13 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 	if gear := traeEffort(req.RequestedEffort); gear != "" {
 		body["reasoning_effort"] = gear
 	}
+	// BP-173 (plugins trae 0.2.24, 68794ba): Moonshot refuses the WHOLE
+	// request when a schema node has no type — Trae answers code 4027
+	// "not a valid moonshot flavored json schema … type is not defined", and
+	// Claude Code's enum-only properties trigger it. Kimi-routed models get
+	// their parameters normalized through the enum/type fixup; other
+	// families' schemas pass untouched.
+	kimiSchema := kimiRouted(call.UpstreamModel)
 	var tools []map[string]any
 	for _, t := range req.Tools {
 		if strings.TrimSpace(t.Name) == "" {
@@ -537,6 +576,9 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 			fn["description"] = t.Description
 		}
 		if t.Parameters != nil {
+			if kimiSchema {
+				prompt.FixEnumTypes(t.Parameters)
+			}
 			// The upstream Go struct types parameters as a JSON *string*
 			// (OpenAI types it as an object): an object body answers
 			// code=4001 "cannot unmarshal object into Go struct field
@@ -789,6 +831,14 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			return uperr.New(uperr.ClassInternal, 200, "trae: stream error: %s", truncate([]byte(payload), 200))
 		default:
 			if name != "" {
+				// BP-183: output/done/usage frames carry no model, but
+				// extra_info.model and timing_cost.provider_model_name do —
+				// the only place Trae names what actually served (Coding2API
+				// db74aef3). Warn on a silent model swap, keep the wire
+				// untouched.
+				if billed := billedModelOf(payload); billed != "" && call.UpstreamModel != "" && billed != call.UpstreamModel {
+					log.Printf("trae: upstream served a different model: requested=%s billed=%s", call.UpstreamModel, billed)
+				}
 				return nil // metadata / timing_cost / extra_info: no client content
 			}
 			// Bare payload without an event name: legacy chunk, or a wrapped

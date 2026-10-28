@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"log"
@@ -302,12 +303,28 @@ func applyAuth(req *http.Request, creds *Creds) {
 // Any non-200 is classified into *uperr.Error.
 func (d *Driver) postChat(ctx context.Context, creds *Creds, call driver.ChatCall, body []byte, path string) (*http.Response, error) {
 	url := d.chatBase(creds) + path
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	// BP-178: the official client gzips model requests past 1KB
+	// (RequestBodyGzip in both builds' product.json, misakano 47f1ed61 /
+	// plugins f4d48ac — a long agent conversation went up 2.89GB plain).
+	// BestSpeed level, same threshold.
+	payload := body
+	if len(body) > wbGzipThreshold {
+		var buf bytes.Buffer
+		if zw, zerr := gzip.NewWriterLevel(&buf, gzip.BestSpeed); zerr == nil {
+			_, _ = zw.Write(body)
+			_ = zw.Close()
+			payload = buf.Bytes()
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if len(payload) != len(body) {
+		req.Header.Set("Content-Encoding", "gzip")
+	}
 	applyAuth(req, creds)
 	if creds.DeviceToken != "" {
 		req.Header.Set("X-Device-Token", creds.DeviceToken)
@@ -491,6 +508,16 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool
 			}
 			body["reasoning_effort"] = effort
 		}
+	} else if strings.HasPrefix(strings.ToLower(call.UpstreamModel), "deepseek") {
+		// BP-177 (misakano f4d48ac, measured 2026-10-28 on www.workbuddy.ai):
+		// a chat that names no effort goes WITHOUT reasoning_effort, and
+		// upstream treats that as "don't think" — deepseek-v4.1-flash
+		// answered 0 reasoning tokens. The model config's own default
+		// (reasoning.defaultEffort) is "high" and that is what WorkBuddy's
+		// client sends. DeepSeek family only: other families' defaults are
+		// unverified, so they stay unset. An explicit off/none still takes
+		// the BP-130 disabled path above.
+		body["reasoning_effort"] = "high"
 	}
 	// prompt_cache_key injection (per-account stable key, panel parity).
 	prompt.InjectPromptCacheKey(body, creds.UID, sessionFromReq(req))
@@ -647,7 +674,9 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 			// Non-SSE error frame (upstream sometimes inlines JSON errors).
 			if strings.HasPrefix(line, "{") {
 				if code, msg, ok := detectBusinessError([]byte(line)); ok {
-					return nil, classifyBusiness(code, msg, call.UpstreamModel)
+					e := classifyBusiness(code, msg, call.UpstreamModel)
+					attachQueueRetryAfter(e, []byte(line))
+					return nil, e
 				}
 			}
 			continue
@@ -659,7 +688,9 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 		}
 		// Business-error frames arrive as HTTP 200 with an error body.
 		if code, msg, ok := detectBusinessError([]byte(payload)); ok {
-			return nil, classifyBusiness(code, msg, call.UpstreamModel)
+			e := classifyBusiness(code, msg, call.UpstreamModel)
+			attachQueueRetryAfter(e, []byte(payload))
+			return nil, e
 		}
 		var chunk struct {
 			Choices []struct {
@@ -874,6 +905,26 @@ func toInt(v any) int {
 	}
 }
 
+// attachQueueRetryAfter fills the queue signals' own wait. 6020 arrives with
+// data.retry_after (misakano f07eba54: "6020 带 data.retry_after=40"); without
+// it the client guesses. 缺省 5s per the same reference — a queue that names
+// no wait is a short one.
+func attachQueueRetryAfter(e *uperr.Error, body []byte) {
+	if e == nil || e.Class != uperr.ClassUpstreamBusy {
+		return
+	}
+	var doc struct {
+		Data struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &doc) == nil && doc.Data.RetryAfter > 0 {
+		e.ResetAt = time.Now().Add(time.Duration(doc.Data.RetryAfter) * time.Second)
+		return
+	}
+	e.ResetAt = time.Now().Add(5 * time.Second)
+}
+
 // classifyBusiness maps a business code to the error taxonomy.
 func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 	switch code {
@@ -1041,7 +1092,10 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 		return
 	}
 	global := creds.RealmOrDefault() == "global"
-	origin, lang := "https://www.codebuddy.cn", "zh-CN"
+	// BP-170: the CN client's origin moved to www.workbuddy.cn (misakano
+	// 47f1ed61: not one real request hits codebuddy.cn any more) — X-Domain,
+	// Origin and Referer all derive from this.
+	origin, lang := "https://www.workbuddy.cn", "zh-CN"
 	if global {
 		origin, lang = "https://www.workbuddy.ai", "en-US"
 	}
@@ -1092,6 +1146,11 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 		req.Header.Set("X-Machine-ID", machine)
 		req.Header.Set("X-Session-ID", machine)
 	}
+	// BP-170: the model-optimization toggle rides this header; the default
+	// client state (optimization on) sends "false" — 7 real chat captures all
+	// false (misakano ee1c80d8). Enterprise builds send "true"; none of our
+	// accounts are enterprise, so it is pinned false.
+	req.Header.Set("X-Private-Data", "false")
 	// The openai-node SDK / agent segment the client also sends.
 	req.Header.Set("X-Agent-Type", "main")
 	req.Header.Set("X-Agent-Intent", "craft")
@@ -1176,18 +1235,35 @@ func randomHex() string {
 	return hex.EncodeToString(b[:])
 }
 
+// wbGzipThreshold is the body size past which the official client gzips its
+// model requests (misakano 47f1ed61).
+const wbGzipThreshold = 1024
+
+// nakedHost strips the scheme from a base URL: X-Domain carries the bare
+// hostname (misakano 8ecf115a), never "https://…".
+func nakedHost(base string) string {
+	base = strings.TrimPrefix(base, "https://")
+	return strings.TrimPrefix(base, "http://")
+}
+
 // classifyHTTP maps HTTP status + body to the taxonomy.
 func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	if code, msg, ok := detectBusinessError(body); ok {
-		return classifyBusiness(code, msg, upstreamModel)
+		e := classifyBusiness(code, msg, upstreamModel)
+		attachQueueRetryAfter(e, body)
+		return e
 	}
 	text := string(body)
 	lower := strings.ToLower(text)
 	// Account restriction without a JSON envelope: the edge sometimes answers
 	// bare text. This must be judged before the generic 403 → WAF branch,
 	// because a restricted account has to leave routing (2026-10-20).
+	// BP-171: the bare number "11140" must NOT match here — request ids,
+	// timestamps or echoed user content can carry those five digits and
+	// would disable a healthy account (Coding2API 58e18f74). The structured
+	// code path (classifyBusiness codeAccountRestricted) and the wording
+	// markers are the reliable signals.
 	if status == 403 && (strings.Contains(lower, "request illegal") ||
-		strings.Contains(lower, "11140") ||
 		strings.Contains(lower, "account restricted") ||
 		strings.Contains(text, "异常行为")) {
 		return uperr.New(uperr.ClassAccountRestricted, status, "workbuddy: account restricted by upstream: %s", truncate(body, 300))
@@ -1548,19 +1624,26 @@ func (d *Driver) RefreshNow(ctx context.Context, acc *model.Account) error {
 }
 
 func (d *Driver) refreshOnce(ctx context.Context, creds *Creds) ([]byte, error) {
-	// The route takes the refresh token as a header and no body (verified
-	// 2026-10-18: empty body → 400 "refreshToken is empty" when the header is
-	// missing; a bad header value → 401 code 12153).
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatBase(creds)+refreshPath, nil)
+	// The route takes the refresh token as a header and a 2-byte "{}" body
+	// (verified 2026-10-18: empty body → 400 "refreshToken is empty" when the
+	// header is missing; a bad header value → 401 code 12153). BP-175
+	// (misakano 8ecf115a, real-device capture idx 556 = 11 headers): the
+	// client also sends X-Auth-Refresh-Source: plugin, X-Requested-With and
+	// X-Request-ID, its Accept is the loose axios value, and X-Domain is the
+	// naked host without scheme.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatBase(creds)+refreshPath, strings.NewReader("{}"))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("X-Refresh-Token", creds.RefreshToken)
+	req.Header.Set("X-Auth-Refresh-Source", "plugin")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("X-Request-ID", randomHex())
 	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", d.chatBase(creds))
+	req.Header.Set("X-Domain", nakedHost(d.chatBase(creds)))
 	req.Header.Set("X-Product", "SaaS")
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)

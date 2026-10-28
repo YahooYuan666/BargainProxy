@@ -142,6 +142,8 @@ func IsAuthDead(err error) bool {
 
 // growthCallOnce performs a single growth-domain attempt.
 func (d *Driver) growthCallOnce(ctx context.Context, creds *Creds, method, path string, body any, extraHeaders map[string]string) (json.RawMessage, error) {
+	// BP-175 (misakano 8ecf115a): the real client sends "{}" (Content-Length
+	// 2) on bodyless POSTs, never an empty body.
 	var rdr io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -149,6 +151,8 @@ func (d *Driver) growthCallOnce(ctx context.Context, creds *Creds, method, path 
 			return nil, err
 		}
 		rdr = bytes.NewReader(raw)
+	} else if method == http.MethodPost {
+		rdr = bytes.NewReader([]byte("{}"))
 	}
 	base := d.chatBase(creds)
 	req, err := http.NewRequestWithContext(ctx, method, base+path, rdr)
@@ -159,7 +163,10 @@ func (d *Driver) growthCallOnce(ctx context.Context, creds *Creds, method, path 
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("User-Agent", desktopUA)
-	req.Header.Set("X-Domain", base)
+	// BP-175: X-Domain is the naked host (no scheme), and every growth
+	// request carries a random 32-hex X-Request-ID.
+	req.Header.Set("X-Domain", nakedHost(base))
+	req.Header.Set("X-Request-ID", randomHex())
 	req.Header.Set("X-Product", "SaaS")
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)

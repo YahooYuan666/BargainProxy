@@ -156,6 +156,9 @@ type qoderMessage struct {
 	Content             string               `json:"content"`
 	ResponseMeta        responseMeta         `json:"response_meta"`
 	ReasoningContentSig string               `json:"reasoning_content_signature"`
+	// ReasoningContent (BP-172) is an earlier assistant turn's thinking, as
+	// Qoder's own converter sets it. Empty/blank stays off the wire.
+	ReasoningContent string `json:"reasoning_content,omitempty"`
 	Contents            []contentPart        `json:"contents,omitempty"`
 	ToolCalls           []normalizedToolCall `json:"tool_calls,omitempty"`
 	Name                string               `json:"name,omitempty"`
@@ -178,6 +181,24 @@ func buildUserMessage(text string, images []string) qoderMessage {
 
 func buildStructuredMessage(role, text string) qoderMessage {
 	return qoderMessage{Role: role, Content: text, ResponseMeta: blankResponseMeta()}
+}
+
+// applyReasoning copies an assistant message's historical thinking onto the
+// qoder message (BP-172). Only non-blank text rides the wire, and the field
+// is set ONLY on assistant turns — the official client sends none back for
+// anything else.
+func applyReasoning(message map[string]interface{}, msg *qoderMessage) {
+	if msg == nil || msg.Role != "assistant" {
+		return
+	}
+	rc, _ := message["reasoning_content"].(string)
+	if strings.TrimSpace(rc) == "" {
+		rc, _ = message["reasoning"].(string)
+	}
+	if strings.TrimSpace(rc) == "" {
+		return
+	}
+	msg.ReasoningContent = rc
 }
 
 // ---- OpenAI 消息规范化 ----
@@ -585,10 +606,12 @@ func convertIncomingMessage(message map[string]interface{}, toolsEnabled, allowS
 		}
 		msg := buildStructuredMessage("assistant", content)
 		msg.ToolCalls = structuredToolCalls
+		applyReasoning(message, &msg)
 		return &msg
 	}
 	if role == "assistant" && anyToolCalls != nil && !allowStructuredToolCalls {
 		msg := buildStructuredMessage("assistant", summarizeUnresolvedToolCalls(anyToolCalls))
+		applyReasoning(message, &msg)
 		return &msg
 	}
 
@@ -636,6 +659,7 @@ func convertIncomingMessage(message map[string]interface{}, toolsEnabled, allowS
 		return &msg
 	}
 	msg := buildStructuredMessage(role, text)
+	applyReasoning(message, &msg)
 	return &msg
 }
 

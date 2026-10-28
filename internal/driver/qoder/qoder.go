@@ -760,6 +760,13 @@ func irPayload(call driver.ChatCall) (map[string]any, error) {
 		if m.ToolCallID != "" {
 			wire["tool_call_id"] = m.ToolCallID
 		}
+		// BP-172: an earlier assistant turn's thinking rides back as
+		// reasoning_content — Qoder's own client sends it that way
+		// (plugins qoder 0.2.42, ae48bf0), and without it the model never
+		// sees what it thought before its tool calls.
+		if m.Reasoning != "" && m.Role == ir.RoleAssistant {
+			wire["reasoning_content"] = m.Reasoning
+		}
 		msgs = append(msgs, wire)
 	}
 	payload := map[string]any{"model": call.UpstreamModel, "messages": msgs, "stream": true}
@@ -1501,6 +1508,18 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 			}
 		case "CLAIMED":
 			if active {
+				// BP-174 (plugins 0.2.43, b7bbc9d): a CLAIMED campaign whose
+				// window STARTED before today's 10:00 UTC+8 refresh is
+				// YESTERDAY's share — the daily credits refresh at 10:00, so
+				// a slot that runs before 10:00 (or one that only ever saw
+				// yesterday's window) must not settle the day as done, or
+				// today's share is lost to the idempotent ledger. Fall
+				// through to the not-yet-claimable retryable answer and let
+				// a later slot claim today's. Unknown startAt keeps the old
+				// behaviour (the claim endpoint is idempotent anyway).
+				if start > 0 && start < qoderDailyRefreshUnix(time.Unix(now, 0)) {
+					break
+				}
 				return true, campaignBenefit(c), true, nil
 			}
 		}
@@ -1554,6 +1573,15 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 	// today" — a landed +100 that read as if nothing had been claimed.)
 	// The day is still settled: the ok status locks the later slots.
 	return false, reward, true, nil
+}
+
+// qoderDailyRefreshUnix is the start of TODAY's daily-credit window: 10:00
+// UTC+8, fixed to the campaigns' own zone regardless of the host clock
+// (BP-174; the refresh time was read live on 2026-10-26).
+func qoderDailyRefreshUnix(now time.Time) int64 {
+	loc := time.FixedZone("UTC+8", 8*3600)
+	y, m, d := now.In(loc).Date()
+	return time.Date(y, m, d, 10, 0, 0, 0, loc).Unix()
 }
 
 // campaignRetryableError marks "the programme exists but today's share is not

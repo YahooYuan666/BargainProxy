@@ -40,8 +40,11 @@ func TestRefreshUsesRealEndpointAndHeader(t *testing.T) {
 	if gotHeader != "test-refresh-value" {
 		t.Fatalf("X-Refresh-Token = %q, want the stored refresh token", gotHeader)
 	}
-	if gotBody != "" {
-		t.Fatalf("refresh body = %q, want empty (token travels in the header)", gotBody)
+	// BP-175 (misakano 8ecf115a, real-device capture): the body is the 2-byte
+	// "{}" — Content-Length 2, never empty. The token still travels in the
+	// header.
+	if gotBody != "{}" {
+		t.Fatalf("refresh body = %q, want {} (token travels in the header)", gotBody)
 	}
 
 	creds, err := ParseCreds(acc.CredsJSON)

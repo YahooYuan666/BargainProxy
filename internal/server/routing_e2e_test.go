@@ -322,10 +322,13 @@ func TestEmptyPoolBindingSkippedWithoutFallbackWait(t *testing.T) {
 
 // TestQueueFullUpstreamBusyNoRotation: a CodeBuddy queue-full (429 + 6021)
 // from the first binding must NOT rotate into the next account/binding —
-// rotating at request pace against one full queue is the miskill failure
-// mode. The client gets 503 upstream_busy, the sibling channel sees zero
-// traffic, the account state stays clean, and the channel+model pause makes
-// the next request fail fast without touching any upstream until it expires.
+// rotating ACROSS accounts against one full queue is the miskill failure
+// mode. BP-169 (user option A, misakano f07eba54): the SAME lease is retried
+// in-request with a short backoff (3 upstream calls total — queue signals
+// are intermittent, two accounts recovered within 33s), and the terminal is
+// 429 + Retry-After (the WorkBuddy CLI auto-resends on 429 and ABORTS on
+// 503). The sibling channel sees zero traffic, the account state stays
+// clean, and the channel+model pause makes the next request fail fast.
 func TestQueueFullUpstreamBusyNoRotation(t *testing.T) {
 	var traeHits, wbHits int
 	traeUp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -344,13 +347,14 @@ func TestQueueFullUpstreamBusyNoRotation(t *testing.T) {
 	srv, p := buildCrossChannelServer(t, traeUp, wbUp)
 	// Pin workbuddy: it is the lower-priority binding here, and pinning keeps
 	// trae out of the picture entirely (the rotation we are proving absent is
-	// workbuddy's own single-account retry plus any cross-binding cascade).
+	// workbuddy's own cross-account rotation plus any cross-binding cascade).
 	body := `{"model":"channel:workbuddy:glm-5.3","messages":[{"role":"user","content":"hi"}]}`
 
 	resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
+	retryAfter := resp.Header.Get("Retry-After")
 	var errBody struct {
 		Error struct {
 			Message string `json:"message"`
@@ -359,15 +363,18 @@ func TestQueueFullUpstreamBusyNoRotation(t *testing.T) {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&errBody)
 	resp.Body.Close()
-	if resp.StatusCode != 503 {
-		t.Fatalf("queue-full must surface 503, got %d (%+v)", resp.StatusCode, errBody)
+	if resp.StatusCode != 429 {
+		t.Fatalf("queue-full must surface 429 with Retry-After, got %d (%+v)", resp.StatusCode, errBody)
 	}
 	if errBody.Error.Code != "upstream_busy" {
 		t.Fatalf("error code = %q, want upstream_busy", errBody.Error.Code)
 	}
-	// No rotation: exactly one wb attempt, zero trae.
-	if wbHits != 1 || traeHits != 0 {
-		t.Fatalf("queue-full must not rotate: wbHits=%d traeHits=%d", wbHits, traeHits)
+	if retryAfter == "" {
+		t.Fatal("429 must carry Retry-After (the CLI auto-resends on it)")
+	}
+	// Same-lease backoff retries, zero cross-account/cross-channel rotation.
+	if wbHits != 3 || traeHits != 0 {
+		t.Fatalf("queue-full must retry only the same lease: wbHits=%d (want 3) traeHits=%d (want 0)", wbHits, traeHits)
 	}
 
 	// Account state machine untouched (the miskill axis).
@@ -385,7 +392,7 @@ func TestQueueFullUpstreamBusyNoRotation(t *testing.T) {
 		t.Fatalf("retry post: %v", err)
 	}
 	resp2.Body.Close()
-	if resp2.StatusCode != 429 || wbHits != 1 || traeHits != 0 {
+	if resp2.StatusCode != 429 || wbHits != 3 || traeHits != 0 {
 		t.Fatalf("paused retry must fail fast 429 without upstream hits: status=%d wbHits=%d traeHits=%d", resp2.StatusCode, wbHits, traeHits)
 	}
 
