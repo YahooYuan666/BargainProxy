@@ -50,6 +50,7 @@ func (s *Server) WithPanel(p PanelMounter) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", s.auth(s.handleChatCompletions))
+	mux.HandleFunc("POST /v1/images/generations", s.auth(s.handleImages))
 	mux.HandleFunc("GET /v1/models", s.auth(s.handleModels))
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.MountProtocols(mux)

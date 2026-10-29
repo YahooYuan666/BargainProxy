@@ -152,17 +152,17 @@ func blankResponseMeta() responseMeta { return responseMeta{} }
 
 // qoderMessage 网关消息（字段顺序对齐 Python 参考实现）。
 type qoderMessage struct {
-	Role                string               `json:"role"`
-	Content             string               `json:"content"`
-	ResponseMeta        responseMeta         `json:"response_meta"`
-	ReasoningContentSig string               `json:"reasoning_content_signature"`
+	Role                string       `json:"role"`
+	Content             string       `json:"content"`
+	ResponseMeta        responseMeta `json:"response_meta"`
+	ReasoningContentSig string       `json:"reasoning_content_signature"`
 	// ReasoningContent (BP-172) is an earlier assistant turn's thinking, as
 	// Qoder's own converter sets it. Empty/blank stays off the wire.
-	ReasoningContent string `json:"reasoning_content,omitempty"`
-	Contents            []contentPart        `json:"contents,omitempty"`
-	ToolCalls           []normalizedToolCall `json:"tool_calls,omitempty"`
-	Name                string               `json:"name,omitempty"`
-	ToolCallID          string               `json:"tool_call_id,omitempty"`
+	ReasoningContent string               `json:"reasoning_content,omitempty"`
+	Contents         []contentPart        `json:"contents,omitempty"`
+	ToolCalls        []normalizedToolCall `json:"tool_calls,omitempty"`
+	Name             string               `json:"name,omitempty"`
+	ToolCallID       string               `json:"tool_call_id,omitempty"`
 }
 
 func buildUserMessage(text string, images []string) qoderMessage {

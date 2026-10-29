@@ -12,20 +12,24 @@ import (
 	"bargainproxy/internal/protocol/openai"
 )
 
-// BP-158: the fingerprint must match the CURRENT desktop builds (magpie
-// 74dcf40a, diffed against both update feeds on 2026-10-28) — CN 5.9.3 with
-// CLI 2.165.0, international 5.8.4 with CLI 2.161.0.
+// BP-158/BP-197: the fingerprint must match the CURRENT desktop builds —
+// 2026-10-28: CN 5.9.3 with CLI 2.165.0, international 5.8.4 with CLI
+// 2.161.0; 2026-10-29 (BP-197, magpie 17114b5 + plugins b08a6c1) the
+// international feed moved to the same 5.9.3 / CLI 2.165.0 pair, so the two
+// realms now ship the same versions.
 func TestBP158Fingerprints(t *testing.T) {
 	if !strings.Contains(desktopUA, "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0") {
 		t.Fatalf("CN UA = %q, want the 5.9.3 / CLI 2.165.0 build", desktopUA)
 	}
-	if !strings.Contains(desktopUAGlobal, "WorkBuddy/5.8.4 workbuddy-ai/5.8.4 CLI/2.161.0") {
-		t.Fatalf("global UA = %q, want the 5.8.4 / CLI 2.161.0 build", desktopUAGlobal)
+	if !strings.Contains(desktopUAGlobal, "WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0") {
+		t.Fatalf("global UA = %q, want the 5.9.3 / CLI 2.165.0 build (BP-197)", desktopUAGlobal)
 	}
 }
 
-// BP-158: X-Agent-Runtime is a 5.9 CN-only header — the international 5.8.4
-// build sends none, so sending it to the global edge would be a tell.
+// BP-158/BP-197: X-Agent-Runtime is a 5.9 header. It was CN-only on the
+// 5.8.4 international build (BP-158); the international feed has since
+// moved to the same 5.9.3 build and sends it too, so BOTH realms must carry
+// it now.
 func TestBP158AgentRuntimeCNOnly(t *testing.T) {
 	d := testDriver("http://unused")
 	orig := d.cfg.WebBaseCN
@@ -52,8 +56,8 @@ func TestBP158AgentRuntimeCNOnly(t *testing.T) {
 
 	greq := mkReq()
 	d.applyClientFingerprint(greq, mustGlobalCreds(t), call)
-	if greq.Header.Get("X-Agent-Runtime") != "" {
-		t.Fatalf("global X-Agent-Runtime = %q, want absent", greq.Header.Get("X-Agent-Runtime"))
+	if greq.Header.Get("X-Agent-Runtime") != "local-agent" {
+		t.Fatalf("global X-Agent-Runtime = %q, want local-agent (BP-197: the 5.9.3 international build sends it)", greq.Header.Get("X-Agent-Runtime"))
 	}
 	if greq.Header.Get("X-Stainless-Timeout") != "1200" {
 		t.Fatalf("global X-Stainless-Timeout = %q, want 1200", greq.Header.Get("X-Stainless-Timeout"))

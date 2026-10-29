@@ -1,6 +1,9 @@
 package prompt
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // Tool-schema repair for strict upstreams.
 //
@@ -146,4 +149,122 @@ func inferEnumType(vals []any) string {
 		}
 	}
 	return kind
+}
+
+// maxRefDepth bounds nested $ref expansion so a $defs cycle (X -> Y -> X)
+// stops instead of running forever; the deepest ref is left as-is.
+const maxRefDepth = 32
+
+// ExpandLocalRefs resolves local "$ref": "#/$defs/Name" pointers inline and
+// strips the root "$defs"/"definitions" table. Kimi answers 400 to any tool
+// schema still carrying a $ref (misakano 854e74cd, 2026-10-29), and MCP tool
+// definitions share their branches through exactly such refs — so nothing is
+// dropped or trimmed, every node is expanded in place.
+//
+// Pointers are resolved against the ROOT document's defs table (JSON Schema
+// pointers are root-anchored); nested defs tables inside branches register
+// into the same pool so local shorthands keep working. A pointer that cannot
+// be resolved stays as-is for the upstream to complain about, same as before.
+// It reports whether anything changed.
+func ExpandLocalRefs(schema any) bool {
+	root, ok := schema.(map[string]any)
+	if !ok {
+		return false
+	}
+	defs := map[string]any{}
+	for _, key := range []string{"$defs", "definitions"} {
+		if m, ok := root[key].(map[string]any); ok {
+			for name, def := range m {
+				if _, dup := defs[name]; !dup {
+					defs[name] = def
+				}
+			}
+			delete(root, key)
+		}
+	}
+	if len(defs) == 0 {
+		return false
+	}
+	return resolveRefs(root, defs, 0)
+}
+
+// resolveRefs walks a schema value replacing every resolvable local $ref
+// with a deep copy of its target. Sibling keys a caller set next to $ref
+// survive: the target's keys are merged over them.
+func resolveRefs(v any, defs map[string]any, depth int) bool {
+	if depth > maxRefDepth {
+		return false
+	}
+	changed := false
+	switch t := v.(type) {
+	case map[string]any:
+		if ref, ok := t["$ref"].(string); ok {
+			if def, ok := lookupLocalRef(defs, ref); ok {
+				for k := range t {
+					delete(t, k)
+				}
+				if cp := deepCopyJSON(def); cp != nil {
+					if m, ok := cp.(map[string]any); ok {
+						for k, kv := range m {
+							t[k] = kv
+						}
+					}
+				}
+				changed = true
+				// The expanded body may itself carry refs (defs referencing
+				// defs); one more pass at a deeper bound unwinds them.
+				if resolveRefs(t, defs, depth+1) {
+					changed = true
+				}
+				return changed
+			}
+		}
+		for k, sub := range t {
+			if k == "$ref" {
+				continue
+			}
+			if resolveRefs(sub, defs, depth) {
+				changed = true
+			}
+		}
+	case []any:
+		for _, sub := range t {
+			if resolveRefs(sub, defs, depth) {
+				changed = true
+			}
+		}
+	}
+	return changed
+}
+
+// lookupLocalRef resolves "#/$defs/Name" and "#/definitions/Name". Only
+// shallow, local pointers are handled — remote and deeper pointers stay
+// untouched (JSON-pointer ~0/~1 escapes are rare in MCP tool names and are
+// left unresolved by design).
+func lookupLocalRef(defs map[string]any, ref string) (any, bool) {
+	rest, ok := strings.CutPrefix(ref, "#/")
+	if !ok {
+		return nil, false
+	}
+	rest = strings.TrimPrefix(rest, "$defs/")
+	rest = strings.TrimPrefix(rest, "definitions/")
+	if rest == "" || strings.ContainsAny(rest, "/~") {
+		return nil, false
+	}
+	v, ok := defs[rest]
+	return v, ok
+}
+
+// deepCopyJSON clones a JSON-shaped value so two $ref sites never share one
+// expanded subtree (an in-place edit through one would corrupt the other).
+func deepCopyJSON(v any) any {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var out any
+	if json.Unmarshal(b, &out) != nil {
+		return nil
+	}
+	return out
 }

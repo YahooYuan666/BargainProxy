@@ -12,12 +12,13 @@ package workbuddy
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
-	"compress/gzip"
 	"fmt"
 	"io"
 	"log"
@@ -474,6 +475,16 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool
 				params := t.Parameters
 				if prompt.FixEnumTypes(params) {
 					log.Printf("workbuddy: typed enum(s) in tool %q schema", t.Name)
+				}
+				// BP-191 (misakano 854e74cd): Kimi rejects a request whose
+				// tool schema still carries "$ref" — MCP definitions share
+				// their branches through "#/$defs/…". Resolve them inline at
+				// the root, dropping no tool (the upstream has no name-based
+				// trimming either). CN realm only: the international Kimi has
+				// no field evidence, and the expansion is a rewrite the
+				// global edge never asked for.
+				if creds.RealmOrDefault() != "global" && kimiRouted(call.UpstreamModel) && prompt.ExpandLocalRefs(params) {
+					log.Printf("workbuddy: expanded $defs refs in tool %q schema", t.Name)
 				}
 				fn["parameters"] = params
 			}
@@ -979,6 +990,16 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		return uperr.New(uperr.ClassAccountRestricted, 403, "workbuddy: account restricted by upstream: %s", msg)
 	case codeSessionDead:
 		return uperr.New(uperr.ClassAuth, 401, "workbuddy: %s", msg)
+	case 1001, 1002, 1003, 10001, 14001:
+		// BP-201 (plugins 3f73907): the meter checkin's own refusal family —
+		// 1001 already checked in, 1002 not eligible today, 1003 activity not
+		// open (10001/14001 are the historical already-checked-in pair,
+		// ticket 30). None of the family is fixable by a retry;
+		// IsAlreadyCheckin reads the code so the task ledger records the
+		// day's done state instead of a failure.
+		e := uperr.New(uperr.ClassBadRequest, 400, "workbuddy: checkin not claimable: %s", msg)
+		e.Code = fmt.Sprint(code)
+		return e
 	default:
 		// Business-code branch runs before the status fallbacks, so a
 		// request-level rejection must be recognized HERE too — otherwise
@@ -1110,13 +1131,12 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 	req.Header.Set("X-IDE-Name", "WorkBuddy")
 	req.Header.Set("X-IDE-Type", "WorkBuddy")
 	req.Header.Set("X-IDE-Version", workBuddyClientVersion(global))
-	// BP-158: WorkBuddy 5.9's desktop local transport announces the agent
-	// runtime; the international 5.8.4 build sends no such header (magpie
-	// 74dcf40a, diffed against both update feeds). Adding it to the global
-	// edge would be a fingerprint of its own.
-	if !global {
-		req.Header.Set("X-Agent-Runtime", "local-agent")
-	}
+	// BP-158/BP-197: WorkBuddy 5.9's desktop local transport announces the
+	// agent runtime. Originally only the CN build sent it (BP-158); the
+	// international feed has since moved to the same 5.9.3 build and sends
+	// it too (magpie 17114b5, plugins b08a6c1, 2026-10-29) — keeping the
+	// global lane silent would now be the stale fingerprint.
+	req.Header.Set("X-Agent-Runtime", "local-agent")
 	// BP-144: a key account is personal with no domain and no enterprise, and
 	// the CLI sends neither — an X-Domain on a key request is a shape upstream
 	// never sees from its own client.
@@ -1128,6 +1148,13 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 		req.Header.Set("X-User-Id", apiKeyUserID(creds.APIKey))
 	} else if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
+	} else if uid := uidFromJWT(creds.AccessToken); uid != "" {
+		// BP-206 (Coding2API bd48203): the official client sends X-User-Id on
+		// every request; an account imported by access token alone has no
+		// stored UID, and a chat without the header is an automation tell of
+		// its own. The JWT "sub" claim is the same identity the login flow
+		// stores as UID.
+		req.Header.Set("X-User-Id", uid)
 	}
 	// Browser/CLI-shaped headers the desktop client never sends on chat:
 	// Origin, Referer, Accept-Language, X-Machine-ID, X-Session-ID,
@@ -1293,6 +1320,13 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	case status == 429 || strings.Contains(lower, "rate") || strings.Contains(lower, "limit"):
 		e := uperr.New(uperr.ClassSoftRate, status, "workbuddy: %s", truncate(body, 300))
 		e.ResetAt = parseResetWallClock(text)
+		// BP-189 (misakano 22868bbf, PR #114): a plain soft rate limit binds to
+		// the MODEL, not the account — production showed one model's wall
+		// cooling the same account's other models with it. The pool falls back
+		// to an account rest when no model is known (the billing call).
+		if upstreamModel != "" {
+			e.Model = upstreamModel
+		}
 		return e
 	case status == 403:
 		if uperr.IsEdgeBlock(body) {
@@ -1521,8 +1555,10 @@ func parsePackages(raw []byte) ([]driver.Package, error) {
 // IsAlreadyCheckin reports whether err is the upstream's idempotent
 // "already checked in today" rejection: a duplicate daily checkin gets
 // code=10001/14001 with the reason in the message (已签到 / "already").
-// Callers treat it as success — the task ledger used to record a FAILED row
-// for every repeat slot of the day (ticket 30).
+// BP-201 (plugins 3f73907) adds the meter activity's own family: 1001
+// already checked in, 1002 not eligible, 1003 not open — none fixable by a
+// retry. Callers treat all of them as success — the task ledger used to
+// record a FAILED row for every repeat slot of the day (ticket 30).
 func IsAlreadyCheckin(err error) bool {
 	if err == nil {
 		return false
@@ -1531,20 +1567,95 @@ func IsAlreadyCheckin(err error) bool {
 	if !ok {
 		return false
 	}
+	switch ue.Code {
+	case "1001", "1002", "1003", "10001", "14001":
+		return true
+	}
 	if strings.Contains(ue.Message, "已签到") {
 		return true
 	}
 	return strings.Contains(strings.ToLower(ue.Message), "already")
 }
 
-// Checkin performs the daily checkin (idempotent upstream-side).
+// checkinStatusPath is the meter activity precheck (BP-201, plugins
+// 3f73907): claiming while the activity is not configured used to answer a
+// 10001-styled exception every single day; the status endpoint tells
+// whether the day is claimable at all.
+const checkinStatusPath = "/v2/billing/meter/checkin-activity-status"
+
+// Checkin performs the daily checkin. BP-201: the activity status is asked
+// first — only an active, not-yet-checked-in day earns a claim POST. A
+// precheck failure must not block the claim itself (the endpoint is newer
+// than some deployments), and a 200 body carrying {"code":10000} is the
+// upstream's own transient marker, retried twice.
 func (d *Driver) Checkin(ctx context.Context, acc *model.Account) error {
 	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
-	_, err = d.billingCall(ctx, creds, "/v2/billing/meter/daily-checkin", map[string]any{}, 0)
-	return err
+	if active, done, err := d.checkinActivityStatus(ctx, creds); err == nil {
+		if !active {
+			log.Printf("workbuddy: checkin activity inactive, no claim sent (uid=%s)", creds.UID)
+			return nil
+		}
+		if done {
+			return nil
+		}
+	}
+	const maxTransient = 2
+	for attempt := 0; ; attempt++ {
+		raw, err := d.billingCall(ctx, creds, "/v2/billing/meter/daily-checkin", map[string]any{}, 0)
+		if err != nil {
+			return err
+		}
+		if code := checkinBodyCode(raw); code == 10000 && attempt < maxTransient {
+			time.Sleep(300 * time.Millisecond)
+			continue
+		}
+		return nil
+	}
+}
+
+// checkinActivityStatus asks the meter activity precheck. active=false means
+// the deployment has no checkin campaign configured today; done=true means
+// today is already claimed.
+func (d *Driver) checkinActivityStatus(ctx context.Context, creds *Creds) (active, done bool, err error) {
+	raw, err := d.billingCall(ctx, creds, checkinStatusPath, map[string]any{}, 0)
+	if err != nil {
+		return false, false, err
+	}
+	var st struct {
+		Active         *bool `json:"active"`
+		CheckedInSnake bool  `json:"today_checked_in"`
+		CheckedInCamel bool  `json:"todayCheckedIn"`
+	}
+	if json.Unmarshal(raw, &st) != nil {
+		return false, false, fmt.Errorf("checkin status: body not json")
+	}
+	if st.Active != nil {
+		active = *st.Active
+	} else {
+		active = true // an active-less body states no gate: claim as before
+	}
+	return active, st.CheckedInSnake || st.CheckedInCamel, nil
+}
+
+// checkinBodyCode reads a JSON body's business "code" (number or string).
+func checkinBodyCode(raw []byte) int {
+	var doc struct {
+		Code any `json:"code"`
+	}
+	if json.Unmarshal(raw, &doc) != nil {
+		return 0
+	}
+	switch v := doc.Code.(type) {
+	case float64:
+		return int(v)
+	case string:
+		n, _ := strconv.Atoi(v)
+		return n
+	}
+	return 0
 }
 
 // ReportEvent posts a telemetry event to the upstream report endpoint.
@@ -1717,4 +1828,34 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "…"
+}
+
+// kimiRouted reports whether the routed upstream model is a Kimi/Moonshot
+// one (BP-191): the CN edge's Kimi is the backend that rejects $ref-carrying
+// tool schemas.
+var kimiRe = regexp.MustCompile(`kimi|moonshot`)
+
+func kimiRouted(model string) bool {
+	return kimiRe.MatchString(strings.ToLower(model))
+}
+
+// uidFromJWT extracts the "sub" claim of a JWT access token (BP-206). The
+// login flow stores the same identity as UID, so a token-only import loses
+// nothing by deriving it here.
+func uidFromJWT(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return ""
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return ""
+	}
+	var claims struct {
+		Sub string `json:"sub"`
+	}
+	if json.Unmarshal(raw, &claims) != nil {
+		return ""
+	}
+	return claims.Sub
 }

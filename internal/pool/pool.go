@@ -999,6 +999,12 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 	}
 	switch upstreamErr.Class {
 	case uperr.ClassSoftRate:
+		// BP-194 (magpie 87c68c9): a failure reported for an account that is
+		// ALREADY resting must not raise its backoff ladders again — one
+		// request walking its retries through the same account pushed seven
+		// Codex accounts to the 10-minute cap in a single turn upstream. The
+		// rest itself is still set below wherever the branch does so.
+		alreadyResting := now.Before(a.AccountCooldownUntil)
 		until := upstreamErr.ResetAt
 		if until.IsZero() || !until.After(now) {
 			until = now.Add(p.softRateBase(a.BreakerFails))
@@ -1018,7 +1024,9 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// account selectable but put it behind the ones that have not been
 		// limited since (BP-91).
 		p.sinkLocked(a, now)
-		a.BreakerFails++
+		if !alreadyResting {
+			a.BreakerFails++
+		}
 	case uperr.ClassModelRate:
 		m := upstreamErr.Model
 		if m == "" {
@@ -1083,25 +1091,28 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 	case uperr.ClassAccountRestricted:
 		// The upstream has restricted this account (workbuddy 403 code=11140
 		// "request illegal" / "账号存在异常行为，已被限制使用"). No refresh can
-		// fix it, so the account leaves routing entirely: keeping it selectable
-		// is what made a pool of 3 accounts look dead while 1 was healthy
-		// (sticky conversations stayed bound to the banned ones). Disabled is
-		// the honest terminal state — the panel shows it and a human decides
-		// whether to re-login.
+		// fix it NOW, so the account leaves routing: keeping it selectable is
+		// what made a pool of 3 accounts look dead while 1 was healthy
+		// (sticky conversations stayed bound to the banned ones).
 		//
 		// BP-146: this account leaving is NOT permission to walk the rest of
 		// the pool. The ban is per account (or per egress IP when several
-		// accounts share one), so `uperr.Rotatable` now refuses to try another
+		// accounts share one), so `uperr.Rotatable` refuses to try another
 		// account of the same channel inside this request — Coding2API
 		// measured one request leaving a risk record on three accounts, the
-		// third banned three minutes later (f428e33). A second restriction on
-		// this channel inside RestrictedChannelWindow also pauses the whole
+		// third banned three minutes later. A second restriction on this
+		// channel inside RestrictedChannelWindow still pauses the whole
 		// channel briefly: two bans in minutes means the pattern, not the
 		// account, is what upstream is reacting to.
-		a.Disabled = true
+		//
+		// BP-205 (user-observed 2026-10-29): the restriction is NOT terminal —
+		// field history shows the account comes back in about a week. So the
+		// account rests for 7 days instead of being disabled outright: the
+		// panel shows the cooldown with its end time, the account rejoins
+		// routing on its own, and a fresh hit while resting simply pushes the
+		// wall out again (restAccount keeps the later of the two).
+		p.restAccount(a, now.Add(7*24*time.Hour), "restricted by upstream", "fixed", now)
 		a.Paused = false
-		a.AccountCooldownReason = "restricted by upstream"
-		a.AccountCooldownBy = "human"
 		a.ConsecutiveFails = 0
 		a.BreakerFails = 0
 		if a.ModelCooldowns != nil {
@@ -1185,7 +1196,12 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		}
 		return
 	default:
-		a.ConsecutiveFails++
+		// BP-194: the same no-double-count guard the SoftRate branch has —
+		// retries of one request against a resting account must not climb the
+		// ladder the rest exists to enforce.
+		if !now.Before(a.AccountCooldownUntil) {
+			a.ConsecutiveFails++
+		}
 	}
 	a.UpdatedAt = now
 	p.changedLocked(a)

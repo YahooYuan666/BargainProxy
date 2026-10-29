@@ -251,9 +251,8 @@ func TestCheckinFlow(t *testing.T) {
 // BP-98 TRAE-3: a PERMANENT business refusal is upstream's answer about today
 // — it answers the same however often it is asked, so it fails on the FIRST
 // claim; the retry loop is for 5xx/transport only (yetone/magpie#808: three
-// 20s waits per account per slot bought nothing). BP-135 split the RUSH
-// wording off: 9074 "参与用户太多" retries with a wider delay — see
-// TestCheckin9074RushRetries.
+// 20s waits per account per slot bought nothing). BP-204 extended this to the
+// WHOLE 9074 family — see TestCheckin9074FailsFastEverywhere.
 func TestCheckinClaimBusinessCodeRetriesThenFails(t *testing.T) {
 	old := checkinRetryDelay
 	checkinRetryDelay = time.Millisecond
@@ -479,58 +478,13 @@ func TestBadRequest4001Classified(t *testing.T) {
 	}
 }
 
-// BP-135: 9074 "当前参与用户太多，请稍后再试" is the check-in RUSH answer —
-// the upstream itself asks for a later retry, and the money is still there.
-// It failed the task three days running at the 01:00 slot because the whole
-// 9074 family was treated as permanent. The rush wording now retries with the
-// wider delay and claims on a calm attempt.
-func TestCheckin9074RushRetriesThenClaims(t *testing.T) {
-	oldRush := checkinRushRetryDelay
-	checkinRushRetryDelay = time.Millisecond
-	defer func() { checkinRushRetryDelay = oldRush }()
-	claims := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/trae/api/v2/ug/checkin_credits/status":
-			// BP-147: after the claim lands the status page reports the day
-			// as checked in and carries the new balance.
-			if claims > 0 {
-				fmt.Fprint(w, `{"checked_in":true,"credits":200,"enable":true}`)
-				return
-			}
-			fmt.Fprint(w, `{"checked_in":false,"credits":100,"enable":true}`)
-		case "/trae/api/v2/ug/checkin_credits/claim":
-			claims++
-			if claims == 1 {
-				fmt.Fprint(w, `{"code":9074,"message":"当前参与用户太多，请稍后再试"}`)
-				return
-			}
-			fmt.Fprint(w, `{}`)
-		default:
-			t.Errorf("unexpected path %s", r.URL.Path)
-		}
-	}))
-	defer srv.Close()
-
-	d := testDriver(srv.URL, srv.URL)
-	checked, credits, enable, err := d.Checkin(context.Background(), testAccount())
-	if err != nil {
-		t.Fatalf("checkin: %v", err)
-	}
-	if !checked || credits != 200 || !enable {
-		t.Fatalf("checkedIn=%v credits=%d enable=%v, want true/200/true (post-claim balance)", checked, credits, enable)
-	}
-	if claims != 2 {
-		t.Fatalf("claim attempts = %d, want 2 (one rush refusal, then the claim)", claims)
-	}
-}
-
-// ...and the rush retry is BOUNDED: a rush that never clears still surfaces as
-// a failure after the attempts are spent (the ledger row says why).
-func TestCheckin9074RushExhausts(t *testing.T) {
-	oldRush := checkinRushRetryDelay
-	checkinRushRetryDelay = time.Millisecond
-	defer func() { checkinRushRetryDelay = oldRush }()
+// TestCheckin9074FailsFastEverywhere (BP-204, magpie-community/plugins
+// 644038d): 9074 is the DEVICE refusal — Trae takes one check-in per device
+// per day, and the "参与用户太多" wording does not make it a rush-hour answer
+// (BP-135's three 01:00 failures in a row fit the device reading, not the
+// rush one; plugins#436 measured the shared-device case). No waiting retry:
+// the claim is asked once, the task row fails with the code.
+func TestCheckin9074FailsFastEverywhere(t *testing.T) {
 	claims := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -546,12 +500,12 @@ func TestCheckin9074RushExhausts(t *testing.T) {
 	defer srv.Close()
 
 	d := testDriver(srv.URL, srv.URL)
-	_, _, _, err := d.Checkin(context.Background(), testAccount())
-	if err == nil {
-		t.Fatal("a rush that never clears must still fail the task (honestly)")
+	checked, _, _, err := d.Checkin(context.Background(), testAccount())
+	if err == nil || checked {
+		t.Fatalf("a 9074 device refusal must fail the task, got checked=%v err=%v", checked, err)
 	}
-	if claims != 3 {
-		t.Fatalf("claim attempts = %d, want 3 (the retry budget)", claims)
+	if claims != 1 {
+		t.Fatalf("claim attempts = %d, want 1 (no rush retry)", claims)
 	}
 	if !strings.Contains(err.Error(), "9074") {
 		t.Fatalf("error should carry the business code: %v", err)

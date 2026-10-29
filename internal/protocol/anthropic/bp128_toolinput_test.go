@@ -15,7 +15,7 @@ func TestToolArgumentsKeepLargeIntegers(t *testing.T) {
 	const big = `{"id":9007199254740993,"note":"keep me"}`
 	resp := &ir.ChatResponse{
 		Message: ir.Message{
-			Role: ir.RoleAssistant,
+			Role:      ir.RoleAssistant,
 			ToolCalls: []ir.ToolCall{{ID: "t1", Name: "lookup", Arguments: big}},
 		},
 	}

@@ -67,6 +67,26 @@ type PackagesProber interface {
 	CreditPackages(ctx context.Context, acc *model.Account) ([]Package, error)
 }
 
+// ImagePart is one generated picture: base64 (no data: prefix) plus its MIME.
+type ImagePart struct {
+	MIME string `json:"mime"`
+	B64  string `json:"b64"`
+}
+
+// ImageResult is the outcome of one text-to-image upstream call. Images and
+// Text are mutually exclusive in practice: an upstream that refuses the prompt
+// explains itself in text instead of sending pixels.
+type ImageResult struct {
+	Images []ImagePart
+	Text   string // refusal / explanation when no image came back
+}
+
+// ImageGenerator is implemented by drivers that can produce images from a
+// text prompt (optional capability; served through /v1/images/generations).
+type ImageGenerator interface {
+	GenerateImage(ctx context.Context, acc *model.Account, modelName, prompt string) (*ImageResult, error)
+}
+
 // Refresher refreshes credentials (OAuth / device tokens).
 type Refresher interface {
 	Refresh(ctx context.Context, acc *model.Account) error

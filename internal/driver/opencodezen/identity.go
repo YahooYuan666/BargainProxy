@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -76,17 +77,107 @@ func gateToolSchema(name string) map[string]any {
 
 // --- OpenCode environment block ---------------------------------------------
 
-// zenEnvironment is OpenCode's environment block: every OpenCode prompt ends
-// with `<env>…Working directory:…</env>`, and Zen's free tier serves a
-// request as OpenCode's own only when one of its SYSTEM messages carries it
-// (magpie zen-free 0.1.15, live 2026-10-25 against deepseek-v4.1-flash-free
-// and glm-5.3-flash-free). A request without one gets a small daily
-// allowance, then 429 FreeUsageLimitError until 00:00 UTC, whatever its
-// headers say. In a user message or a tool description it does not count,
-// and `<ENV>` / `working directory:` don't either. The directory isn't known
-// here, so it is told as unknown rather than as a path that would mislead
-// the model.
-const zenEnvironment = "<env>\n  Working directory: unknown\n</env>"
+// zenEnvironmentFor renders the env block with a REAL working directory.
+// Since 2026-10-29 (magpie-community/plugins 1f56706) the upstream
+// fingerprints the literal "Working directory: unknown" as a proxy's
+// constant and answers 429 FreeUsageLimitError to it, so the block must
+// carry a directory a real client would: extracted from the request's own
+// texts (OpenCode's `<cwd>…</cwd>`, or a "Working directory: …" line), else
+// this process's working directory, else the user's home. The 10-25 reading
+// — "the directory isn't known here, so say unknown rather than a path that
+// would mislead the model" — is exactly what the gate now refuses.
+func zenEnvironmentFor(body map[string]any) string {
+	dir := extractWorkingDir(body)
+	if dir == "" {
+		if wd, err := os.Getwd(); err == nil && wd != "" {
+			dir = wd
+		}
+	}
+	if dir == "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			dir = home
+		}
+	}
+	if dir == "" {
+		dir = "." // nothing derivable: the current-directory shorthand
+	}
+	return "<env>\n  Working directory: " + dir + "\n</env>"
+}
+
+var (
+	zenCwdRe         = regexp.MustCompile(`<cwd>([^<\n]{1,300})</cwd>`)
+	zenWorkDirLineRe = regexp.MustCompile(`(?m)^\s*Working directory:[ \t]*(\S[^\n]{0,300})`)
+)
+
+// extractWorkingDir digs a working directory out of the request's own texts:
+// OpenCode embeds `<cwd>…</cwd>` in its env block, other harnesses write a
+// "Working directory: …" line. The literal "unknown" is skipped — it is what
+// the upstream now punishes.
+func extractWorkingDir(body map[string]any) string {
+	texts := zenScanTexts(body)
+	for _, re := range []*regexp.Regexp{zenCwdRe, zenWorkDirLineRe} {
+		for _, s := range texts {
+			if m := re.FindStringSubmatch(s); m != nil {
+				if dir := strings.TrimSpace(m[1]); dir != "" && !strings.EqualFold(dir, "unknown") {
+					return dir
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// zenScanTexts collects the request's own text values, system messages (and
+// the Responses instructions) first: that is where a real client's env block
+// lives. Nothing is copied — the strings are borrowed for matching only.
+func zenScanTexts(body map[string]any) []string {
+	var system, rest []string
+	if s, ok := body["instructions"].(string); ok && s != "" {
+		system = append(system, s)
+	}
+	switch msgs := body["messages"].(type) {
+	case []map[string]any:
+		for _, mm := range msgs {
+			role, _ := mm["role"].(string)
+			if role == "system" {
+				appendTextInto(&system, mm["content"])
+			} else {
+				appendTextInto(&rest, mm["content"])
+			}
+		}
+	case []any:
+		for _, m := range msgs {
+			mm, ok := m.(map[string]any)
+			if !ok {
+				continue
+			}
+			role, _ := mm["role"].(string)
+			if role == "system" {
+				appendTextInto(&system, mm["content"])
+			} else {
+				appendTextInto(&rest, mm["content"])
+			}
+		}
+	}
+	return append(system, rest...)
+}
+
+func appendTextInto(dst *[]string, content any) {
+	switch c := content.(type) {
+	case string:
+		if c != "" {
+			*dst = append(*dst, c)
+		}
+	case []any:
+		for _, p := range c {
+			if pm, ok := p.(map[string]any); ok {
+				if txt, _ := pm["text"].(string); txt != "" {
+					*dst = append(*dst, txt)
+				}
+			}
+		}
+	}
+}
 
 var zenHasEnvironment = regexp.MustCompile(`(?s)<env>.*Working directory:.*</env>`)
 
@@ -96,12 +187,13 @@ var zenHasEnvironment = regexp.MustCompile(`(?s)<env>.*Working directory:.*</env
 // already carries an env block is left alone; with no system message at all
 // one is put first.
 func injectEnvironment(body map[string]any, responsesLane bool) {
+	env := zenEnvironmentFor(body)
 	if responsesLane {
 		s, _ := body["instructions"].(string)
 		if zenHasEnvironment.MatchString(s) {
 			return
 		}
-		body["instructions"] = withEnvironment(s)
+		body["instructions"] = withEnvironment(s, env)
 		return
 	}
 	// The chat build stores messages as []map[string]any (a concrete []any
@@ -118,18 +210,18 @@ func injectEnvironment(body map[string]any, responsesLane bool) {
 				if zenHasEnvironment.MatchString(c) {
 					return
 				}
-				mm["content"] = withEnvironment(c)
+				mm["content"] = withEnvironment(c, env)
 			case []any:
 				if partsHaveEnvironment(c) {
 					return
 				}
-				mm["content"] = append(c, map[string]any{"type": "text", "text": zenEnvironment})
+				mm["content"] = append(c, map[string]any{"type": "text", "text": env})
 			case nil:
-				mm["content"] = zenEnvironment
+				mm["content"] = env
 			}
 			return
 		}
-		body["messages"] = append([]map[string]any{{"role": "system", "content": zenEnvironment}}, msgs...)
+		body["messages"] = append([]map[string]any{{"role": "system", "content": env}}, msgs...)
 	case []any:
 		for _, m := range msgs {
 			mm, ok := m.(map[string]any)
@@ -144,20 +236,20 @@ func injectEnvironment(body map[string]any, responsesLane bool) {
 				if zenHasEnvironment.MatchString(c) {
 					return
 				}
-				mm["content"] = withEnvironment(c)
+				mm["content"] = withEnvironment(c, env)
 			case []any:
 				if partsHaveEnvironment(c) {
 					return
 				}
-				mm["content"] = append(c, map[string]any{"type": "text", "text": zenEnvironment})
+				mm["content"] = append(c, map[string]any{"type": "text", "text": env})
 			case nil:
-				mm["content"] = zenEnvironment
+				mm["content"] = env
 			}
 			return
 		}
-		body["messages"] = append([]any{map[string]any{"role": "system", "content": zenEnvironment}}, msgs...)
+		body["messages"] = append([]any{map[string]any{"role": "system", "content": env}}, msgs...)
 	default:
-		body["messages"] = []any{map[string]any{"role": "system", "content": zenEnvironment}}
+		body["messages"] = []any{map[string]any{"role": "system", "content": env}}
 	}
 }
 
@@ -177,11 +269,11 @@ func partsHaveEnvironment(parts []any) bool {
 
 // withEnvironment appends the block to a system text the way the reference
 // implementation does: `content\n\n<env>…`, or just the block when empty.
-func withEnvironment(content string) string {
+func withEnvironment(content, env string) string {
 	if strings.TrimSpace(content) == "" {
-		return zenEnvironment
+		return env
 	}
-	return content + "\n\n" + zenEnvironment
+	return content + "\n\n" + env
 }
 
 // --- identity: canonical session/request/project ids ---

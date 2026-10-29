@@ -1,8 +1,8 @@
 package workbuddy
 
 import (
-	"compress/gzip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"

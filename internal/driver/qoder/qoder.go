@@ -485,8 +485,10 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 		// BP-167: the upstream can silently bill a different model than the
 		// one requested (qoder2api-hub #105: kmodel_latest recorded as auto).
 		// A warn here makes the mismatch visible in the gateway log without
-		// touching the wire.
-		if usageObj.Model != "" && usageObj.Model != display && usageObj.Model != qoderKey {
+		// touching the wire. BP-207 (qoder2api-hub #113): the upstream often
+		// answers a constant "auto", so the warn is rate-limited to one line
+		// per (requested, billed) pair per hour.
+		if usageObj.Model != "" && usageObj.Model != display && usageObj.Model != qoderKey && billedWarnOnce(display, usageObj.Model) {
 			log.Printf("qoder: upstream billed a different model: requested=%s billed=%s (account=%s)",
 				display, usageObj.Model, call.Account.ID)
 		}
@@ -537,6 +539,52 @@ func mapStop(reason string) ir.StopReason {
 	default:
 		return ir.StopEnd
 	}
+}
+
+// absoluteExpire reads an absolute expiry (BP-202): a JSON number past 1e12
+// is epoch millis, past 1e9 epoch seconds; a JSON string is parsed as a date.
+// Anything else — absent, zero, garbage — is no answer and returns zero.
+func absoluteExpire(raws ...json.RawMessage) time.Time {
+	for _, r := range raws {
+		if len(r) == 0 || string(r) == "null" {
+			continue
+		}
+		var n int64
+		if json.Unmarshal(r, &n) == nil {
+			switch {
+			case n >= 1e12:
+				return time.UnixMilli(n)
+			case n >= 1e9:
+				return time.UnixMilli(n * 1000)
+			}
+			continue
+		}
+		var s string
+		if json.Unmarshal(r, &s) == nil && s != "" {
+			for _, layout := range []string{time.RFC3339, "2006-01-02 15:04:05", "2006-01-02"} {
+				if ts, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+					return ts
+				}
+			}
+		}
+	}
+	return time.Time{}
+}
+
+// billedWarnMemo backs billedWarnOnce: one mismatch warn per (requested,
+// billed) pair per hour (BP-207, qoder2api-hub issue #113 — a constant "auto"
+// billed model otherwise floods the log without adding information).
+var billedWarnMemo sync.Map
+
+func billedWarnOnce(requested, billed string) bool {
+	key := requested + "|" + billed
+	if v, ok := billedWarnMemo.Load(key); ok {
+		if until, ok := v.(time.Time); ok && time.Now().Before(until) {
+			return false
+		}
+	}
+	billedWarnMemo.Store(key, time.Now().Add(time.Hour))
+	return true
 }
 
 // queueWaitSeconds parses the upstream queue answer's retryAfterSeconds.
@@ -958,6 +1006,12 @@ func (d *Driver) refreshJobToken(ctx context.Context, rt *runtime, refreshToken 
 		Token     string `json:"token"`
 		Refresh   string `json:"refresh_token"`
 		ExpiresIn int64  `json:"expires_in"`
+		// BP-202 (plugins cc3f000): the expiry may also arrive as absolute
+		// time, which has no unit ambiguity — number (seconds or millis) or
+		// date string on any of the three names.
+		ExpireTime json.RawMessage `json:"expire_time"`
+		ExpiresAt  json.RawMessage `json:"expires_at"`
+		ExpireAt   json.RawMessage `json:"expire_at"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return fmt.Errorf("qoder job token refresh: decode: %w", err)
@@ -969,11 +1023,25 @@ func (d *Driver) refreshJobToken(ctx context.Context, rt *runtime, refreshToken 
 	defer rt.mu.Unlock()
 	rt.securityOauth = out.Token
 	rt.refreshToken = out.Refresh
-	if out.ExpiresIn > 0 {
-		rt.expireTimeMs = time.Now().UnixMilli() + out.ExpiresIn*1000
-	} else {
-		rt.expireTimeMs = time.Now().Add(24 * time.Hour).UnixMilli()
+	// BP-202: absolute time wins (no unit to guess). The relative
+	// expires_in is treated as milliseconds per the reference client
+	// (plugins cc3f000) — our old code assumed seconds, which would have
+	// parked the expiry ~1000x too far out and left renewal to the 401
+	// fallback. Values that fit neither reading sensibly fall back to a
+	// day; the parsed result is logged so a live response settles the
+	// semantics on the first renewal.
+	expiry := absoluteExpire(out.ExpireTime, out.ExpiresAt, out.ExpireAt)
+	if expiry.IsZero() {
+		if out.ExpiresIn >= 10_000_000 { // ≥ ~2.8h: only plausible as millis
+			expiry = time.Now().Add(time.Duration(out.ExpiresIn) * time.Millisecond)
+		} else if out.ExpiresIn >= 10_000 { // hours-scale number: seconds
+			expiry = time.Now().Add(time.Duration(out.ExpiresIn) * time.Second)
+		} else {
+			expiry = time.Now().Add(24 * time.Hour)
+		}
 	}
+	log.Printf("qoder: job token renewed, expires at %s (expires_in=%d)", expiry.Format(time.RFC3339), out.ExpiresIn)
+	rt.expireTimeMs = expiry.UnixMilli()
 	rt.refreshedAt = time.Now()
 	// Rebuild the COSY session from the renewed identity.
 	sess, err := newSession(authIdentity{

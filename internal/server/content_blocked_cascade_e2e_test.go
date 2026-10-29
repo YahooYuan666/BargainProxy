@@ -50,9 +50,9 @@ func buildCascadeServer(t *testing.T, zcodeUp, wbUp *httptest.Server) *httptest.
 	p.Upsert(&model.Account{ID: "wb-1", Channel: model.ChannelWorkBuddy, CredsJSON: wb})
 
 	drivers := map[string]driver.Driver{
-		model.ChannelZCode:      zcode.New(cfg.Channels.ZCode, nil),
-		model.ChannelWorkBuddy:  workbuddy.New(cfg.Channels.WorkBuddy, nil),
-		model.ChannelTrae:       trae.New(cfg.Channels.Trae, nil),
+		model.ChannelZCode:     zcode.New(cfg.Channels.ZCode, nil),
+		model.ChannelWorkBuddy: workbuddy.New(cfg.Channels.WorkBuddy, nil),
+		model.ChannelTrae:      trae.New(cfg.Channels.Trae, nil),
 	}
 	r := router.New(cfg)
 	gw := gateway.New(cfg, p, r, drivers, st)

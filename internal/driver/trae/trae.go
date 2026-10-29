@@ -1334,44 +1334,27 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 			// no retries, no red task row (magpie 0.2.19: outcome done).
 			return true, st.Credits, true, nil
 		}
-		if !retryableCheckinErr(lastErr) && !rushCheckinErr(lastErr) {
+		if !retryableCheckinErr(lastErr) {
 			return false, 0, false, lastErr
 		}
-		// BP-135: 9074 "当前参与用户太多，请稍后再试" is the upstream asking
-		// for a LATER retry — it is the check-in rush hour, not the "check in
-		// via the app" refusal. It failed the task three days running at the
-		// 01:00 slot while the message itself says the money is still there.
-		// Wait out the rush with a wider spacing than the transport backoff.
+		// BP-204 (magpie-community/plugins 644038d): 9074 is NOT the rush
+		// hour — upstream measurements show the same account, token and
+		// headers taken right beside a 16-digit-device id, and the "参与用户
+		// 太多" wording on claims whose device was the problem (plugins#436:
+		// two accounts shared one machine's device, the second answered 9074
+		// daily). Trae takes ONE check-in per device per day; waiting out a
+		// "rush" that does not exist just held the task slot for 3×60s every
+		// day (BP-135's three 01:00 failures in a row fit exactly this).
+		// retryableCheckinErr keeps 9074 out, so the refusal surfaces now.
 		if attempt < 3 {
-			delay := checkinRetryDelay
-			if rushCheckinErr(lastErr) {
-				delay = checkinRushRetryDelay
-			}
 			select {
 			case <-ctx.Done():
 				return false, 0, false, uperr.New(uperr.ClassCanceled, 0, "trae checkin: %v", ctx.Err())
-			case <-time.After(delay):
+			case <-time.After(checkinRetryDelay):
 			}
 		}
 	}
 	return false, 0, false, lastErr
-}
-
-// checkinRushRetryDelay is the spacing for the 9074 rush answer. 20s kept
-// landing inside the same rush (three days of failed 01:00 rows); a minute
-// gives the upstream's own "稍后再试" a chance to be true. Package var so
-// tests can shorten it.
-var checkinRushRetryDelay = 60 * time.Second
-
-// rushCheckinErr reports whether a claim refusal is the TRANSIENT rush shape:
-// 9074 whose message asks for a later retry. Other 9074 wordings (the
-// historical "go check in via the app" answer) stay fail-fast.
-func rushCheckinErr(err error) bool {
-	ce, ok := err.(*checkinCodeErr)
-	if !ok || ce.code != 9074 {
-		return false
-	}
-	return strings.Contains(ce.ue.Message, "参与用户太多")
 }
 
 // checkinRetryDelay is a package var so tests can shorten the backoff.
@@ -1625,8 +1608,15 @@ func ParseEntUsageFull(raw []byte) (remain, limit, used int64, packs int, earlie
 		default:
 			continue // no quota on this pack
 		}
-		if end := normalizePackExpiry(p.EntitlementBaseInfo.EndTime, p.EntitlementBaseInfo.ExpireTime, p.EndTime); !end.IsZero() {
-			if earliestExpiry.IsZero() || end.Before(earliestExpiry) {
+		// BP-195 (misakano c99c6173): only a pack that still HAS quota and
+		// has not expired yet may pin the account's earliest expiry — an
+		// exhausted pack ("今天到期" while the fresh check-in pack runs 31
+		// days) or an already-passed end made the panel report the account
+		// as expiring today forever. Unlimited packs keep counting: they
+		// have quota by definition.
+		if end := normalizePackExpiry(p.EntitlementBaseInfo.EndTime, p.EntitlementBaseInfo.ExpireTime, p.EndTime); !end.IsZero() && end.After(time.Now()) {
+			hasRemain := l == unlimitedPack || l-u > 0
+			if hasRemain && (earliestExpiry.IsZero() || end.Before(earliestExpiry)) {
 				earliestExpiry = end
 			}
 		}

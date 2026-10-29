@@ -35,10 +35,17 @@ import (
 )
 
 var (
-	// keepaliveGap is how long the stream may be silent before a keepalive.
-	// Well under every client watchdog we know of (Claude Code 300s) and
-	// under typical intermediate proxy idle timeouts.
-	keepaliveGap = 15 * time.Second
+	// keepaliveFirstGap is how long the FIRST silence may last before the
+	// first keepalive. BP-198 (magpie c3462d5): Windows-local TUN/Clash-class
+	// proxies cut an idle stream at ~10s (499/connection reset), and the cut
+	// lands in the first silence — a deep-thinking model's TTFB alone can
+	// exceed it. 3s proves the connection alive well before that.
+	keepaliveFirstGap = 3 * time.Second
+	// keepaliveGap is how long the stream may stay silent between keepalives
+	// after the first. Well under every client watchdog we know of (Claude
+	// Code 300s) and under typical intermediate proxy idle timeouts; 15s
+	// used to sit ABOVE the ~10s local-proxy cut (BP-198).
+	keepaliveGap = 5 * time.Second
 	// keepalivePingGap is the minimum spacing between Anthropic ping events.
 	keepalivePingGap = time.Minute
 	// keepaliveLifetime bounds the whole thing: a provider that never
@@ -140,39 +147,63 @@ func (k *streamKeepalive) Stop() {
 
 func (k *streamKeepalive) loop() {
 	defer close(k.done)
-	t := time.NewTicker(keepaliveGap)
-	defer t.Stop()
 	deadline := time.Now().Add(keepaliveLifetime)
+	// The first keepalive comes sooner than the steady gap (BP-198): the
+	// ~10s idle cut of local proxies lands in the first silence, before any
+	// frame has flowed.
+	if !k.silenceTick(keepaliveFirstGap, &deadline) {
+		return
+	}
+	t := time.NewTimer(keepaliveGap)
+	defer t.Stop()
 	for {
 		select {
 		case <-k.stop:
 			return
 		case <-t.C:
 		}
-		now := time.Now()
-		if now.After(deadline) {
+		if !k.silenceTick(keepaliveGap, &deadline) {
 			return
 		}
-		k.mu.Lock()
-		silent := now.Sub(k.lastEvt) >= keepaliveGap
-		started := k.started
-		pingDue := started && k.pingFrame != "" && now.Sub(k.lastPing) >= keepalivePingGap
-		if pingDue {
-			k.lastPing = now
-		}
-		if silent {
-			k.lastEvt = now
-		}
-		k.mu.Unlock()
-		if !silent {
-			continue
-		}
-		frame := ": keepalive\n\n"
-		if pingDue {
-			frame = k.pingFrame
-		}
-		if err := k.lw.writeString(frame); err != nil {
-			return // client is gone; nothing left to keep alive
-		}
+		t.Reset(keepaliveGap)
 	}
+}
+
+// silenceTick waits one gap, then writes the keepalive if the stream has
+// been silent for that long. It returns false when the loop must end:
+// stopped, lifetime over, or the write failed (client gone).
+func (k *streamKeepalive) silenceTick(gap time.Duration, deadline *time.Time) bool {
+	t := time.NewTimer(gap)
+	defer t.Stop()
+	select {
+	case <-k.stop:
+		return false
+	case <-t.C:
+	}
+	now := time.Now()
+	if now.After(*deadline) {
+		return false
+	}
+	k.mu.Lock()
+	silent := now.Sub(k.lastEvt) >= gap
+	started := k.started
+	pingDue := started && k.pingFrame != "" && now.Sub(k.lastPing) >= keepalivePingGap
+	if pingDue {
+		k.lastPing = now
+	}
+	if silent {
+		k.lastEvt = now
+	}
+	k.mu.Unlock()
+	if !silent {
+		return true
+	}
+	frame := ": keepalive\n\n"
+	if pingDue {
+		frame = k.pingFrame
+	}
+	if err := k.lw.writeString(frame); err != nil {
+		return false // client is gone; nothing left to keep alive
+	}
+	return true
 }

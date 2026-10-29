@@ -14,7 +14,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -65,11 +68,24 @@ const (
 	// overseas host answers 401 {"error":"Invalid token"} (verified live
 	// 2026-10-24), which is what makes the overseas pool a genuinely separate
 	// quota pool rather than another door into the same one.
-	overseasChannel = "zai"
-	// overseasVersion follows the installed client (2.2.2 at the time of
-	// measurement). The gateway checks it, and reports a mismatch as 401
-	// "Invalid token", so it must be bumped when the client is.
-	overseasVersion = "2.2.2"
+	// BP-190: the official 2.0.3 desktop fingerprint (magpie-community/
+	// plugins 744e1e2, read from the AppImage's dist/main.cjs). The overseas
+	// gateway refuses "X-Tm: linux" only beside a NON-official fingerprint
+	// (#367), so the lane now carries the official set as a whole: channel
+	// "official", version 2.0.3, en lang, the OpenAI-SDK header family the
+	// Electron client adds. The previous "zai"/2.2.2 pair was measured live
+	// on 2026-10-24 but is no longer what the official client sends.
+	overseasChannel = "official"
+	overseasVersion = "2.0.3"
+	overseasLang    = "en"
+	// The Electron client routes its model calls through OpenAI SDK 6.26.0
+	// (Node v24.18.0), whose User-Agent and X-Stainless-* headers the gateway
+	// sees on every official request.
+	overseasSDKVersion  = "6.26.0"
+	overseasNodeVersion = "v24.18.0"
+	// overseasVersion follows the official desktop build; the gateway checks
+	// it, and reports a mismatch as 401 "Invalid token", so it must be bumped
+	// when the client is.
 	overseasHost    = "https://autoglm-api.autoglm.ai"
 	// overseasChatPath has a /v1 segment the CN gateway does not. Measured
 	// 2026-10-24 against the real overseas account:
@@ -339,35 +355,51 @@ func userapiHeaders(token, secret string) http.Header {
 // mandatory (without it the gateway answers 401 "Invalid token"), and the
 // channel/version must name the 2.1.0 build this gateway serves.
 func managedChatHeaders(token, secret, model string) http.Header {
-	return managedChatHeadersFor(token, secret, model, false)
+	return managedChatHeadersFor(token, secret, model, false, nil)
 }
 
 // managedChatHeadersFor builds the header family for one lane.
 //
-// The overseas lane differs from the CN one in the channel name, the client
-// version, and the absence of the CN gateway's client headers (Origin, Referer,
-// X-Client-Type, X-Agent-Id). The auth header is the SAME on both:
-// X-Authorization. Verified live 2026-10-24 with a real overseas account.
-func managedChatHeadersFor(token, secret, model string, overseas bool) http.Header {
+// The overseas lane carries the official 2.0.3 desktop fingerprint (BP-190):
+// channel "official", the OpenAI SDK header family, a per-request UUID on
+// both X-Trace-Id and X-Request-Id, and a conversation-stable X-Session-Id.
+// The auth header is X-Authorization on both lanes, always with one Bearer
+// prefix regardless of the token's own shape (BP-87). Verified live
+// 2026-10-24 with a real overseas account; the fingerprint itself is from
+// magpie-community/plugins 744e1e2.
+func managedChatHeadersFor(token, secret, model string, overseas bool, wire []byte) http.Header {
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	h := http.Header{}
 	h.Set("Content-Type", "application/json")
 	if overseas {
-		h.Set("Accept", "*/*")
-		h.Set("User-Agent", "AutoClaw/"+overseasVersion+" (win-amd64)")
+		rid := requestUUID()
+		h.Set("Accept", "application/json")
+		h.Set("User-Agent", "OpenAI/JS "+overseasSDKVersion)
+		h.Set("X-Stainless-Retry-Count", "0")
+		h.Set("X-Stainless-Timeout", "600")
+		h.Set("X-Stainless-Lang", "js")
+		h.Set("X-Stainless-Package-Version", overseasSDKVersion)
+		h.Set("X-Stainless-OS", stainlessOS())
+		h.Set("X-Stainless-Arch", stainlessArch())
+		h.Set("X-Stainless-Runtime", "node")
+		h.Set("X-Stainless-Runtime-Version", overseasNodeVersion)
 		h.Set("X-Version", overseasVersion)
-		h.Set("X-Tm", "win")
+		h.Set("X-Tm", platformTm())
 		h.Set("X-Product", "autoclaw")
 		h.Set("X-Auth-Appid", appID)
 		h.Set("X-Auth-TimeStamp", ts)
 		h.Set("X-Auth-Sign", sign(ts, secret))
-		h.Set("X-Trace-Id", traceID())
-		h.Set("X-Lang", "zh-CN")
+		h.Set("X-Lang", overseasLang)
 		h.Set("X-Channel", overseasChannel)
-		h.Set("X-Request-Model", model)
-		if token != "" {
-			h.Set("X-Authorization", token)
+		h.Set("X-Trace-Id", rid)
+		h.Set("X-Request-Id", rid)
+		if model != "" {
+			h.Set("X-Request-Model", model)
 		}
+		h.Set("X-Client-Type", "pc")
+		h.Set("x_trace_id", "autoclaw-desktop")
+		h.Set("X-Session-Id", conversationSessionID(wire))
+		h.Set("X-Authorization", "Bearer "+strings.TrimPrefix(strings.TrimPrefix(token, "Bearer "), "bearer "))
 		return h
 	}
 	h.Set("Accept", "*/*")
@@ -502,7 +534,7 @@ func (d *Driver) chatManaged(ctx context.Context, cr *Creds, body []byte, modelI
 	if err != nil {
 		return nil, err
 	}
-	req.Header = managedChatHeadersFor(cr.bearer(), secret, modelID, overseas)
+	req.Header = managedChatHeadersFor(cr.bearer(), secret, modelID, overseas, wire)
 	resp, err := d.http.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "autoclaw managed: %v", err)
@@ -559,6 +591,107 @@ func traceID() string {
 	}
 	return hex.EncodeToString(b)
 }
+
+// requestUUID mints a random RFC-4122 v4 UUID: the official client sends one
+// on X-Trace-Id and the same value on X-Request-Id (BP-190).
+func requestUUID() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		return traceID()
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// platformTm mirrors the official managedPlatform(): darwin is "mac", win32
+// is "win", anything else is the GOOS as is — so Linux is "linux" on x64 and
+// arm64 alike (magpie-community/plugins 744e1e2; the gateway refuses it only
+// beside a non-official fingerprint, #367).
+func platformTm() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "mac"
+	case "windows":
+		return "win"
+	default:
+		return runtime.GOOS
+	}
+}
+
+// stainlessOS / stainlessArch are the OpenAI SDK's own normalizations of the
+// platform for its X-Stainless-* headers.
+func stainlessOS() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "MacOS"
+	case "windows":
+		return "Windows"
+	case "linux":
+		return "Linux"
+	default:
+		return "Other:" + runtime.GOOS
+	}
+}
+
+func stainlessArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x64"
+	case "386":
+		return "x32"
+	default:
+		return runtime.GOARCH
+	}
+}
+
+// conversationSessionID derives the conversation-stable X-Session-Id the
+// official client sends on every turn of one session (BP-190): the first
+// non-system message stands in for the session (the wire shape here has no
+// session of its own), hashed the same way magpie-community/plugins derives
+// it — sha256 of `["<role>",<content>]` shaped into a v4 UUID. A body
+// without a usable message gets a fresh UUID: a stable-per-request id beats
+// a shared constant (BP-80's "main" collision lesson).
+func conversationSessionID(wire []byte) string {
+	var doc struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal(wire, &doc) == nil {
+		for _, m := range doc.Messages {
+			if m.Role == "system" || len(m.Content) == 0 || string(m.Content) == "null" {
+				continue
+			}
+			role, _ := json.Marshal(m.Role)
+			h := sha256.New()
+			h.Write([]byte("["))
+			h.Write(role)
+			h.Write([]byte(","))
+			h.Write(m.Content)
+			h.Write([]byte("]"))
+			s := hex.EncodeToString(h.Sum(nil))
+			variant := (hexDigit(s[16]) & 0x3) | 0x8
+			return s[0:8] + "-" + s[8:12] + "-4" + s[13:16] + "-" +
+				string(hexDigits[variant]) + s[17:20] + "-" + s[20:32]
+		}
+	}
+	return requestUUID()
+}
+
+func hexDigit(c byte) int {
+	switch {
+	case c >= '0' && c <= '9':
+		return int(c - '0')
+	case c >= 'a' && c <= 'f':
+		return int(c-'a') + 10
+	default:
+		return 0
+	}
+}
+
+const hexDigits = "0123456789abcdef"
 
 // Driver implements driver.Driver for AutoClaw.
 type Driver struct {

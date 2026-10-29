@@ -7,8 +7,8 @@ import (
 
 	"bargainproxy/internal/driver"
 	"bargainproxy/internal/ir"
-	"bargainproxy/internal/uperr"
 	"bargainproxy/internal/model"
+	"bargainproxy/internal/uperr"
 )
 
 // effortDriver refuses the effort gear once (wording that names it), then

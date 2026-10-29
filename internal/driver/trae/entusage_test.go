@@ -43,13 +43,16 @@ func TestParseEntUsageUnlimitedPack(t *testing.T) {
 }
 
 // TestParseEntUsageExpiryFeedsExpiring: the earliest pack end lands in the
-// returned time; a response without expiries returns zero time.
+// returned time; a response without expiries returns zero time. BP-195
+// (misakano c99c6173): an EXHAUSTED pack and an already-passed end must not
+// pin the account's earliest expiry — the exhausted pack made a fresh 31-day
+// pack read "expiring today" forever.
 func TestParseEntUsageExpiryFeedsExpiring(t *testing.T) {
-	// Two packs: ends 2027-01-01 and 2026-11-01 (earlier, must win). Upstream
-	// sends seconds or milliseconds; this body uses milliseconds.
+	// Two live packs: ends 2027-01-01 and 2026-11-05 (earlier, must win).
+	// Upstream sends seconds or milliseconds; this body uses milliseconds.
 	raw := []byte(`{"user_entitlement_pack_list":[
 		{"entitlement_base_info":{"quota":{"credits_limit":100},"end_time":1798761600000},"usage":{"credits_amount":10}},
-		{"entitlement_base_info":{"quota":{"credits_limit":50},"end_time":1762252800000},"usage":{"credits_amount":0}}
+		{"entitlement_base_info":{"quota":{"credits_limit":50},"end_time":1793913600000},"usage":{"credits_amount":0}}
 	]}`)
 	_, _, _, packs, until, unlimited, err := ParseEntUsageFull(raw)
 	if err != nil {
@@ -61,9 +64,27 @@ func TestParseEntUsageExpiryFeedsExpiring(t *testing.T) {
 	if packs != 2 {
 		t.Fatalf("packs = %d, want 2", packs)
 	}
-	want := time.Unix(1762252800, 0)
+	want := time.Unix(1793913600, 0)
 	if until.IsZero() || !until.Equal(want) {
 		t.Fatalf("earliest expiry = %v, want %v", until, want)
+	}
+
+	// BP-195: a pack with nothing left does not decide the expiry — the live
+	// pack's later end wins.
+	exhausted := []byte(`{"user_entitlement_pack_list":[
+		{"entitlement_base_info":{"quota":{"credits_limit":100},"end_time":1793913600000},"usage":{"credits_amount":100}},
+		{"entitlement_base_info":{"quota":{"credits_limit":50},"end_time":1798761600000},"usage":{"credits_amount":0}}
+	]}`)
+	if _, _, _, _, until2, _, err := ParseEntUsageFull(exhausted); err != nil || !until2.Equal(time.Unix(1798761600, 0)) {
+		t.Fatalf("exhausted pack pinned the expiry: until=%v err=%v, want %v", until2, err, time.Unix(1798761600, 0))
+	}
+
+	// BP-195: an end already in the past is ignored outright.
+	passed := []byte(`{"user_entitlement_pack_list":[
+		{"entitlement_base_info":{"quota":{"credits_limit":100},"end_time":1600000000000},"usage":{"credits_amount":0}}
+	]}`)
+	if _, _, _, _, until3, _, err := ParseEntUsageFull(passed); err != nil || !until3.IsZero() {
+		t.Fatalf("a passed end must not feed the expiry: until=%v err=%v", until3, err)
 	}
 }
 

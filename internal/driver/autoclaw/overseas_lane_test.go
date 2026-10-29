@@ -7,21 +7,20 @@ import (
 )
 
 // TestOverseasLaneUsesTheOneXContract pins the dialect difference between the
-// two credential universes. The overseas gateway (autoglm-api.autoglm.ai) is
-// the older 1.x deployment and rejects the CN gateway's header family in ways
-// that read like a credential problem, so the two must never be mixed:
+// two credential universes. Since BP-190 the overseas lane carries the
+// OFFICIAL 2.0.3 desktop fingerprint (magpie-community/plugins 744e1e2, from
+// the AppImage's dist/main.cjs) — the gateway refuses "X-Tm: linux" only
+// beside a non-official fingerprint (#367), so the lane must look exactly
+// like the official client:
 //
-//	X-Channel     zai            vs AutoClaw26
-//	X-Version     2.2.2          vs 2.1.0
-//	auth header   X-Authorization on both
-//	client headers  absent       vs Origin/Referer/Client-Type/X-Agent-Id
+//	X-Channel     official       vs AutoClaw26
+//	X-Version     2.0.3          vs 2.1.0
+//	auth header   X-Authorization with one Bearer prefix, on both
+//	client headers  X-Client-Type: pc + X-Stainless-* family
+//	              vs Origin/Referer/Client-Type/X-Agent-Id (2.x dialect)
 //	path          .../autoclaw/v1/chat/completions  vs .../autoclaw/chat/completions
-//
-// Evidence: apmengzi/autoclaw-switch README + bridge/server_2x.mjs
-// (CLOUD_LANES, cloudHeaders, and detect_autoclaw_version's note that
-// "X-Version: 1.18.5 -> 401 Invalid token, 1.18.5.851 -> 200").
 func TestOverseasLaneUsesTheOneXContract(t *testing.T) {
-	h := managedChatHeadersFor("Bearer tok", "secret", "zai_glm-5.3-flash", true)
+	h := managedChatHeadersFor("Bearer tok", "secret", "zai_glm-5.3-flash", true, nil)
 
 	if got := h.Get("X-Channel"); got != overseasChannel {
 		t.Fatalf("X-Channel = %q, want %q", got, overseasChannel)
@@ -32,17 +31,51 @@ func TestOverseasLaneUsesTheOneXContract(t *testing.T) {
 	if !strings.Contains(overseasChatPath, "/v1/") {
 		t.Fatalf("the overseas path must keep its /v1 segment, got %q", overseasChatPath)
 	}
-	// Both lanes authenticate with X-Authorization (measured live 2026-10-24
-	// against a real overseas account; the earlier lower-case assumption came
-	// from a reference implementation's 2.x notes and did not hold here).
+	// Both lanes authenticate with X-Authorization, always exactly one Bearer
+	// prefix (measured live 2026-10-24; a doubled prefix is the BP-87 401).
 	if got := h.Get("X-Authorization"); got != "Bearer tok" {
 		t.Fatalf("X-Authorization = %q, want the token", got)
 	}
-	// The CN gateway's client headers belong to the 2.x dialect only.
-	for _, k := range []string{"Origin", "Referer", "X-Client-Type", "X-Agent-Id"} {
-		if got := h.Get(k); got != "" {
-			t.Errorf("the overseas lane must not send %s (got %q)", k, got)
+	// The official fingerprint's own marks. X-Client-Type: pc IS part of the
+	// official set (BP-190 reversed the old 2.2.2-era absence); X-Agent-Id is
+	// the CN gateway's header and must still never appear here.
+	if got := h.Get("X-Client-Type"); got != "pc" {
+		t.Fatalf("X-Client-Type = %q, want the official %q", got, "pc")
+	}
+	if got := h.Get("X-Agent-Id"); got != "" {
+		t.Errorf("the overseas lane must not send X-Agent-Id (got %q)", got)
+	}
+	// The OpenAI SDK family the Electron client adds to every official call.
+	for k, want := range map[string]string{
+		"X-Stainless-Lang":              "js",
+		"X-Stainless-Package-Version":   overseasSDKVersion,
+		"X-Stainless-Runtime":           "node",
+		"X-Stainless-Runtime-Version":   overseasNodeVersion,
+		"X-Stainless-Retry-Count":       "0",
+		"X-Stainless-Timeout":           "600",
+	} {
+		if got := h.Get(k); got != want {
+			t.Errorf("%s = %q, want %q", k, got, want)
 		}
+	}
+	if h.Get("X-Stainless-OS") == "" || h.Get("X-Stainless-Arch") == "" {
+		t.Error("X-Stainless-OS/X-Stainless-Arch must be present")
+	}
+	// X-Trace-Id and X-Request-Id carry the SAME per-request UUID.
+	if h.Get("X-Trace-Id") == "" || h.Get("X-Trace-Id") != h.Get("X-Request-Id") {
+		t.Fatalf("X-Trace-Id and X-Request-Id must be the same UUID, got %q / %q",
+			h.Get("X-Trace-Id"), h.Get("X-Request-Id"))
+	}
+	// A conversation-stable session id: present, and derived from the wire
+	// when one is given (see TestConversationSessionIDIsStable).
+	if h.Get("X-Session-Id") == "" {
+		t.Fatal("X-Session-Id is part of the official fingerprint")
+	}
+	if h.Get("x_trace_id") != "autoclaw-desktop" {
+		t.Errorf("x_trace_id = %q, want autoclaw-desktop", h.Get("x_trace_id"))
+	}
+	if h.Get("X-Lang") != overseasLang {
+		t.Errorf("X-Lang = %q, want %q", h.Get("X-Lang"), overseasLang)
 	}
 	// Both lanes sign, or the gateway answers 401 regardless of the token.
 	if h.Get("X-Auth-Sign") == "" || h.Get("X-Auth-Appid") == "" {
@@ -50,9 +83,30 @@ func TestOverseasLaneUsesTheOneXContract(t *testing.T) {
 	}
 }
 
+// TestConversationSessionIDIsStable pins the conversation-stable X-Session-Id
+// derivation (BP-190): same first non-system message, same UUID, on every
+// turn of the conversation.
+func TestConversationSessionIDIsStable(t *testing.T) {
+	wire := []byte(`{"messages":[{"role":"system","content":"sys"},{"role":"user","content":"hi there"}]}`)
+	a := conversationSessionID(wire)
+	b := conversationSessionID(wire)
+	if a == "" || a != b {
+		t.Fatalf("session id must be stable, got %q vs %q", a, b)
+	}
+	// A different first message must derive a different id.
+	other := []byte(`{"messages":[{"role":"user","content":"different"}]}`)
+	if conversationSessionID(other) == a {
+		t.Fatal("different conversations must not share a session id")
+	}
+	// No usable message: a fresh id, still present.
+	if conversationSessionID([]byte(`{}`)) == "" {
+		t.Fatal("a body without messages still needs a session id")
+	}
+}
+
 // TestCNLaneKeepsItsOwnDialect: the change must not disturb the CN path.
 func TestCNLaneKeepsItsOwnDialect(t *testing.T) {
-	h := managedChatHeadersFor("Bearer tok", "secret", "zai_glm-5.3-flash", false)
+	h := managedChatHeadersFor("Bearer tok", "secret", "zai_glm-5.3-flash", false, nil)
 
 	if got := h.Get("X-Channel"); got != managedChannel {
 		t.Fatalf("X-Channel = %q, want %q", got, managedChannel)

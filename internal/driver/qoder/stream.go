@@ -54,7 +54,32 @@ func extractUsageObj(v interface{}) *usage {
 		u.PromptTokensDetails = &detail{CachedTokens: toInt(d["cached_tokens"])}
 	}
 	if d, ok := m["completion_tokens_details"].(map[string]interface{}); ok {
-		u.CompletionTokensDetails = &detail{ReasoningTokens: toInt(d["reasoning_tokens"])}
+		u.CompletionTokensDetails = &detail{
+			ReasoningTokens: toInt(d["reasoning_tokens"]),
+			CachedTokens:    toInt(d["cached_tokens"]),
+		}
+	}
+	// BP-196 (qoder2api-hub 45e76f9, issue #112): the upstream names the
+	// cache hit in model-family fields — DeepSeek answers
+	// prompt_cache_hit_tokens, Qwen tucks it under
+	// completion_tokens_details.cached_tokens — and neither fills the
+	// standard slot, so the channel's cache-hit KPI (BP-53) read zero
+	// forever. Both fold into the standard slot, standard slot wins.
+	foldCache := func(cached int) {
+		if cached <= 0 {
+			return
+		}
+		if u.PromptTokensDetails == nil {
+			u.PromptTokensDetails = &detail{CachedTokens: cached}
+			return
+		}
+		if u.PromptTokensDetails.CachedTokens == 0 {
+			u.PromptTokensDetails.CachedTokens = cached
+		}
+	}
+	foldCache(toInt(m["prompt_cache_hit_tokens"]))
+	if u.CompletionTokensDetails != nil {
+		foldCache(u.CompletionTokensDetails.CachedTokens)
 	}
 	return u
 }

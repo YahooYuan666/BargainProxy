@@ -43,13 +43,14 @@ func (s *syncBuf) body() string {
 }
 
 // withKeepaliveTimings shrinks the windows so the test does not wait a
-// minute, restoring them afterwards.
+// minute, restoring them afterwards. The first-gap window rides the same
+// shrink (BP-198): a 3s first keepalive would outlast every sleep here.
 func withKeepaliveTimings(t *testing.T, gap, ping, life time.Duration) {
 	t.Helper()
-	oldGap, oldPing, oldLife := keepaliveGap, keepalivePingGap, keepaliveLifetime
-	keepaliveGap, keepalivePingGap, keepaliveLifetime = gap, ping, life
+	oldGap, oldFirst, oldPing, oldLife := keepaliveGap, keepaliveFirstGap, keepalivePingGap, keepaliveLifetime
+	keepaliveGap, keepaliveFirstGap, keepalivePingGap, keepaliveLifetime = gap, gap, ping, life
 	t.Cleanup(func() {
-		keepaliveGap, keepalivePingGap, keepaliveLifetime = oldGap, oldPing, oldLife
+		keepaliveGap, keepaliveFirstGap, keepalivePingGap, keepaliveLifetime = oldGap, oldFirst, oldPing, oldLife
 	})
 }
 

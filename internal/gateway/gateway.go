@@ -155,6 +155,12 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	if req.Stream && emit == nil {
 		return nil, fmt.Errorf("gateway: stream requested but no emitter")
 	}
+	// The image model has no chat route on purpose (chat cannot carry image
+	// parts back); point the caller at the images endpoint instead of a bare
+	// "model not found" (BP-186).
+	if gerr := g.imageModelGate(req.Model); gerr != nil {
+		return nil, gerr
+	}
 	bindings := g.router.Resolve(req.Model)
 	if len(bindings) == 0 {
 		return nil, uperr.New(uperr.ClassBadRequest, 404, "model %q not found", req.Model)
@@ -1094,6 +1100,24 @@ func (g *Gateway) ListModels() []ModelInfo {
 			mi.Channels = append(mi.Channels, ModelChannel{Channel: b.Channel, Native: b.UpstreamModel})
 		}
 		out = append(out, mi)
+	}
+	// The text-to-image model is not a chat route but belongs in the list:
+	// image clients discover it here (and the a2-gemini skill probes for it).
+	// Only listed while the channel can actually serve it — a model nobody
+	// can call is noise, not discovery (BP-186).
+	if g.ImageGenAvailable() && g.pool.HasAccounts(imageChannel) {
+		seen := false
+		for _, mi := range out {
+			if strings.EqualFold(mi.Model, model.ImageGenModel) {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, ModelInfo{Model: model.ImageGenModel, Channels: []ModelChannel{
+				{Channel: imageChannel, Native: model.ImageGenModel},
+			}})
+		}
 	}
 	return out
 }

@@ -72,6 +72,7 @@ var DefaultModelMap = map[string]string{
 	"MiniMax-M2.7":      "mmodel",
 }
 
+// defaultCatalog returns the static fallback catalogue.
 func defaultCatalog() *ModelCatalog {
 	mm := map[string]string{}
 	for k, v := range DefaultModelMap {
@@ -79,6 +80,22 @@ func defaultCatalog() *ModelCatalog {
 	}
 	return &ModelCatalog{ModelMap: mm, VisionModels: map[string]bool{}, Caps: map[string]*ModelCaps{},
 		DefaultName: nameForKey(mm, preferredDefaultKey)}
+}
+
+// paidModelMissing reports whether a fetched listing names NONE of the
+// static catalogue's models (BP-203, plugins 3c279f6): the upstream serves a
+// restricted account the free tier only, so an otherwise-successful fetch
+// with an empty paid set is a credential problem, not a catalogue change.
+func paidModelMissing(cat *ModelCatalog) bool {
+	if cat == nil {
+		return true
+	}
+	for name := range DefaultModelMap {
+		if _, ok := cat.ModelMap[name]; ok {
+			return false
+		}
+	}
+	return true
 }
 
 func nameForKey(modelMap map[string]string, key string) string {
@@ -376,7 +393,7 @@ func extractCatalog(raw map[string]interface{}) *ModelCatalog {
 		efforts, defEffort := parseEfforts(m)
 		caps[key] = &ModelCaps{IsReasoning: reasoningCapability(m), MaxOutputTokens: maxOut,
 			MaxInputTokens: maxIn,
-			Rate: rate, RateWas: rateWas, Free: free, Efforts: efforts, DefaultEffort: defEffort}
+			Rate:           rate, RateWas: rateWas, Free: free, Efforts: efforts, DefaultEffort: defEffort}
 	}
 	if len(modelMap) == 0 {
 		return nil
@@ -446,6 +463,29 @@ func (d *Driver) getCatalog(ctx context.Context, rt *runtime) *ModelCatalog {
 			if sess != nil {
 				if raw, err := d.fetchModelCatalog(ctx, sess); err == nil {
 					fetched = extractCatalog(raw)
+					// BP-203 (plugins 3c279f6): a listing that names NONE of
+					// the known paid models means the job token is restricted
+					// or stale — the upstream serves the free tier only, and
+					// caching that answer would 400 every paid model for a
+					// full ten-minute cycle. Renew once and re-fetch.
+					if fetched != nil && paidModelMissing(fetched) {
+						log.Printf("qoder model/list: no known paid model in the listing; renewing the job token once")
+						rt.mu.Lock()
+						refresh := rt.refreshToken
+						rt.mu.Unlock()
+						if refresh != "" && d.refreshJobToken(ctx, rt, refresh) == nil {
+							rt.mu.Lock()
+							sess = rt.sess
+							rt.mu.Unlock()
+							if sess != nil {
+								if raw2, err2 := d.fetchModelCatalog(ctx, sess); err2 == nil {
+									if refetched := extractCatalog(raw2); refetched != nil && !paidModelMissing(refetched) {
+										fetched = refetched
+									}
+								}
+							}
+						}
+					}
 				} else {
 					log.Printf("qoder model/list: %v (fallback)", err)
 				}

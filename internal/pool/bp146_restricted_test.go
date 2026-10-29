@@ -52,15 +52,19 @@ func restrictedPool(t *testing.T) (*Pool, *[]*model.Account) {
 	return p, &accts
 }
 
-// TestOneRestrictionPausesNothing reorders nothing: a single ban disables the
-// account and leaves the channel selectable (someone may still be healthy).
+// TestOneRestrictionPausesNothing reorders nothing: a single ban rests the
+// account (BP-205: ~a week, the observed upstream lift time) and leaves the
+// channel selectable (someone may still be healthy).
 func TestOneRestrictionPausesNothing(t *testing.T) {
 	p, accts := restrictedPool(t)
 	a := (*accts)[0]
 	p.ApplyResult(a, "glm-5.3", uperr.New(uperr.ClassAccountRestricted, 403, "11140 request illegal"))
 
-	if !a.Disabled {
-		t.Fatalf("the restricted account must be disabled")
+	if a.Disabled {
+		t.Fatalf("BP-205: the restriction is a week-long rest, not a disable")
+	}
+	if a.AccountCooldownUntil.IsZero() || !a.AccountCooldownUntil.After(time.Now().Add(6*24*time.Hour)) {
+		t.Fatalf("the restriction rest must run about a week, until %v", a.AccountCooldownUntil)
 	}
 	if _, paused := p.ChannelBusyUntil(model.ChannelWorkBuddy, "glm-5.3", time.Now()); paused {
 		t.Fatalf("one restriction must not pause the whole channel")

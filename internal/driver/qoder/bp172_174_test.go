@@ -53,8 +53,8 @@ func TestBP174YesterdayCampaignDoesNotSettle(t *testing.T) {
 	loc := time.FixedZone("UTC+8", 8*3600)
 	now := time.Date(2026, 10, 29, 16, 0, 0, 0, loc)
 	todayRefresh := qoderDailyRefreshUnix(now)
-	yesterdayStart := todayRefresh - 26 * 3600 // yesterday's 08:00 UTC+8 window
-	todayStart := todayRefresh                 // today's 10:00 window
+	yesterdayStart := todayRefresh - 26*3600 // yesterday's 08:00 UTC+8 window
+	todayStart := todayRefresh               // today's 10:00 window
 
 	end := todayRefresh + 24*3600 - 60 // ends 09:59 next day
 

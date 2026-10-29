@@ -21,7 +21,10 @@ var geminiSchemaAllowedKeys = map[string]bool{
 }
 
 // cleanGeminiSchema recursively reduces an arbitrary JSON-schema-ish value to
-// the Gemini-accepted shape. Values that are not maps/arrays pass through.
+// the Gemini-accepted shape. Bare booleans are normalized too (BP-192, magpie
+// 2cac98d: MCP tools emit draft-2020-12 boolean schemas and the Google
+// backend 400s on them): `true` accepts anything and becomes an empty schema,
+// `false` matches nothing and the key carrying it is dropped by the caller.
 func cleanGeminiSchema(v any) any {
 	switch t := v.(type) {
 	case map[string]any:
@@ -32,6 +35,11 @@ func cleanGeminiSchema(v any) any {
 			out[i] = cleanGeminiSchema(item)
 		}
 		return out
+	case bool:
+		if t {
+			return map[string]any{}
+		}
+		return nil
 	default:
 		return v
 	}
@@ -71,12 +79,20 @@ func cleanGeminiSchemaMap(in map[string]any) map[string]any {
 			if props, ok := v.(map[string]any); ok {
 				cleaned := make(map[string]any, len(props))
 				for pk, pv := range props {
-					cleaned[pk] = cleanGeminiSchema(pv)
+					cv := cleanGeminiSchema(pv)
+					if cv == nil {
+						// A bare-false property can never match: drop it
+						// instead of sending a null schema node (BP-192).
+						continue
+					}
+					cleaned[pk] = cv
 				}
 				out[k] = cleaned
 			}
 		case "items":
-			out[k] = cleanGeminiSchema(v)
+			if cv := cleanGeminiSchema(v); cv != nil {
+				out[k] = cv
+			} // a bare-false items: drop the key (element shape unrestricted)
 		default:
 			out[k] = v
 		}

@@ -90,22 +90,34 @@ func domesticCatalog() []tierRow {
 		{Source: "workbuddy", ID: "kimi-k2.6", Billing: "x0.20（倍率待复核）", ContextLen: 262144, MaxOutput: 262144, InputModes: m("text", "image", "video"), Reasoning: "关闭（Moonshot 官方仅 toggle）", ToolCall: true, Structured: true},
 		{Source: "workbuddy", ID: "minimax-m3", Billing: "x0.15（倍率待复核）", ContextLen: 1048576, MaxOutput: 512000, InputModes: m("text", "image", "video"), Reasoning: "关闭（MiniMax 官方仅 toggle）", ToolCall: true, Structured: true},
 		// Trae CN（积分池）
-		// 倍率来源：docs.trae.cn「内置模型限时折扣」官方表 + 2026-10-18 客户端截图。
+		// 倍率来源：docs.trae.cn「内置模型限时折扣」官方表 + 2026-10-18 客户端截图；
+		// 2026-10-29 起补 misakano7545/traework2api-panel df199b37/d26fa12b 的
+		// /v1/models 实测价目（两次独立探针，284积分/M 口径）。-max 变体与基名
+		// 同价（上游 credit_rate 相同）；剥 -max 归一到基名倍率时必须
+		// 「基名在表内才剥」，否则 qwen3.8-max 会被误剥成不存在的 qwen3.8。
 		// 忙时 08:00-22:00 / 空闲 22:00-08:00；客户端"标签+数字"口径不统一
-		// （glm-5.3 显示折前、deepseek-v4.1-flash 显示折后），故此处写明两档。
+		// （glm-5.3 显示折前、deepseek-v4.1-flash 显示折后），故部分写明两档。
 		// glm-5.3 路由已下线（用户 2026-10-16 实测 Trae 只留 glm-5.3-flashx，
 		// BP-38 删了 glm-5.3→trae:glm-5.2 第二腿），但官方折扣表仍列付费会员价，保留供对照。
-		{Source: "trae", ID: "glm-5.3-flashx", Billing: "倍率待复核（旧记免费档）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "glm-5.3-flashx", Billing: "x0.31（输出 7.1；实测 284积分/M）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
 		{Source: "trae", ID: "glm-5.3-flash", Billing: "x0.06", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video", "pdf"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
 		{Source: "trae", ID: "glm-5.3", Billing: "付费会员 x0.78 → 5 折 x0.39", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "glm-5.1", Billing: "x0.83（上游 /v1/models 实测）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "未单列（走上游默认）", ToolCall: false, Structured: true},
 		{Source: "trae", ID: "qwen3.8-max", Billing: "x1.50", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "关闭 + low/medium/xhigh", ToolCall: false, Structured: true},
 		{Source: "trae", ID: "qwen3.8-flash", Billing: "x0.08", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image", "video"), Reasoning: "关闭 + low/medium/xhigh", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "qwen-3.5", Billing: "x0.26（上游 /v1/models 实测）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "未单列（走上游默认）", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "qwen-3.6-plus", Billing: "x0.26（上游 /v1/models 实测）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "未单列（走上游默认）", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "mimo-v2.6-flash", Billing: "x0.06（上游 /v1/models 实测）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "未单列（走上游默认）", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "mimo-v2.6-pro", Billing: "x0.15（上游 /v1/models 实测）", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "未单列（走上游默认）", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "minimax-m2.7", Billing: "x0.27（上游 /v1/models 实测）", ContextLen: 1000000, MaxOutput: 512000, InputModes: m("text", "image", "video"), Reasoning: "未单列（走上游默认）", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "minimax-m3.1-flash", Billing: "x0.09（上游 /v1/models 实测）", ContextLen: 1000000, MaxOutput: 512000, InputModes: m("text"), Reasoning: "未单列（走上游默认）", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "doubao-seed-code", Billing: "x0.06（上游 /v1/models 实测）", ContextLen: 256000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "未单列（走上游默认）", ToolCall: false, Structured: true},
 		{Source: "trae", ID: "deepseek-v4-pro", Billing: "忙时 x0.72 / 空闲 x0.36（5 折）", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "关闭 + high/max", ToolCall: true, Structured: true},
 		{Source: "trae", ID: "deepseek-v4-flash", Billing: "忙时 x0.20 / 空闲 x0.10（5 折）", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + high", ToolCall: true, Structured: true},
 		{Source: "trae", ID: "deepseek-v4.1-flash", Billing: "免费忙时 x0.12 / 空闲 x0.06；付费会员全时段 x0.06", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "关闭 + low/high/max", ToolCall: false, Structured: true},
 		{Source: "trae", ID: "doubao-seed-2.1-pro", Billing: "高级包 约30-50/次", ContextLen: 256000, MaxOutput: 128000, InputModes: m("text", "image", "video"), Reasoning: "官方 turbo 口径 关闭 + low/high（pro 未单列）", ToolCall: true, Structured: true},
 		{Source: "trae", ID: "kimi-k3", Billing: "x1.83", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image", "video"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
-		{Source: "trae", ID: "kimi-k3.1-pro", Billing: "倍率待实测（K3.1）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
+		{Source: "trae", ID: "kimi-k3.1-pro", Billing: "x1.2（上游 /v1/models 实测）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "low/high/max", ToolCall: false, Structured: true},
 		// ZCode（Z.AI Coding Plan 计划内额度；提供 GLM 系模型，无 Claude）
 		{Source: "zcode", ID: "glm-5.3", Billing: "计划内额度", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "low/high/max", ToolCall: true, Structured: true},
 	}
@@ -169,14 +181,14 @@ var routedSpecs = map[string]tierRow{
 	// thinkingConfig=null：按 BP-98 结论"null=不显示入口、不发档位参数、走上游
 	// 默认"，kimi-k3 客户端固定 max。MaxOutput 沿用同族模型在 models.dev 的
 	// 规格（目录不提供该字段）。
-	"lobster|deepseek-flash":     {Billing: "x0.05 空闲 / x0.10 高峰 · ¥1/¥4 每百万", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 high）", ToolCall: true, Structured: true},
-	"lobster|deepseek-v4-pro":    {Billing: "x0.26 空闲 / x0.52 高峰 · ¥4.5/¥13.5 每百万", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "off/high/max（默认 high）", ToolCall: true, Structured: true},
-	"lobster|glm-5.3-flashx":     {Billing: "x0.15 · ¥2/¥7 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
-	"lobster|glm-5.3-flash":      {Billing: "x0.06 · ¥0.8/¥2.8 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
-	"lobster|glm-5.3":            {Billing: "x1.08 · ¥8/¥28 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
-	"lobster|qwen3.8-max":        {Billing: "x0.91 · ¥12/¥36 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "官方不开放档位（走上游默认）", ToolCall: true, Structured: true},
-	"lobster|qwen3.8-flash":      {Billing: "x0.06 · ¥0.8/¥2.7 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "官方不开放档位（走上游默认）", ToolCall: true, Structured: true},
-	"lobster|kimi-k3":            {Billing: "x1.35 · ¥20/¥100 每百万（思考固定 max）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "客户端固定 max", ToolCall: true, Structured: true},
+	"lobster|deepseek-flash":  {Billing: "x0.05 空闲 / x0.10 高峰 · ¥1/¥4 每百万", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 high）", ToolCall: true, Structured: true},
+	"lobster|deepseek-v4-pro": {Billing: "x0.26 空闲 / x0.52 高峰 · ¥4.5/¥13.5 每百万", ContextLen: 1000000, MaxOutput: 393216, InputModes: m("text"), Reasoning: "off/high/max（默认 high）", ToolCall: true, Structured: true},
+	"lobster|glm-5.3-flashx":  {Billing: "x0.15 · ¥2/¥7 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
+	"lobster|glm-5.3-flash":   {Billing: "x0.06 · ¥0.8/¥2.8 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
+	"lobster|glm-5.3":         {Billing: "x1.08 · ¥8/¥28 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text"), Reasoning: "off/high/max（默认 max）", ToolCall: true, Structured: true},
+	"lobster|qwen3.8-max":     {Billing: "x0.91 · ¥12/¥36 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "官方不开放档位（走上游默认）", ToolCall: true, Structured: true},
+	"lobster|qwen3.8-flash":   {Billing: "x0.06 · ¥0.8/¥2.7 每百万", ContextLen: 1000000, MaxOutput: 131072, InputModes: m("text", "image"), Reasoning: "官方不开放档位（走上游默认）", ToolCall: true, Structured: true},
+	"lobster|kimi-k3":         {Billing: "x1.35 · ¥20/¥100 每百万（思考固定 max）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "客户端固定 max", ToolCall: true, Structured: true},
 	// K3.1 反而比 K3 便宜（0.88 vs 1.35，2026-10-27 价格目录实测）；highspeed 版更贵。
 	"lobster|kimi-k3.1-pro":           {Billing: "x0.88 · K3.1 Pro（比 K3 便宜）", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "客户端固定 max", ToolCall: true, Structured: true},
 	"lobster|kimi-k3.1-pro-highspeed": {Billing: "x1.16 · K3.1 Pro 高速版", ContextLen: 1048576, MaxOutput: 1048576, InputModes: m("text", "image"), Reasoning: "客户端固定 max", ToolCall: true, Structured: true},

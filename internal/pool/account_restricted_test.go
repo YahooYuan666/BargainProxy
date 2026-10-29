@@ -9,13 +9,16 @@ import (
 	"bargainproxy/internal/uperr"
 )
 
-// TestAccountRestrictedLeavesRouting pins the 2026-10-20 fix: when upstream
+// TestAccountRestrictedLeavesRouting pins the 2026-10-20 fix (state changed
+// at all) plus the BP-205 reversal of its terminal form: when upstream
 // reports the ACCOUNT as restricted (workbuddy 403 code=11140 "request
-// illegal", displayMsg "账号存在异常行为，已被限制使用"), the account must be
-// disabled so the pool stops offering it. Before this, the error classified as
-// internal: no state change, sticky conversations stayed bound to the banned
-// account, and every turn failed over to another channel — the pool looked
-// broken while one account was still healthy.
+// illegal", displayMsg "账号存在异常行为，已被限制使用"), the account must
+// leave routing for ~a week — field history shows the upstream lifts the
+// restriction in about that time, so it now rests instead of being disabled
+// outright. Before the original fix, the error classified as internal: no
+// state change, sticky conversations stayed bound to the banned account, and
+// every turn failed over to another channel — the pool looked broken while
+// one account was still healthy.
 func TestAccountRestrictedLeavesRouting(t *testing.T) {
 	now := time.Date(2026, 10, 20, 22, 0, 0, 0, time.UTC)
 	p := New(Params{Now: fixedNow(now)}, map[string]int{model.ChannelWorkBuddy: 2}, nil)
@@ -36,19 +39,25 @@ func TestAccountRestrictedLeavesRouting(t *testing.T) {
 	ue := uperr.New(uperr.ClassAccountRestricted, 403, "workbuddy: account restricted")
 	p.ApplyResult(banned, "deepseek-v4.1-flash", ue)
 
-	if !banned.Disabled {
-		t.Fatal("a restricted account must be disabled (left routing)")
+	if banned.Disabled {
+		t.Fatal("BP-205: a restriction is a ~week-long rest, not a disable")
+	}
+	if !now.Add(6 * 24 * time.Hour).Before(banned.AccountCooldownUntil) {
+		t.Fatalf("the restriction rest must run about a week, until %v", banned.AccountCooldownUntil)
+	}
+	if banned.AccountCooldownReason != "restricted by upstream" {
+		t.Fatalf("cooldown reason = %q, want the restriction wording", banned.AccountCooldownReason)
 	}
 
 	// Whatever the previous sticky binding was, the next request must land on
-	// a usable account and never return the disabled one.
+	// a usable account and never return the resting one.
 	for i := 0; i < 4; i++ {
 		l, err := p.Acquire(context.Background(), model.ChannelWorkBuddy, "deepseek-v4.1-flash", "sess-1")
 		if err != nil {
 			t.Fatalf("acquire after restriction: %v", err)
 		}
 		if l.Account.ID == "wb-banned" {
-			t.Fatalf("disabled account was selected again (bound was %s)", bound)
+			t.Fatalf("resting account was selected again (bound was %s)", bound)
 		}
 		l.Release()
 	}

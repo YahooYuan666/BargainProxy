@@ -16,13 +16,17 @@ func TestEnvBlockAppendsToSystemText(t *testing.T) {
 		{"role": "system", "content": "be brief"},
 		{"role": "user", "content": "hi"},
 	}}
+	// BP-188: the block is built per request (a real working directory — the
+	// upstream 429s the literal "unknown" since 2026-10-29), so the test
+	// reproduces the same body-derived value before the injection runs.
+	env := zenEnvironmentFor(body)
 	injectEnvironment(body, false)
 	msgs := body["messages"].([]map[string]any)
 	if len(msgs) != 2 {
 		t.Fatalf("messages = %d, want 2 (no new message added)", len(msgs))
 	}
 	c, _ := msgs[0]["content"].(string)
-	if c != "be brief\n\n"+zenEnvironment {
+	if c != "be brief\n\n"+env {
 		t.Fatalf("system content = %q", c)
 	}
 	if _, isUser := msgs[1]["content"].(string); !isUser || msgs[1]["role"] != "user" {
@@ -33,12 +37,16 @@ func TestEnvBlockAppendsToSystemText(t *testing.T) {
 // A request that already carries an env block is left alone; `<ENV>` and
 // `working directory:` do not count (upstream checks are exact).
 func TestEnvBlockSkippedWhenPresent(t *testing.T) {
+	// Any env block counts as present — the request's own directory rides in
+	// it and must not be touched (BP-188: the block now carries a real path,
+	// but the skip rule is about the request, not the value).
+	const block = "<env>\n  Working directory: /tmp/some-project\n</env>"
 	body := map[string]any{"messages": []map[string]any{
-		{"role": "system", "content": "prompt\n\n" + zenEnvironment},
+		{"role": "system", "content": "prompt\n\n" + block},
 	}}
 	injectEnvironment(body, false)
 	msgs := body["messages"].([]map[string]any)
-	if c, _ := msgs[0]["content"].(string); c != "prompt\n\n"+zenEnvironment {
+	if c, _ := msgs[0]["content"].(string); c != "prompt\n\n"+block {
 		t.Fatalf("content changed: %q", c)
 	}
 	body2 := map[string]any{"messages": []map[string]any{
@@ -58,6 +66,7 @@ func TestEnvBlockPartsAndUnshift(t *testing.T) {
 		map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": "be brief"}}},
 		map[string]any{"role": "user", "content": "hi"},
 	}}
+	env := zenEnvironmentFor(body)
 	injectEnvironment(body, false)
 	msgs := body["messages"].([]any)
 	if len(msgs) != 2 {
@@ -67,17 +76,18 @@ func TestEnvBlockPartsAndUnshift(t *testing.T) {
 	if len(parts) != 2 {
 		t.Fatalf("parts = %d, want 2", len(parts))
 	}
-	if txt, _ := parts[1].(map[string]any)["text"].(string); txt != zenEnvironment {
+	if txt, _ := parts[1].(map[string]any)["text"].(string); txt != env {
 		t.Fatalf("appended part = %q", txt)
 	}
 	none := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}}
+	noneEnv := zenEnvironmentFor(none)
 	injectEnvironment(none, false)
 	l := none["messages"].([]any)
 	if len(l) != 2 {
 		t.Fatalf("messages = %d, want 2", len(l))
 	}
 	first := l[0].(map[string]any)
-	if first["role"] != "system" || first["content"] != zenEnvironment {
+	if first["role"] != "system" || first["content"] != noneEnv {
 		t.Fatalf("unshifted system = %v", first)
 	}
 }
@@ -85,13 +95,15 @@ func TestEnvBlockPartsAndUnshift(t *testing.T) {
 // Responses lane: the block rides in instructions.
 func TestEnvBlockResponsesInstructions(t *testing.T) {
 	body := map[string]any{"instructions": "be brief"}
+	env := zenEnvironmentFor(body)
 	injectEnvironment(body, true)
-	if ins, _ := body["instructions"].(string); ins != "be brief\n\n"+zenEnvironment {
+	if ins, _ := body["instructions"].(string); ins != "be brief\n\n"+env {
 		t.Fatalf("instructions = %q", ins)
 	}
 	empty := map[string]any{}
+	emptyEnv := zenEnvironmentFor(empty)
 	injectEnvironment(empty, true)
-	if ins, _ := empty["instructions"].(string); ins != zenEnvironment {
+	if ins, _ := empty["instructions"].(string); ins != emptyEnv {
 		t.Fatalf("empty instructions = %q", ins)
 	}
 }

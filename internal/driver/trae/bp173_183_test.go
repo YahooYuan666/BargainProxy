@@ -17,7 +17,7 @@ func TestBP173KimiSchemaNormalized(t *testing.T) {
 		Account:       &model.Account{ID: "tr-ks", Channel: model.ChannelTrae},
 		UpstreamModel: "kimi-k3",
 		Request: &ir.ChatRequest{
-			Model: "kimi-k3",
+			Model:    "kimi-k3",
 			Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}}},
 			Tools: []ir.ToolDef{{
 				Name: "pick_color",
@@ -61,7 +61,7 @@ func TestBP173KimiSchemaNormalized(t *testing.T) {
 	glm := call
 	glm.UpstreamModel = "glm-5.3"
 	glm.Request = &ir.ChatRequest{
-		Model: "glm-5.3",
+		Model:    "glm-5.3",
 		Messages: []ir.Message{{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}}},
 		Tools: []ir.ToolDef{{
 			Name: "pick_color",

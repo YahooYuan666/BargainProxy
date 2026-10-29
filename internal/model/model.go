@@ -68,6 +68,13 @@ const (
 	ChannelLobster = "lobster"
 )
 
+// ImageGenModel is the canonical text-to-image model, served only through
+// POST /v1/images/generations (antigravity upstream, image_gen request type).
+// It has no chat route on purpose: the chat path cannot carry image parts
+// back (2026-10-29 生图考察), so chat requests naming it get pointed at the
+// images endpoint instead of an empty answer.
+const ImageGenModel = "gemini-3.1-flash-image"
+
 // Window is a quota window snapshot (antigravity 5h / weekly windows).
 type Window struct {
 	RemainingFraction float64   `json:"remaining_fraction"` // 0..1

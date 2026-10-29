@@ -37,18 +37,20 @@ const (
 	// (official packet captures of both packages, 2026-10-22). Version segments
 	// are per realm — the two distributions ship on different cadences, so
 	// sending CN's number to the global edge does not match any real build.
-	desktopUA           = "WorkBuddy/" + clientVersionCN + " WorkBuddy/" + clientVersionCN + " CLI/" + cliVersionCN
-	desktopUAGlobal     = "WorkBuddy/" + clientVersionGlobal + " workbuddy-ai/" + clientVersionGlobal + " CLI/" + cliVersionGlobal
-	// BP-158: the shipped builds as of 2026-10-28 (magpie 74dcf40a, diffed
-	// against both update feeds: CN 5.9.3.42398134 with @genie/agent-cli
-	// 2.165.0, international 5.8.4.41366630 with CLI 2.161.0). 5.9 is also
-	// when the CN desktop started sending X-Agent-Runtime. The older 2.176.0
-	// figure came from misakano 244d4e6 and predates these builds.
-	clientVersionCN     = "5.9.3"
-	clientVersionGlobal = "5.8.4"
-	cliVersionCN        = "2.165.0"
-	cliVersionGlobal    = "2.161.0"
-	cliVersion          = cliVersionCN // legacy alias used by the growth/billing paths
+	desktopUA       = "WorkBuddy/" + clientVersionCN + " WorkBuddy/" + clientVersionCN + " CLI/" + cliVersionCN
+	desktopUAGlobal = "WorkBuddy/" + clientVersionGlobal + " workbuddy-ai/" + clientVersionGlobal + " CLI/" + cliVersionGlobal
+	// BP-158/BP-197: the shipped builds as of 2026-10-29 (magpie 74dcf40a
+	// diffed against both update feeds; the international numbers bumped by
+	// magpie 17114b5 + plugins b08a6c1 after the overseas feed pushed
+	// 5.9.3.42398134 with CLI 2.165.0 — the two realms now ship the same
+	// versions). 5.9 is also when the desktop started sending
+	// X-Agent-Runtime, on BOTH realms (BP-197). The older 2.176.0 figure
+	// came from misakano 244d4e6 and predates these builds.
+	clientVersionCN       = "5.9.3"
+	clientVersionGlobal   = "5.9.3"
+	cliVersionCN          = "2.165.0"
+	cliVersionGlobal      = "2.165.0"
+	cliVersion            = cliVersionCN // legacy alias used by the growth/billing paths
 	stainlessSDKVersion   = "6.25.0"
 	stainlessNodeVersion  = "v22.21.1"
 	reportPath            = "/v2/report"

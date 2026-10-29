@@ -434,11 +434,42 @@ func minuteLimitBody(lower string) bool {
 	return minuteMarkers.MatchString(text) && !longWindowWords.MatchString(text)
 }
 
+// creditShortfallWords is the credit-death wording a 400/409/422 can carry
+// (BP-193, magpie 3627742 / issue #4095: "可用积分已不足…请充值" over HTTP
+// 400): treating it as a client error ends the request while accounts with
+// credit remain, and never cools the empty one. Any status with this wording
+// is the balance death instead.
+var creditShortfallWords = regexp.MustCompile(
+	`积分.{0,12}(不足|用完|耗尽)|不足.{0,8}积分|请充值|(?i)insufficient.{0,24}credit|(?i)credit.{0,24}(insufficient|exhausted|has run out|balance)|(?i)out of credits?\b`)
+
+// modelUnserved401 / authLapsed401 separate a 401 that names the MODEL as the
+// problem (BP-199, magpie 3ec2552 / plugins #468: "The model X is not
+// available on your plan" — the account is fine) from one that names the
+// credential. The lapsed wording wins when both appear.
+var modelUnserved401 = regexp.MustCompile(
+	`(?i)model[^.\n]{0,48}(not available|not supported|not entitled|no access|not enabled|unavailable)|(?i)(unsupported|unknown) model|模型(不支持|未开通|无权(访问|使用))`)
+var authLapsed401 = regexp.MustCompile(
+	`(?i)invalid.{0,16}(api.?key|token)|(?i)(expired|unauthorized|authentication failed|sign.?in|credential)|api.?key|令牌|鉴权`)
+
+// contentPolicy403 is the wording third-party gateways put on a content
+// rejection with HTTP 403 (BP-200, magpie 750bd1b): clients read 403 as an
+// auth failure and tell the user to log in again. It is a request problem —
+// ClassContentBlocked (400, no account penalty), not ClassWAF.
+var contentPolicy403 = regexp.MustCompile(
+	`(?i)content_policy_rejected|(?i)content[_ ]?filter|(?i)content policy|内容安全|内容审核|合规审查`)
+
 func classifyHTTP(status int, body []byte) *uperr.Error {
 	text := string(body)
 	lower := strings.ToLower(text)
 	switch {
 	case status == 401:
+		// BP-199: a 401 whose body blames the model (plan/entitlement) and
+		// never the credential is a request problem on a healthy account —
+		// cooling it for auth would bench it for 10 minutes over a routing
+		// mistake.
+		if modelUnserved401.MatchString(text) && !authLapsed401.MatchString(text) {
+			return uperr.WithFields(uperr.New(uperr.ClassBadRequest, status, "openaicompat: model not served by this credential: %s", truncate(body, 300)), body)
+		}
 		return uperr.WithFields(uperr.New(uperr.ClassAuth, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 429:
 		e := uperr.WithFields(uperr.New(uperr.ClassSoftRate, status, "openaicompat: %s", truncate(body, 300)), body)
@@ -457,7 +488,10 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 		e := uperr.New(uperr.ClassSoftRate, status, "openaicompat: %s", truncate(body, 300))
 		e.ResetAt = time.Now().Add(5 * time.Second)
 		return uperr.WithFields(e, body)
-	case status == 402 || strings.Contains(lower, "insufficient") || strings.Contains(text, "余额"):
+	case status == 402 || creditShortfallWords.MatchString(text) || strings.Contains(lower, "insufficient") || strings.Contains(text, "余额"):
+		// BP-193: the shortfall wording decides over the status — a 400
+		// carrying it is the same balance death and must rotate to accounts
+		// that still have credit.
 		return uperr.WithFields(uperr.New(uperr.ClassHardCredit, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 403:
 		// A CDN/WAF edge block is not this account's fault: every account
@@ -465,6 +499,12 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 		// one edge rule into a dead pool (BP-94).
 		if uperr.IsEdgeBlock(body) {
 			return uperr.WithFields(uperr.EdgeBlocked(status, "openaicompat: edge blocked: %s", truncate(body, 300)), body)
+		}
+		// BP-200: a content-policy rejection wears 403 but is a request
+		// problem; as ClassWAF it would cool a healthy account for wording
+		// the account has no influence over.
+		if contentPolicy403.MatchString(text) {
+			return uperr.WithFields(uperr.New(uperr.ClassContentBlocked, status, "openaicompat: content policy: %s", truncate(body, 300)), body)
 		}
 		return uperr.WithFields(uperr.New(uperr.ClassWAF, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 400 || status == 404:

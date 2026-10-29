@@ -196,19 +196,20 @@ func (d *Driver) ensureFresh(ctx context.Context, acc *model.Account) (*Creds, e
 }
 
 // Stream implements driver.Driver.
-func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	acc := call.Account
+// resolveCreds returns fresh credentials and the effective project id for a
+// request, discovering the project on first use. Shared by the chat and image
+// paths; a discovery failure is not fatal (some upstream builds accept
+// requests without a project).
+func (d *Driver) resolveCreds(ctx context.Context, acc *model.Account) (*Creds, string, error) {
 	creds, err := d.ensureFresh(ctx, acc)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	project := creds.ProjectID
 	if project == "" {
 		project = acc.ProjectID
 	}
 	if project == "" {
-		// Best-effort discovery; a failure here is not fatal (some upstream
-		// builds accept requests without a project).
 		if pid, perr := d.loadCodeAssist(ctx, acc.ID, creds.AccessToken); perr == nil && pid != "" {
 			project = pid
 			creds.ProjectID = pid
@@ -217,6 +218,15 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 				acc.CredsDirty = true
 			}
 		}
+	}
+	return creds, project, nil
+}
+
+func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
+	acc := call.Account
+	creds, project, err := d.resolveCreds(ctx, acc)
+	if err != nil {
+		return nil, err
 	}
 
 	lookup, sigUsed := d.sigLookup(call.UpstreamModel, acc.ID)

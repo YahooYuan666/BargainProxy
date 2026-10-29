@@ -39,3 +39,4 @@
 /.scratch_*.log
 /.scratch_*.ps1
 /.e2e.*
+/bargainproxy.exe.new-*

@@ -303,8 +303,13 @@ func TestModelsEndpoint(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if len(out.Data) != 1 || out.Data[0].ID != "gemini-3-pro" || out.Data[0].OwnedBy != model.ChannelAntigravity {
+	if len(out.Data) != 2 || out.Data[0].ID != "gemini-3-pro" || out.Data[0].OwnedBy != model.ChannelAntigravity {
 		t.Fatalf("models = %+v", out.Data)
+	}
+	// BP-186: the text-to-image model rides the list while the channel has
+	// accounts — image clients (and the a2-gemini skill) discover it here.
+	if out.Data[1].ID != model.ImageGenModel || out.Data[1].OwnedBy != model.ChannelAntigravity {
+		t.Fatalf("image model missing or misplaced: %+v", out.Data)
 	}
 }
 
