@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
@@ -653,11 +654,20 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 		if uperr.IsEdgeBlock(body) {
 			return uperr.EdgeBlocked(status, "opencodezen: edge blocked: %s", truncate(body, 300))
 		}
-		if uperr.IsEdgeBlock(body) {
-			return uperr.EdgeBlocked(status, "opencodezen: edge blocked: %s", truncate(body, 300))
-		}
 		return uperr.New(uperr.ClassWAF, status, "opencodezen: %s", truncate(body, 300))
 	case status == 429:
+		// BP-211: the anonymous free lane's DAILY allowance spent answers 429
+		// FreeUsageLimitError until 00:00 UTC (identity.go's long-standing
+		// note) — as ClassUpstreamBusy it rendered "queue full, retry
+		// shortly", lying to the client about both the cause and the wait. A
+		// soft rate carrying the real reset rests the anonymous identity
+		// until the window turns over and renders an honest 429 instead.
+		// Other 429 wordings stay transient capacity.
+		if strings.Contains(text, "FreeUsageLimit") || strings.Contains(text, "Free usage limit") {
+			e := uperr.New(uperr.ClassSoftRate, status, "opencodezen: free usage limit reached, resets at 00:00 UTC: %s", truncate(body, 300))
+			e.ResetAt = nextUTCMidnight(time.Now())
+			return e
+		}
 		return uperr.New(uperr.ClassUpstreamBusy, status, "opencodezen: %s", truncate(body, 300))
 	case status == 404:
 		return uperr.New(uperr.ClassNotFound, status, "opencodezen: model endpoint gone: %s", truncate(body, 300))
@@ -1024,4 +1034,11 @@ func parseResponsesSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.
 		return nil, err
 	}
 	return out, nil
+}
+
+// nextUTCMidnight returns the next 00:00 UTC after now — the free lane's own
+// reset wall for its anonymous daily allowance (identity.go).
+func nextUTCMidnight(now time.Time) time.Time {
+	u := now.UTC()
+	return time.Date(u.Year(), u.Month(), u.Day(), 0, 0, 0, 0, time.UTC).Add(24 * time.Hour)
 }

@@ -34,10 +34,14 @@ func transientProbeErr(err error) bool {
 	switch ue.Class {
 	case uperr.ClassUpstreamBusy, uperr.ClassUpstreamTimeout,
 		uperr.ClassCanceled, uperr.ClassTransport, uperr.ClassWAF,
-		uperr.ClassNotFound:
+		uperr.ClassNotFound, uperr.ClassSoftRate:
 		// A 404 means the probe path is gone (edge or route change). That
 		// says nothing about whether the model still exists, so it must not
 		// be recorded as "model dead" (same reasoning as the free-tier gate).
+		// ClassSoftRate joined in BP-211: the free lane's daily-allowance 429
+		// now rides it (with the real UTC-midnight reset), and it says just
+		// as little about any single model — the shared quota spends and all
+		// nine models answer the same way.
 		return true
 	case uperr.ClassBadRequest:
 		return strings.Contains(ue.Message, "free-tier gate rejected")
