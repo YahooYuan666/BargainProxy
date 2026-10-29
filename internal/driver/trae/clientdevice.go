@@ -34,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,37 +52,83 @@ const (
 // --user-data-dir is found only if it is one of these.
 var clientProfileNames = []string{"Trae CN", "TRAE SOLO CN", "trae-cn"}
 
-// clientStoragePaths are where storage.json may be, in order. The two
-// Windows roots are often the same folder; they are compared as one system
-// spells them, so a difference of separator or case alone doesn't read the
-// same file twice.
+// clientStoragePaths are where storage.json may be, in order, on THIS
+// platform (BP-210): the same derivation every machine runs — the client's
+// standard profile layout under the OS's own config root, nothing
+// machine-specific. See clientStoragePathsFor for the per-platform rules.
 func clientStoragePaths() []string {
-	var roots []string
-	norm := func(r string) string {
-		return strings.ToLower(strings.TrimRight(strings.ReplaceAll(r, "/", "\\"), "\\"))
+	home, _ := os.UserHomeDir()
+	return clientStoragePathsFor(runtime.GOOS, home,
+		os.Getenv("APPDATA"), os.Getenv("XDG_CONFIG_HOME"))
+}
+
+// clientStoragePathsFor is the pure, testable core: the profile folders to
+// scan per platform, mirroring the upstream scanner's rules
+// (magpie-community/plugins packages/trae clientStoragePaths):
+//
+//	darwin  ~/Library/Application Support/{Trae CN, TRAE SOLO CN}
+//	win32   %APPDATA% and ~\AppData\Roaming (often the same folder, compared
+//	        as one system spells them so it is not read twice) ×
+//	        {Trae CN, TRAE SOLO CN, trae-cn}
+//	linux   $XDG_CONFIG_HOME or ~/.config × the same three names
+//
+// A client started with its own --user-data-dir writes a profile none of
+// these names cover, and none of the three platforms has a registry of such
+// profiles — the upstream passes those over too, and so do we (the account
+// falls back to its derived identity).
+func clientStoragePathsFor(goos, home, appdata, xdgConfig string) []string {
+	file := func(root, name string) string {
+		return filepath.Join(root, name, "User", "globalStorage", "storage.json")
 	}
-	add := func(r string) {
-		if r == "" {
-			return
+	switch goos {
+	case "darwin":
+		root := filepath.Join(home, "Library", "Application Support")
+		var out []string
+		for _, n := range clientProfileNames {
+			if n == "trae-cn" {
+				continue // not a macOS profile folder name
+			}
+			out = append(out, file(root, n))
 		}
-		for _, was := range roots {
-			if norm(was) == norm(r) {
+		return out
+	case "linux":
+		root := xdgConfig
+		if root == "" {
+			root = filepath.Join(home, ".config")
+		}
+		var out []string
+		for _, n := range clientProfileNames {
+			out = append(out, file(root, n))
+		}
+		return out
+	default: // windows
+		var roots []string
+		norm := func(r string) string {
+			return strings.ToLower(strings.TrimRight(strings.ReplaceAll(r, "/", "\\"), "\\"))
+		}
+		add := func(r string) {
+			if r == "" {
 				return
 			}
+			for _, was := range roots {
+				if norm(was) == norm(r) {
+					return
+				}
+			}
+			roots = append(roots, r)
 		}
-		roots = append(roots, r)
-	}
-	add(os.Getenv("APPDATA"))
-	if home, err := os.UserHomeDir(); err == nil {
-		add(filepath.Join(home, "AppData", "Roaming"))
-	}
-	var out []string
-	for _, r := range roots {
-		for _, n := range clientProfileNames {
-			out = append(out, filepath.Join(r, n, "User", "globalStorage", "storage.json"))
+		add(appdata)
+		if home != "" {
+			add(filepath.Join(home, "AppData", "Roaming"))
 		}
+		var out []string
+		for _, r := range roots {
+			for _, n := range clientProfileNames {
+				out = append(out, file(r, n))
+			}
+		}
+		return out
 	}
-	return out
 }
 
 // clientStoragePathsFn is the indirection tests point at a temp tree.

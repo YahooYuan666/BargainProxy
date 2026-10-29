@@ -225,3 +225,39 @@ func TestBP210ClientTokenIsNeverTaken(t *testing.T) {
 		t.Fatal("the client's own token must be read past, never kept")
 	}
 }
+
+// TestBP210PathsCoverAllPlatforms pins the per-platform derivation (BP-210):
+// the scanner is the same rule set on every machine, keyed off the OS's own
+// config roots — nothing machine-specific, and the upstream's exact folder
+// names.
+func TestBP210PathsCoverAllPlatforms(t *testing.T) {
+	const home = `/home/users/dev`
+	win := clientStoragePathsFor("windows", `C:\Users\dev`, `C:\Users\dev\AppData\Roaming`, "")
+	if len(win) != 3 {
+		t.Fatalf("windows roots deduped to %d paths, want 3 (APPDATA == home roaming): %v", len(win), win)
+	}
+	for _, p := range win {
+		if !strings.HasSuffix(filepath.ToSlash(p), "/User/globalStorage/storage.json") {
+			t.Fatalf("windows path %q lacks the profile layout", p)
+		}
+	}
+	win2 := clientStoragePathsFor("windows", `C:\Users\dev`, `D:\Other\Roaming`, "")
+	if len(win2) != 6 {
+		t.Fatalf("two distinct windows roots must yield 6 paths, got %d", len(win2))
+	}
+	mac := clientStoragePathsFor("darwin", home, "", "")
+	if len(mac) != 2 {
+		t.Fatalf("darwin must scan 2 profiles (no trae-cn), got %d: %v", len(mac), mac)
+	}
+	if !strings.Contains(filepath.ToSlash(mac[0]), "Library/Application Support/Trae CN") {
+		t.Fatalf("darwin root wrong: %q", mac[0])
+	}
+	lin := clientStoragePathsFor("linux", home, "", "")
+	if len(lin) != 3 || !strings.Contains(filepath.ToSlash(lin[0]), home+"/.config/Trae CN") {
+		t.Fatalf("linux default root wrong: %v", lin)
+	}
+	linX := clientStoragePathsFor("linux", home, "", "/etc/xdg")
+	if !strings.HasPrefix(filepath.ToSlash(linX[0]), "/etc/xdg/") {
+		t.Fatalf("XDG_CONFIG_HOME must win when set: %q", linX[0])
+	}
+}
