@@ -1282,6 +1282,11 @@ func (d *Driver) checkinStatus(ctx context.Context, creds *Creds, accID string) 
 
 // Checkin performs the daily checkin (idempotent upstream-side).
 func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn bool, credits int64, enable bool, err error) {
+	// BP-210: the local client's registered device may have changed since
+	// the last refresh (a fresh sign-in in the desktop client rotates it) —
+	// pick it up here, not only in Refresh, so a check-in never rides a
+	// stale identity.
+	backfillTraeDevice(acc)
 	creds, err := ParseCreds(acc.Credentials())
 	if err != nil {
 		return false, 0, false, uperr.New(uperr.ClassAuth, 0, "%v", err)
@@ -1723,9 +1728,21 @@ func (d *Driver) Refresh(ctx context.Context, acc *model.Account) error {
 	return d.refreshToken(ctx, acc, false)
 }
 
-// backfillTraeDevice fills an empty device/machine pair in the credential
-// blob with a per-account stable one. Deterministic on (device_id, uid);
-// for a blob with neither, uid alone seeds it, so it never rotates.
+// backfillTraeDevice puts the account's device identity in order.
+//
+// BP-210: the device a LOCAL Trae CN client registered for this account
+// wins over everything — Trae CN takes one check-in per registered device
+// per day, and a derived id the device service never registered is refused
+// 9074 however the message words it (six straight days of it after the
+// derived identity landed, task_runs 10-23..10-29). Only an exact uid
+// match is used, and only the device id is taken: the client's own token
+// is read past, never used.
+//
+// Fallback (BP-98 TRAE-2, unchanged): an empty pair is filled with a
+// per-account stable derivation — deterministic on (device_id, uid); for a
+// blob with neither, uid alone seeds it, so it never rotates. An identity
+// already in the blob survives a client-less scan (no reverting a real id
+// to a derived one just because the client was closed).
 func backfillTraeDevice(acc *model.Account) error {
 	if acc == nil {
 		return nil
@@ -1734,7 +1751,26 @@ func backfillTraeDevice(acc *model.Account) error {
 	if err != nil {
 		return nil // let the caller's own parse report the real problem
 	}
-	if creds.DeviceID != "" || creds.UID == "" {
+	if creds.UID == "" {
+		return nil
+	}
+	if real := clientDeviceFor(creds.UID); real != "" {
+		if creds.DeviceID != real {
+			creds.DeviceID = real
+			if creds.MachineID == "" {
+				creds.MachineID = ugDeviceID("", creds.UID+"-machine")
+			}
+			raw, err := json.Marshal(creds)
+			if err != nil {
+				return nil
+			}
+			acc.SetCredentials(raw)
+			acc.CredsDirty = true
+			log.Printf("trae: account %s now signs in on the local client's registered device (BP-210)", acc.ID)
+		}
+		return nil
+	}
+	if creds.DeviceID != "" {
 		return nil
 	}
 	creds.DeviceID = ugDeviceID("", creds.UID)
