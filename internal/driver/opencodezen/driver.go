@@ -9,11 +9,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"testing"
 	"time"
 
 	"bargainproxy/internal/config"
@@ -44,6 +48,11 @@ type Driver struct {
 	// wireFor resolves a model id to its upstream lane ("chat" / "responses";
 	// "" = not servable). Wired from the catalog in main; nil means chat.
 	wireFor func(string) string
+	// sidecar carries the final HTTP hop through Bun's fetch when a Bun
+	// runtime exists (BP-220): the free lane's TLS gate refuses Go's
+	// handshake. Started in New; the lane falls back to direct until/unless
+	// it is up.
+	sidecar zenSidecar
 }
 
 // SetWireResolver wires the catalog's lane decision into the driver.
@@ -56,6 +65,22 @@ func New(cfg config.OpenCodeZenSettings, httpClient *http.Client) *Driver {
 	}
 	d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
 	d.gateEnabled.Store(true)
+	// The TLS gate is bypassed by the Bun sidecar; without Bun the driver
+	// logs once and serves over Go's transport (the gate then refuses). Off
+	// under `go test` — tests must not spawn runtimes.
+	if testing.Testing() {
+		if os.Getenv("BP_ZEN_SIDECAR") != "off" {
+			// allow an explicit opt-in for a sidecar e2e test later
+			if os.Getenv("BP_ZEN_SIDECAR") != "on" {
+				return d
+			}
+		}
+		go startZenSidecar(d)
+		return d
+	}
+	if os.Getenv("BP_ZEN_SIDECAR") != "off" {
+		go startZenSidecar(d)
+	}
 	return d
 }
 
@@ -381,7 +406,14 @@ func (d *Driver) buildWire(call driver.ChatCall) ([]byte, error) {
 	}
 	if req.MaxTokens > 0 {
 		body["max_tokens"] = req.MaxTokens
+	} else {
+		// The desktop asks 32000 explicitly (BP-219 capture); some free models
+		// refuse a body with neither limit named.
+		body["max_completion_tokens"] = 32000
 	}
+	// Usage comes in the terminal chunk when this is set; the desktop always
+	// sends it (BP-219 capture) and our cache/usage accounting needs it.
+	body["stream_options"] = map[string]any{"include_usage": true}
 	if req.TopP != nil {
 		body["top_p"] = *req.TopP
 	}
@@ -435,6 +467,22 @@ func (d *Driver) buildWire(call driver.ChatCall) ([]byte, error) {
 	return json.Marshal(body)
 }
 
+// dumpWireOnFailure writes the exact upstream wire of a refused request when
+// BP_ZEN_DEBUG_WIRE is set (BP-219 field debugging; the file lands in logs/).
+func (d *Driver) dumpWireOnFailure(wire []byte, status int) {
+	if os.Getenv("BP_ZEN_DEBUG_WIRE") == "" {
+		return
+	}
+	path := filepath.Join("logs", "zen_wire_debug.json")
+	hdr := fmt.Appendf(nil, "status=%d\n", status)
+	if err := os.WriteFile(path, append(hdr, wire...), 0o644); err != nil {
+		log.Printf("opencodezen: wire dump: %v", err)
+		return
+	}
+	log.Printf("opencodezen: dumped refused wire (%d bytes) to %s", len(wire), path)
+}
+
+// chatOnce posts one request and parses the SSE stream.
 // chatOnce posts one request and parses the SSE stream.
 func (d *Driver) chatOnce(ctx context.Context, wire []byte, emit driver.Emit) (*ir.ChatResponse, error) {
 	ids := deriveRequestIDs(wire)
@@ -447,13 +495,14 @@ func (d *Driver) chatOnce(ctx context.Context, wire []byte, emit driver.Emit) (*
 	for _, h := range disguiseHeaders(ids, "chat") {
 		req.Header.Set(h[0], h[1])
 	}
-	resp, err := d.http.Do(req)
+	resp, err := d.zenRoundTrip(d.http, req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "opencodezen: %v", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		d.dumpWireOnFailure(wire, resp.StatusCode)
 		return nil, classifyHTTP(resp.StatusCode, raw)
 	}
 	stream := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
@@ -828,13 +877,14 @@ func (d *Driver) responsesOnce(ctx context.Context, wire []byte, emit driver.Emi
 	for _, h := range disguiseHeaders(ids, "responses") {
 		req.Header.Set(h[0], h[1])
 	}
-	resp, err := d.http.Do(req)
+	resp, err := d.zenRoundTrip(d.http, req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "opencodezen: %v", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		d.dumpWireOnFailure(wire, resp.StatusCode)
 		return nil, classifyHTTP(resp.StatusCode, raw)
 	}
 	stream := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())

@@ -124,7 +124,7 @@ func TestBuildResponsesWireShape(t *testing.T) {
 		}
 		names[tm["name"].(string)] = true
 	}
-	if !names["get_weather"] || !names["bash"] || !names["read"] {
+	if !names["get_weather"] || !names["shell"] || !names["read"] {
 		t.Fatalf("tools missing: %v", names)
 	}
 	input, _ := body["input"].([]any)
@@ -146,7 +146,7 @@ func TestParseResponsesSSE(t *testing.T) {
 		`data: {"type":"response.reasoning_summary_text.delta","delta":"think"}`,
 		`data: {"type":"response.output_text.delta","delta":"po"}`,
 		`data: {"type":"response.output_text.delta","delta":"ng"}`,
-		`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_9","name":"bash"}}`,
+		`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_9","name":"shell"}}`,
 		`data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"cmd\":"}`,
 		`data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"\"ls\"}"}`,
 		`data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":11,"output_tokens":3,"input_tokens_details":{"cached_tokens":7}}}}`,

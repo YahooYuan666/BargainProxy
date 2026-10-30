@@ -268,7 +268,11 @@ func (p *Panel) zenSyncNow(ctx context.Context) (string, error) {
 // the hot route table and persists it through the panel's routes setting
 // (same storage the route editor uses, so the two stay consistent).
 func (p *Panel) zenApplyRoutes(add bool) error {
-	rows := p.gw.RouteRows()
+	// BP-218: the write-back SOURCE must be the unfiltered table. RouteRows
+	// curates by primary_models for display; sourcing it here turned every
+	// zen sync tick into a silent purge of every route row outside the
+	// operator's primary list — including rows the operator added on purpose.
+	rows := p.gw.RouteRowsAll()
 	var kept []router.Row
 	for _, row := range rows {
 		if row.Channel == model.ChannelOpenCodeZen {

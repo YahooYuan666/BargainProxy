@@ -855,7 +855,10 @@ func RestoreHotSettings(gw *gateway.Gateway, st store.Store) []string {
 // --- model routes ---
 
 func (p *Panel) handleRoutesGet(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"routes": p.gw.RouteRows()})
+	// BP-218: the editor edits the REAL table, so it must SEE the real table.
+	// Serving the primary_models-filtered view made the editor's own save a
+	// silent purge of every row the display had hidden.
+	writeJSON(w, http.StatusOK, map[string]any{"routes": p.gw.RouteRowsAll()})
 }
 
 type routesRequest struct {

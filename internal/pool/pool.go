@@ -150,7 +150,20 @@ type Params struct {
 	// pause goes on the channel and no account is charged (BP-94).
 	// Default 60s; 0 disables the pause.
 	EdgeBlockPause time.Duration
-	Now            func() time.Time
+	// WindowExpiryPause is the channel+model shared pause applied once the
+	// FIRST-BYTE WINDOW has expired on the pair twice inside windowTripSpan
+	// (BP-217). A window expiry arrives as ClassCanceled — the gateway's own
+	// timer fired because the upstream sent zero bytes — and ClassCanceled
+	// deliberately carries no account penalty (ticket 27: a client cancel or
+	// a slow answer must never cool a healthy account). What was missing is
+	// the channel-level memory: a silently hung upstream re-paid the full
+	// window on EVERY request (field 2026-10-30 22:43–23:03: 17 requests
+	// waited 60s each on a zero-byte workbuddy before cascading to trae).
+	// The pause is channel-scoped shared state, accounts untouched, and it
+	// expires on its own so the leg is re-probed without operator action;
+	// any successful answer clears the pile-up. Default 2m.
+	WindowExpiryPause time.Duration
+	Now               func() time.Time
 }
 
 // Pool is the account pool.
@@ -188,7 +201,12 @@ type Pool struct {
 	// lastRestricted remembers the last upstream restriction per channel, for
 	// the BP-146 escalation: two bans inside a window park the channel.
 	lastRestricted map[string]time.Time
-	closed         bool
+	// windowFails holds the recent first-byte-window expiry timestamps per
+	// channel|model (BP-217): the pile-up that trips WindowExpiryPause.
+	// Pruned by windowTripSpan on every note; cleared for the pair on any
+	// successful answer.
+	windowFails map[string][]time.Time
+	closed      bool
 }
 
 type sessionBinding struct {
@@ -245,6 +263,9 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 	if params.EdgeBlockPause <= 0 {
 		params.EdgeBlockPause = 60 * time.Second
 	}
+	if params.WindowExpiryPause <= 0 {
+		params.WindowExpiryPause = 2 * time.Minute
+	}
 	if params.ModelRateHoldCap <= 0 {
 		params.ModelRateHoldCap = 2 * time.Hour
 	}
@@ -263,6 +284,7 @@ func New(params Params, limits map[string]int, onChange func(*model.Account)) *P
 		deadModels:     map[string]*deadModelVerdict{},
 		pending:        map[string]*model.Account{},
 		lastRestricted: map[string]time.Time{},
+		windowFails:    map[string][]time.Time{},
 		persistWake:    make(chan struct{}, 1),
 		persistDone:    make(chan struct{}),
 	}
@@ -602,6 +624,49 @@ func (p *Pool) markChannelBusyLocked(channel, modelName string, until time.Time)
 		return // keep the later deadline
 	}
 	p.busyUntil[key] = until
+}
+
+// windowTripThreshold is how many first-byte window expiries on one
+// channel+model inside windowTripSpan trip the WindowExpiryPause (BP-217).
+// Two consecutive zero-byte stalls are enough to stop paying the window on a
+// dead leg; a single stall — one slow response — never pauses anything.
+const (
+	windowTripThreshold = 2
+	windowTripSpan      = 10 * time.Minute
+)
+
+// NoteWindowExpiry records a first-byte window expiry for channel+model and
+// trips the shared WindowExpiryPause when they pile up (BP-217).
+//
+// The gateway calls this ONLY when its own timer fired — the client is still
+// connected and the upstream sent zero bytes. A plain client cancel never
+// reaches here, so the ticket-27 rule "cancellations carry no account
+// penalty" keeps holding: this is channel-scoped shared state and the account
+// state machine is untouched, exactly like the 6021 queue-full pause. The
+// pause makes the NEXT request fail fast to the next binding instead of
+// re-paying the full window on a leg that just proved it can stay silent for
+// a whole window; expiring on its own, it re-probes the leg without operator
+// action. The counter survives the pause on purpose: while the upstream stays
+// hung, ONE probe per pause cycle is enough to re-trip; any successful answer
+// clears it (ApplyResult).
+func (p *Pool) NoteWindowExpiry(channel, modelName string) {
+	if p.params.WindowExpiryPause <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := p.params.Now()
+	key := channel + "|" + modelName
+	kept := p.windowFails[key][:0]
+	for _, ts := range p.windowFails[key] {
+		if now.Sub(ts) < windowTripSpan {
+			kept = append(kept, ts)
+		}
+	}
+	p.windowFails[key] = append(kept, now)
+	if len(p.windowFails[key]) >= windowTripThreshold {
+		p.markChannelBusyLocked(channel, modelName, now.Add(p.params.WindowExpiryPause))
+	}
 }
 
 // poolHolderNickname returns the nickname of the account currently
@@ -1023,6 +1088,12 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 	if upstreamErr == nil {
 		a.ConsecutiveFails = 0
 		a.BreakerFails = 0
+		// BP-217: an answer is the strongest evidence the recent first-byte
+		// stalls were transient — forget the pile-up so stall → success →
+		// stall never reads as "two consecutive stalls" and trips the pause.
+		if len(p.windowFails) > 0 {
+			delete(p.windowFails, a.Channel+"|"+model)
+		}
 		// It answered, so it is not a risk-control candidate any more: take it
 		// out of the sunk set and let the rotation reach it again (BP-91).
 		a.RateLimitedAt = time.Time{}
@@ -1065,7 +1136,14 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 			// with this account's history, and letting a stale breaker stretch
 			// the wait turns the base window into 40 minutes for a wall the
 			// account cannot influence.
-			until = now.Add(p.softRateBase(0))
+			// BP-221: fixed 60s, not the base backoff — the base defaults to
+			// 10 minutes, and 2026-10-31 field data shows the shared wall is
+			// EPISODIC (the same shape 200 eight times at a 10s pace right
+			// after one 429), so a 10-minute rest throws away a lane that
+			// works again within the minute. The gateway's BP-221 hold-and-
+			// resend rides the first refusal inside the turn; this short rest
+			// only paces the FOLLOW-UP requests.
+			until = now.Add(60 * time.Second)
 			p.restAccount(a, until, "shared quota", "fixed", now)
 			upstreamErr.HoldUntil = until
 			p.sinkLocked(a, now)

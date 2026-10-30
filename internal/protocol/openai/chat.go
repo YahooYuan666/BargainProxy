@@ -393,9 +393,30 @@ func UsageFromIR(u ir.Usage) *Usage {
 	return out
 }
 
+// FinishReason translates the normalized stop reason into the OpenAI wire
+// vocabulary. IR uses Anthropic's word for a tool round ("tool_use"); OpenAI
+// spells the same state "tool_calls". Emitting the raw IR value made strict
+// clients reject a perfectly complete tool round — OpenMausBot throws
+// "provider tool calls were truncated or malformed" for any finish_reason
+// other than "tool_calls"/"stop" (BP-216).
+func FinishReason(r ir.StopReason) string {
+	switch r {
+	case ir.StopLength:
+		return "length"
+	case ir.StopToolUse:
+		return "tool_calls"
+	case ir.StopContentFilter:
+		return "content_filter"
+	case ir.StopEnd:
+		return "stop"
+	default:
+		return "stop"
+	}
+}
+
 // RenderCompletion renders a full ChatCompletion.
 func RenderCompletion(id, model string, created int64, resp *ir.ChatResponse) *ChatCompletion {
-	finish := string(resp.StopReason)
+	finish := FinishReason(resp.StopReason)
 	msg := &RespMessage{Role: "assistant", Content: textOf(resp.Message.Content)}
 	// Aggregated reasoning surfaces as reasoning_content — DeepSeek-style
 	// clients expect it in non-streamed completions too (BP-41).

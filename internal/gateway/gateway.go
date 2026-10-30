@@ -74,7 +74,19 @@ type Trace struct {
 	// EffortRetried pins the BP-182 effort-downgrade retry to once per
 	// request.
 	EffortRetried bool
+	// SharedRateRodeOut pins the BP-221 shared-quota hold-and-resend to once
+	// per request: a second FreeUsageLimitError inside the same turn falls
+	// through to the pool's normal handling instead of stacking holds.
+	SharedRateRodeOut bool
 }
+
+// BP-221 tunables: how long one shared-lane hold lasts and how many times a
+// turn may ride the lease while the shared bucket is closed. Overridable in
+// tests (sharedRateHold is shortened there).
+var (
+	sharedRateHold       = 50 * time.Second
+	sharedRateMaxResends = 4
+)
 
 // effortRejected reports whether a 400 body names the effort gear as the
 // thing it refused. Deliberately narrow (BP-182): a generic "invalid
@@ -307,6 +319,13 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// sandbox relay) raise their own ceiling without making healthy quick
 		// channels wait longer (BP-71).
 		win := fbWaitFor(g.fbBaseFor(), req, g.fbCeiling(binding.Channel))
+		// TEMP BP-218 diagnostics: the open-design memory legs outlived their
+		// client's timeout with the window never firing. Log the resolved
+		// window chain until the discrepancy is named, then remove.
+		if strings.HasPrefix(req.Model, "open-design-byok/") {
+			log.Printf("bp218-diag: binding=%s bi=%d/%d base=%s ceiling=%s win=%s stream=%v",
+				binding.Channel, bi, len(bindings), g.fbBaseFor(), g.fbCeiling(binding.Channel), win, req.Stream)
+		}
 		if bi == len(bindings)-1 {
 			// The LAST binding has nowhere to cascade to, so a first-byte
 			// window can only hurt: it turns a slow-but-healthy upstream into a
@@ -567,6 +586,16 @@ func fbWaitFor(base time.Duration, req *ir.ChatRequest, ceiling time.Duration) t
 	}
 	n := estimatePromptTokens(req)
 	if n <= 0 {
+		// A request whose text we cannot estimate must still honour the
+		// channel ceiling: returning the UNCAPPED base is how a 10s
+		// per-channel cap silently became 30s for exactly the requests we
+		// understand least (field 2026-10-31: the open-design memory legs
+		// ran past their client's timeout with the window never firing —
+		// the 300ms live probe proved the whole mechanism, so the only
+		// window value that fits the logs is the uncapped base).
+		if base > ceiling {
+			return ceiling
+		}
 		return base
 	}
 	w := base + time.Duration(n/2000)*time.Second
@@ -670,7 +699,13 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		attemptEmit := emit
 		if window > 0 {
 			actx, cancel = context.WithCancel(ctx)
-			timer := time.AfterFunc(window, cancel)
+			// TEMP BP-218 diagnostics: the timer's own fire must be visible —
+			// a leg that outlives its window with no "window expired" note
+			// could mean the timer never fired OR that the abort was ignored.
+			timer := time.AfterFunc(window, func() {
+				log.Printf("bp218-diag: WINDOW FIRED channel=%s win=%s", binding.Channel, window)
+				cancel()
+			})
 			attemptEmit = func(ev ir.StreamEvent) error {
 				timer.Stop()
 				return emit(ev)
@@ -816,6 +851,75 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				}
 			}
 		}
+		// BP-221: the zen free lane's FreeUsageLimitError is EPISODIC. Field
+		// 2026-10-31: one request in a burst of healthy ones was refused with
+		// the shared-allowance 429, and the identical shape answered 200 seven
+		// more times over the following hour (8/8 at a 10s pace at peak); the
+		// allowance belongs to the egress (SharedQuota), so the wall is never
+		// the account's. Ride it out: hold the same lease ~45s and resend the
+		// identical bytes once, while nothing reached the client. A real
+		// exhaustion survives this once and then falls through to the pool's
+		// short shared-quota rest and the honest error.
+		if streamErr != nil && !emitted() {
+			if ue, ok := uperr.As(streamErr); ok && ue.Class == uperr.ClassSoftRate &&
+				ue.SharedQuota && ctx.Err() == nil && (tr == nil || !tr.SharedRateRodeOut) {
+				if tr != nil {
+					tr.SharedRateRodeOut = true
+				}
+				// BP-221 (upgraded 2026-10-31 night): the lane's shared bucket
+				// refills on its own schedule — minutes of silence did not
+				// reopen it, yet the same bytes passed earlier the same hour —
+				// so a single 45s hold is not patient enough. Ride the lease:
+				// up to sharedRateMaxResends holds ~50s apart, each resend with
+				// a fresh first-byte window, only while nothing reached the
+				// client and the user is still connected. A turn then costs
+				// minutes instead of failing; a real day-long exhaustion still
+				// lands as the honest error.
+				for r := 0; r < sharedRateMaxResends && ctx.Err() == nil; r++ {
+					wait := sharedRateHold
+					if !ue.ResetAt.IsZero() {
+						if d := time.Until(ue.ResetAt); d > 0 && d < wait {
+							wait = d
+						}
+					}
+					log.Printf("gateway: %s shared free lane refused — holding the lease %s (resend %d/%d, BP-221)",
+						binding.Channel, wait.Round(time.Second), r+1, sharedRateMaxResends)
+					// The hold runs on the CLIENT context: the failed
+					// attempt's first-byte timer is still armed and would cut
+					// the hold mid-way (the 8s-window test proved it).
+					select {
+					case <-ctx.Done():
+					case <-time.After(wait):
+					}
+					if ctx.Err() != nil {
+						break
+					}
+					_ = emit(ir.StreamEvent{Kind: ir.EvAttemptReset})
+					started = time.Now()
+					resendCtx := ctx
+					resendEmit := emit
+					if window > 0 {
+						var resendCancel context.CancelFunc
+						resendCtx, resendCancel = context.WithCancel(ctx)
+						timer := time.AfterFunc(window, resendCancel)
+						defer resendCancel()
+						resendEmit = func(ev ir.StreamEvent) error {
+							timer.Stop()
+							return emit(ev)
+						}
+					}
+					resp, streamErr = drv.Stream(resendCtx, call, resendEmit)
+					if streamErr == nil {
+						break
+					}
+					next, ok := uperr.As(streamErr)
+					if !ok || next.Class != uperr.ClassSoftRate || !next.SharedQuota {
+						break // a different failure: hand it to the normal path
+					}
+					ue = next
+				}
+			}
+		}
 		// BP-107 mid-stream continuation: the client has already seen part of
 		// the answer and the upstream dropped the connection. Switching channel
 		// is off the table (it would replay the whole turn), so carry on with
@@ -952,6 +1056,14 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		winNote := ""
 		if window > 0 && ue.Class == uperr.ClassCanceled && ctx.Err() == nil {
 			winNote = fmt.Sprintf(" first-byte window %s expired", window)
+			// BP-217: this cancel came from OUR timer — the client is still
+			// connected and the upstream sent zero bytes for a whole window.
+			// Record it so a second stall on the same channel+model pauses the
+			// pair and the following requests cascade without re-paying the
+			// window on a silently hung upstream. A client cancel (ctx.Err()
+			// != nil) never reaches this branch, so ticket-27's "cancellations
+			// carry no penalty" keeps holding.
+			g.pool.NoteWindowExpiry(binding.Channel, req.Model)
 		}
 		// The HTTP status is printed too (BP-110): several drivers word an
 		// upstream failure as "<channel>: <body>" and truncate the body, so a
@@ -1144,6 +1256,19 @@ func (g *Gateway) RouteRows() []router.Row {
 // ReplaceRoutes hot-swaps the model route table (validated by the router).
 func (g *Gateway) ReplaceRoutes(bindings []config.ModelBinding) error {
 	return g.router.Replace(bindings)
+}
+
+// RouteRowsAll returns the FULL route table with no primary_models
+// filtering (BP-218). RouteRows curates what the panel DISPLAYS — its own
+// config comment promises "routing is unaffected". Anything that feeds a
+// whole-table WRITE-BACK must use this instead: zen's route apply sourced
+// the filtered view, so within one sync tick it rewrote the live table and
+// the DB without every route row outside the operator's primary list
+// (field 2026-10-31: the open-design-byok/deepseek-v4.1-flash alias was
+// applied at boot — "routes=40 applied" in the log — and answering 404
+// two minutes later, because the zen write-back had already dropped it).
+func (g *Gateway) RouteRowsAll() []router.Row {
+	return g.router.Rows()
 }
 
 // Driver exposes a driver for probe tasks (panel/tasks).

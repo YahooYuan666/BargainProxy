@@ -2,6 +2,7 @@ package opencodezen
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"bargainproxy/internal/config"
@@ -9,16 +10,14 @@ import (
 	"bargainproxy/internal/ir"
 )
 
-// BP-127: the env block rides in the FIRST system message, appended to its
-// text (one message, so its cache holds).
+// BP-219: the first system message is COMPOSED the way the desktop composes
+// it — OpenCode's harness first, then the caller's own system text, then the
+// date/env/worktree tail — one message, so its cache holds.
 func TestEnvBlockAppendsToSystemText(t *testing.T) {
 	body := map[string]any{"messages": []map[string]any{
 		{"role": "system", "content": "be brief"},
 		{"role": "user", "content": "hi"},
 	}}
-	// BP-188: the block is built per request (a real working directory — the
-	// upstream 429s the literal "unknown" since 2026-10-29), so the test
-	// reproduces the same body-derived value before the injection runs.
 	env := zenEnvironmentFor(body)
 	injectEnvironment(body, false)
 	msgs := body["messages"].([]map[string]any)
@@ -26,41 +25,42 @@ func TestEnvBlockAppendsToSystemText(t *testing.T) {
 		t.Fatalf("messages = %d, want 2 (no new message added)", len(msgs))
 	}
 	c, _ := msgs[0]["content"].(string)
-	if c != "be brief\n\n"+env {
-		t.Fatalf("system content = %q", c)
+	if !strings.HasPrefix(c, harnessSystem) {
+		t.Fatalf("system must open with the embedded harness, got %.80q", c)
+	}
+	if !strings.Contains(c, "be brief") {
+		t.Fatalf("the caller's own system text must survive: %q", c[:200])
+	}
+	for _, want := range []string{"Today's date:", env, zenWorktreeNote} {
+		if !strings.Contains(c, want) {
+			t.Fatalf("composed system missing %q", want)
+		}
 	}
 	if _, isUser := msgs[1]["content"].(string); !isUser || msgs[1]["role"] != "user" {
 		t.Fatalf("user message mangled: %v", msgs[1])
 	}
 }
 
-// A request that already carries an env block is left alone; `<ENV>` and
-// `working directory:` do not count (upstream checks are exact).
+// A request that already carries an env block keeps its own block; the tail
+// then omits the duplicate so the message carries exactly one.
 func TestEnvBlockSkippedWhenPresent(t *testing.T) {
-	// Any env block counts as present — the request's own directory rides in
-	// it and must not be touched (BP-188: the block now carries a real path,
-	// but the skip rule is about the request, not the value).
 	const block = "<env>\n  Working directory: /tmp/some-project\n</env>"
 	body := map[string]any{"messages": []map[string]any{
 		{"role": "system", "content": "prompt\n\n" + block},
 	}}
 	injectEnvironment(body, false)
 	msgs := body["messages"].([]map[string]any)
-	if c, _ := msgs[0]["content"].(string); c != "prompt\n\n"+block {
-		t.Fatalf("content changed: %q", c)
+	c, _ := msgs[0]["content"].(string)
+	if !strings.HasPrefix(c, harnessSystem) || !strings.Contains(c, block) {
+		t.Fatalf("caller env must survive composition: %.80q", c)
 	}
-	body2 := map[string]any{"messages": []map[string]any{
-		{"role": "system", "content": "<ENV>\n  Working directory: x\n</ENV>"},
-	}}
-	injectEnvironment(body2, false)
-	msgs2 := body2["messages"].([]map[string]any)
-	if c, _ := msgs2[0]["content"].(string); !zenHasEnvironment.MatchString(c) {
-		t.Fatalf("exact-case env must still count as present, got %q", c)
+	if own := zenEnvironmentFor(body); strings.Contains(c, own) {
+		t.Fatalf("a second env block was appended:\n...%s", c[max(0, len(c)-300):])
 	}
 }
 
-// Array-shaped system content gets the block as one more text part, and a
-// request with no system message at all gets one put first.
+// Array-shaped system content is flattened into the composition, and a request
+// with no system message at all gets one put first.
 func TestEnvBlockPartsAndUnshift(t *testing.T) {
 	body := map[string]any{"messages": []any{
 		map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": "be brief"}}},
@@ -72,12 +72,9 @@ func TestEnvBlockPartsAndUnshift(t *testing.T) {
 	if len(msgs) != 2 {
 		t.Fatalf("messages = %d, want 2", len(msgs))
 	}
-	parts := msgs[0].(map[string]any)["content"].([]any)
-	if len(parts) != 2 {
-		t.Fatalf("parts = %d, want 2", len(parts))
-	}
-	if txt, _ := parts[1].(map[string]any)["text"].(string); txt != env {
-		t.Fatalf("appended part = %q", txt)
+	c, _ := msgs[0].(map[string]any)["content"].(string)
+	if !strings.HasPrefix(c, harnessSystem) || !strings.Contains(c, "be brief") || !strings.Contains(c, env) {
+		t.Fatalf("composed content = %.120q", c)
 	}
 	none := map[string]any{"messages": []any{map[string]any{"role": "user", "content": "hi"}}}
 	noneEnv := zenEnvironmentFor(none)
@@ -87,8 +84,11 @@ func TestEnvBlockPartsAndUnshift(t *testing.T) {
 		t.Fatalf("messages = %d, want 2", len(l))
 	}
 	first := l[0].(map[string]any)
-	if first["role"] != "system" || first["content"] != noneEnv {
-		t.Fatalf("unshifted system = %v", first)
+	if first["role"] != "system" {
+		t.Fatalf("unshifted role = %v", first["role"])
+	}
+	if c, _ := first["content"].(string); !strings.HasPrefix(c, harnessSystem) || !strings.Contains(c, noneEnv) {
+		t.Fatalf("unshifted system = %.120q", c)
 	}
 }
 
@@ -108,24 +108,38 @@ func TestEnvBlockResponsesInstructions(t *testing.T) {
 	}
 }
 
-// BP-127: each gate stand-in declares the parameter OpenCode's own
-// declaration leads with, additionalProperties off.
+// BP-127, reshaped by BP-219: the gate stand-ins are the desktop's OWN
+// declarations (captured from a live 2.2.2 request), each carrying its real
+// parameters — shell's command/workdir/timeout among them. The 1.19-era
+// one-property stubs are what the current gate refuses.
 func TestGateToolSchemas(t *testing.T) {
+	chat, responses := coreToolDefs()
+	if len(chat) == 0 || len(responses) == 0 {
+		t.Fatal("embedded core tool definitions failed to load")
+	}
 	for _, name := range gateToolNames {
-		schema := gateToolSchema(name)
-		props, _ := schema["properties"].(map[string]any)
-		if len(props) != 1 {
-			t.Fatalf("%s properties = %v, want exactly one", name, props)
+		ct, ok := chat[name]
+		if !ok {
+			t.Fatalf("chat definition missing for %q", name)
 		}
-		if _, ok := props[gateToolParam[name]]; !ok {
-			t.Fatalf("%s schema missing param %q: %v", name, gateToolParam[name], props)
+		fn, _ := ct["function"].(map[string]any)
+		params, _ := fn["parameters"].(map[string]any)
+		props, _ := params["properties"].(map[string]any)
+		if len(props) < 1 {
+			t.Fatalf("%s chat schema has no properties: %v", name, params)
+		}
+		if _, ok := props["command"]; name == "shell" && !ok {
+			t.Fatalf("shell schema must declare command: %v", props)
+		}
+		if _, ok := props["path"]; name == "read" && !ok {
+			t.Fatalf("read schema must declare path: %v", props)
+		}
+		if rt, ok := responses[name]; !ok || toolNameOf(rt) != name {
+			t.Fatalf("responses definition missing/mismamed for %q", name)
 		}
 	}
-	got := gateToolChat("bash")
-	fn := got["function"].(map[string]any)
-	raw, _ := json.Marshal(fn["parameters"])
-	if string(raw) != `{"additionalProperties":false,"properties":{"command":{"type":"string"}},"type":"object"}` {
-		t.Fatalf("bash chat schema = %s", raw)
+	if _, ok := chat["bash"]; ok {
+		t.Fatal("2.2.x has no bash tool; the 1.x name must not come back")
 	}
 }
 
@@ -204,9 +218,9 @@ func TestBuildChatWireCarriesEnvBlock(t *testing.T) {
 	t.Fatal("buildWire output carries no env block in any system message")
 }
 
-// The gate set is OpenCode's five-tool core, not the old bash/read pair.
+// The gate set is the desktop's five-tool core (2.2.x: shell, not bash).
 func TestGateToolNamesAreTheFiveCore(t *testing.T) {
-	want := map[string]bool{"bash": true, "edit": true, "glob": true, "grep": true, "read": true}
+	want := map[string]bool{"shell": true, "edit": true, "glob": true, "grep": true, "read": true}
 	got := map[string]bool{}
 	for _, n := range gateToolNames {
 		got[n] = true

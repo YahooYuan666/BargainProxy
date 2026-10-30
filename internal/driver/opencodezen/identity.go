@@ -14,6 +14,7 @@ package opencodezen
 import (
 	"crypto/rand"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -41,20 +42,18 @@ const AnonymousKey = "public"
 // protocols to `opencode/<channel>/<version>/<name>`, so the per-protocol
 // ai-sdk provider-utils segments the 1.x UA carried are history (BP-97 kept
 // them accurate for 1.19.0; BP-127 follows the 2.x format).
-const openCodeClientVersion = "2.0.25"
+// openCodeClientVersion is the OpenCode release the free lane currently
+// trusts. The desktop 2.2.2 is what the user runs and what the upstream sees
+// succeed (BP-219 capture, 2026-10-30); its UA is
+// `opencode/latest/2.2.2/desktop` and its client header is `desktop`
+// (packages/desktop/src/main/lifecycle/environment.ts sets OPENCODE_CLIENT).
+const openCodeClientVersion = "2.2.2"
 
 // gateToolNames are the function tools the free lane requires on every
-// request (live 2026-10-16: a request without them answers 403
-// FreeTierError). magpie zen-free 0.1.15 carries OpenCode's full five-tool
-// core set, each stand-in declaring the parameter OpenCode's own declaration
-// leads with — when the client did not bring them we inject shadow
-// definitions and strip the model's calls to them from the response.
-var gateToolNames = []string{"bash", "edit", "glob", "grep", "read"}
-
-// gateToolParam is each gate tool's leading parameter, as OpenCode declares it.
-var gateToolParam = map[string]string{
-	"bash": "command", "edit": "filePath", "glob": "pattern", "grep": "pattern", "read": "filePath",
-}
+// request. OpenCode 2.2.x renamed its shell tool (BP-219 capture: the desktop
+// offers shell/edit/glob/grep/read with REAL parameter schemas — the earlier
+// one-property stand-ins and the 1.x "bash" name belong to 1.19-era gates).
+var gateToolNames = []string{"shell", "edit", "glob", "grep", "read"}
 
 // acceptedEfforts are the reasoning_effort values the upstream actually
 // accepts; anything else (off/none/unknown) must be omitted, not passed
@@ -64,18 +63,6 @@ var acceptedEfforts = map[string]bool{
 }
 
 const gateDescription = "Reserved for the host runtime; do not call it."
-
-// gateToolSchema renders the stand-in's parameter schema: one required string
-// property, OpenCode's own shape for that tool.
-func gateToolSchema(name string) map[string]any {
-	return map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			gateToolParam[name]: map[string]any{"type": "string"},
-		},
-		"additionalProperties": false,
-	}
-}
 
 // --- OpenCode environment block ---------------------------------------------
 
@@ -234,14 +221,42 @@ func appendTextInto(dst *[]string, content any) {
 
 var zenHasEnvironment = regexp.MustCompile(`(?s)<env>.*Working directory:.*</env>`)
 
-// injectEnvironment appends the block to the request's own system text —
-// chat lane: the first system message (content stays one message so its
-// cache holds); responses lane: the instructions string. A request that
-// already carries an env block is left alone; with no system message at all
-// one is put first.
+// harnessSystem is OpenCode's own agent preamble, captured from a live 2.2.2
+// desktop request (BP-219, 2026-10-30) and embedded verbatim. The free-lane
+// gate reads the system text's SHAPE: a request whose first message is not
+// OpenCode's own harness answers 429 FreeUsageLimitError no matter what the
+// headers say (live matrix: harness+tools+env 200; any one of them missing
+// 429; the one-line "You are opencode" stand-in 429 too). The embedded text
+// is the static part only — it stops before the user-specific MCP
+// instructions, references, skills and AGENTS.md the desktop appends.
+//
+//go:embed assets/harness_system.md
+var harnessSystem string
+
+// zenWorktreeNote is the line the desktop appends after the env block.
+const zenWorktreeNote = "When you create a worktree outside the current working directory and intend to use it as your primary working directory, consider using `execute` to call `tools.opencode.session_move` and make the worktree the session's working directory."
+
+// zenSystemTail builds what the desktop appends AFTER the user's own
+// instructions: today's date, the env block, the worktree note (BP-219
+// capture order). The env block rides INSIDE the system message — a top-level
+// `system` field is not a chat-completions field and the gate never sees it.
+func zenSystemTail(body map[string]any, withEnv bool) string {
+	var b strings.Builder
+	b.WriteString("Today's date: " + time.Now().Format("Mon Jan 2 2006") + "\n\n")
+	if withEnv {
+		b.WriteString(zenEnvironmentFor(body) + "\n")
+	}
+	b.WriteString(zenWorktreeNote)
+	return b.String()
+}
+
+// injectEnvironment composes the first system message the way the desktop
+// does: OpenCode's harness first, then the request's own system text, then
+// the date/env/worktree tail (BP-219 capture). A request with no system
+// message gets one. The responses lane keeps its instructions-based shape.
 func injectEnvironment(body map[string]any, responsesLane bool) {
-	env := zenEnvironmentFor(body)
 	if responsesLane {
+		env := zenEnvironmentFor(body)
 		s, _ := body["instructions"].(string)
 		if zenHasEnvironment.MatchString(s) {
 			return
@@ -249,6 +264,7 @@ func injectEnvironment(body map[string]any, responsesLane bool) {
 		body["instructions"] = withEnvironment(s, env)
 		return
 	}
+	tail := zenSystemTail(body, true)
 	// The chat build stores messages as []map[string]any (a concrete []any
 	// here once silently replaced every real message — the ensureGateTools
 	// lesson), so both shapes are handled in place.
@@ -258,23 +274,10 @@ func injectEnvironment(body map[string]any, responsesLane bool) {
 			if role, _ := mm["role"].(string); role != "system" {
 				continue
 			}
-			switch c := mm["content"].(type) {
-			case string:
-				if zenHasEnvironment.MatchString(c) {
-					return
-				}
-				mm["content"] = withEnvironment(c, env)
-			case []any:
-				if partsHaveEnvironment(c) {
-					return
-				}
-				mm["content"] = append(c, map[string]any{"type": "text", "text": env})
-			case nil:
-				mm["content"] = env
-			}
+			mm["content"] = composeZenSystem(contentString(mm["content"]), tail)
 			return
 		}
-		body["messages"] = append([]map[string]any{{"role": "system", "content": env}}, msgs...)
+		body["messages"] = append([]map[string]any{{"role": "system", "content": harnessSystem + "\n" + tail}}, msgs...)
 	case []any:
 		for _, m := range msgs {
 			mm, ok := m.(map[string]any)
@@ -284,40 +287,53 @@ func injectEnvironment(body map[string]any, responsesLane bool) {
 			if role, _ := mm["role"].(string); role != "system" {
 				continue
 			}
-			switch c := mm["content"].(type) {
-			case string:
-				if zenHasEnvironment.MatchString(c) {
-					return
-				}
-				mm["content"] = withEnvironment(c, env)
-			case []any:
-				if partsHaveEnvironment(c) {
-					return
-				}
-				mm["content"] = append(c, map[string]any{"type": "text", "text": env})
-			case nil:
-				mm["content"] = env
-			}
+			mm["content"] = composeZenSystem(contentString(mm["content"]), tail)
 			return
 		}
-		body["messages"] = append([]any{map[string]any{"role": "system", "content": env}}, msgs...)
+		body["messages"] = append([]any{map[string]any{"role": "system", "content": harnessSystem + "\n" + tail}}, msgs...)
 	default:
-		body["messages"] = []any{map[string]any{"role": "system", "content": env}}
+		body["messages"] = []any{map[string]any{"role": "system", "content": harnessSystem + "\n" + tail}}
 	}
 }
 
-// partsHaveEnvironment scans array-shaped message content for an env block.
-func partsHaveEnvironment(parts []any) bool {
-	for _, p := range parts {
-		pm, ok := p.(map[string]any)
-		if !ok {
-			continue
+// contentString flattens the system-content shapes a caller may send (string,
+// text-part array, nil) to one string for composition.
+func contentString(v any) string {
+	switch c := v.(type) {
+	case string:
+		return c
+	case []any:
+		var parts []string
+		for _, p := range c {
+			if pm, ok := p.(map[string]any); ok {
+				if t, ok := pm["text"].(string); ok && t != "" {
+					parts = append(parts, t)
+				}
+			}
 		}
-		if txt, _ := pm["text"].(string); zenHasEnvironment.MatchString(txt) {
-			return true
-		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
 	}
-	return false
+}
+
+// composeZenSystem lays out harness + the caller's own system text + the
+// date/env tail, skipping blank pieces. The caller's env, if it sent one
+// already, is left inside its text and the tail omits its duplicate.
+func composeZenSystem(own, tail string) string {
+	withEnv := !zenHasEnvironment.MatchString(own)
+	if !withEnv {
+		tail = zenSystemTail(nil, false)
+	}
+	pieces := make([]string, 0, 3)
+	if strings.TrimSpace(harnessSystem) != "" {
+		pieces = append(pieces, harnessSystem)
+	}
+	if strings.TrimSpace(own) != "" {
+		pieces = append(pieces, own)
+	}
+	pieces = append(pieces, tail)
+	return strings.Join(pieces, "\n")
 }
 
 // withEnvironment appends the block to a system text the way the reference
@@ -537,28 +553,25 @@ func randomHex32() string {
 	return hex.EncodeToString(b[:])
 }
 
-// openCodeUserAgent is the CLI's own User-Agent. 1.x sent per-protocol
-// ai-sdk segments; 2.x sends ONE UA on every protocol:
-//
-//	opencode/<channel>/<version>/<name>   →   opencode/latest/2.0.25/cli
-//
-// (magpie zen-free captured it from the release binary and its live requests,
-// 2026-10-25.) The protocol argument is kept for call-site compatibility.
+// openCodeUserAgent is the desktop client's User-Agent (BP-219 capture:
+// opencode/latest/2.2.2/desktop — App.useragent with the desktop's
+// OPENCODE_CLIENT). The protocol argument is kept for call-site compatibility.
 func openCodeUserAgent(protocol string) string {
-	return fmt.Sprintf("opencode/latest/%s/cli", openCodeClientVersion)
+	return fmt.Sprintf("opencode/latest/%s/desktop", openCodeClientVersion)
 }
 
 // disguiseHeaders returns the full header set every upstream request carries.
 // protocol picks the ai-sdk segment of the User-Agent ("chat"/"responses"/
-// "anthropic"); "" means chat.
+// "anthropic"); "" means chat. 2.2.x sends no x-opencode-request (the 1.x
+// header): the capture shows exactly the ten fields model-request.ts sets.
 func disguiseHeaders(ids requestIDs, protocol string) [][2]string {
 	return [][2]string{
 		{"user-agent", openCodeUserAgent(protocol)},
-		{"x-opencode-client", "cli"},
+		{"x-opencode-client", "desktop"},
 		{"x-opencode-session", ids.session},
+		{"x-opencode-session-id", ids.session},
 		{"x-session-affinity", ids.session},
 		{"x-session-id", ids.session},
-		{"x-opencode-request", ids.request},
 		{"x-opencode-project", ids.project},
 		{"authorization", "Bearer " + AnonymousKey},
 	}
@@ -566,23 +579,68 @@ func disguiseHeaders(ids requestIDs, protocol string) [][2]string {
 
 // --- free-lane request shaping ---
 
+// coreToolDefs are the desktop's own declarations for the five core tools,
+// captured from a live 2.2.2 desktop request (BP-219, 2026-10-30) and embedded
+// verbatim. The gate reads the tools' SHAPES: the earlier one-property stand-in
+// schemas passed the 1.19-era gate but not this one (live matrix: real schemas
+// + harness 200, stub schemas 429).
+//
+//go:embed assets/core_tools.json
+var coreToolsJSON []byte
+
+var coreToolOnce sync.Once
+var coreToolChatDefs, coreToolResponsesDefs map[string]map[string]any
+
+func coreToolDefs() (map[string]map[string]any, map[string]map[string]any) {
+	coreToolOnce.Do(func() {
+		var list []map[string]any
+		if err := json.Unmarshal(coreToolsJSON, &list); err != nil {
+			return // fall back to the stand-ins below
+		}
+		chatDefs := map[string]map[string]any{}
+		responsesDefs := map[string]map[string]any{}
+		for _, t := range list {
+			if fn, ok := t["function"].(map[string]any); ok {
+				name, _ := fn["name"].(string)
+				if name == "" {
+					continue
+				}
+				chatDefs[name] = map[string]any{"type": "function", "function": fn}
+				responsesDefs[name] = map[string]any{
+					"type": "function", "name": name,
+					"description": fn["description"], "parameters": fn["parameters"],
+				}
+			}
+		}
+		coreToolChatDefs = chatDefs
+		coreToolResponsesDefs = responsesDefs
+	})
+	return coreToolChatDefs, coreToolResponsesDefs
+}
+
 func gateToolChat(name string) map[string]any {
+	chat, _ := coreToolDefs()
+	if t := chat[name]; t != nil {
+		return t
+	}
 	return map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        name,
 			"description": gateDescription,
-			"parameters":  gateToolSchema(name),
+			"parameters":  map[string]any{"type": "object", "properties": map[string]any{}, "required": []any{}},
 		},
 	}
 }
 
 func gateToolResponses(name string) map[string]any {
+	_, responses := coreToolDefs()
+	if t := responses[name]; t != nil {
+		return t
+	}
 	return map[string]any{
-		"type":        "function",
-		"name":        name,
-		"description": gateDescription,
-		"parameters":  gateToolSchema(name),
+		"type": "function", "name": name, "description": gateDescription,
+		"parameters": map[string]any{"type": "object", "properties": map[string]any{}, "required": []any{}},
 	}
 }
 

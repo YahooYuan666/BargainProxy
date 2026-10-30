@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -194,6 +195,27 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, openai.RenderError(err.Error(), "invalid_request_error", nil))
 		return
+	}
+	// TEMP BP-218 diagnostics: the open-design memory legs ran past their
+	// client's timeout with the first-byte window never firing, and the live
+	// probe proved the window mechanism — leaving estimate=0 as the only
+	// explanation. Log the real request shape until the blind spot is named,
+	// then remove.
+	if strings.HasPrefix(req.Model, "open-design-byok/") {
+		var shape []string
+		textChars := 0
+		for _, m := range req.Messages {
+			ks := ""
+			for _, p := range m.Content {
+				ks += string(p.Kind) + ","
+				if p.Kind == "text" {
+					textChars += len(p.Text)
+				}
+			}
+			shape = append(shape, fmt.Sprintf("%s(%d:%s)", m.Role, len(m.Content), ks))
+		}
+		log.Printf("bp218-diag: model=%s body=%dB msgs=%d tools=%d max_tokens=%d est=%d textchars=%d shape=%v",
+			req.Model, len(body), len(req.Messages), len(req.Tools), req.MaxTokens, ir.EstimatePromptTokens(req), textChars, shape)
 	}
 	if req.Model == "" {
 		writeJSON(w, http.StatusBadRequest, openai.RenderError("model is required", "invalid_request_error", nil))
@@ -381,7 +403,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 			}
 			return nil
 		case ir.EvDone:
-			finish := string(ev.Stop)
+			finish := openai.FinishReason(ev.Stop)
 			if err := send(openai.RenderChunk(reqID, req.Model, created, &openai.RespDelta{}, &finish)); err != nil {
 				return err
 			}
