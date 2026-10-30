@@ -18,7 +18,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -77,15 +79,25 @@ func gateToolSchema(name string) map[string]any {
 
 // --- OpenCode environment block ---------------------------------------------
 
-// zenEnvironmentFor renders the env block with a REAL working directory.
-// Since 2026-10-29 (magpie-community/plugins 1f56706) the upstream
-// fingerprints the literal "Working directory: unknown" as a proxy's
-// constant and answers 429 FreeUsageLimitError to it, so the block must
-// carry a directory a real client would: extracted from the request's own
-// texts (OpenCode's `<cwd>…</cwd>`, or a "Working directory: …" line), else
-// this process's working directory, else the user's home. The 10-25 reading
-// — "the directory isn't known here, so say unknown rather than a path that
-// would mislead the model" — is exactly what the gate now refuses.
+// zenEnvironmentFor renders OpenCode's OWN environment block. The upstream
+// gate is not "a block exists" but "this looks like the block OpenCode
+// writes": magpie-community/plugins packages/zen-free provider.mjs says a
+// fixed text only this plugin sends is itself the fingerprint (that is how
+// "Working directory: unknown" got refused on 2026-10-29, and how the 1.19.0
+// User-Agent got refused before it). So the block is OpenCode 2.2.0's own,
+// six lines, byte-shaped as its packages/core builtins.ts writes them:
+//
+//	Here is some useful information about the environment you are running in:
+//	<env>
+//	  Working directory: <dir>
+//	  Workspace root folder: <dir>
+//	  Is directory a git repo: yes|no
+//	  Platform: win32|darwin|linux
+//	</env>
+//
+// The directory is the request's own when its prompt names one, else this
+// process's working directory, else the user's home. "unknown" is never
+// sent — that literal is exactly what the gate punishes.
 func zenEnvironmentFor(body map[string]any) string {
 	dir := extractWorkingDir(body)
 	if dir == "" {
@@ -101,7 +113,48 @@ func zenEnvironmentFor(body map[string]any) string {
 	if dir == "" {
 		dir = "." // nothing derivable: the current-directory shorthand
 	}
-	return "<env>\n  Working directory: " + dir + "\n</env>"
+	return "Here is some useful information about the environment you are running in:\n" +
+		"<env>\n" +
+		"  Working directory: " + dir + "\n" +
+		"  Workspace root folder: " + dir + "\n" +
+		"  Is directory a git repo: " + zenGitFlag(dir) + "\n" +
+		"  Platform: " + zenPlatform() + "\n" +
+		"</env>"
+}
+
+// zenPlatform is the platform name OpenCode writes: node's process.platform
+// spelling (win32/darwin/linux), NOT Go's GOOS (windows/darwin/linux) — the
+// difference on Windows alone would be a fingerprint.
+func zenPlatform() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win32"
+	case "darwin":
+		return "darwin"
+	case "linux":
+		return "linux"
+	default:
+		return runtime.GOOS
+	}
+}
+
+// zenGitFlag answers "Is directory a git repo" the way OpenCode does: a
+// .git entry in the directory itself. A directory we cannot stat says "no"
+// (the same thing OpenCode's own try/catch leaves behind).
+func zenGitFlag(dir string) string {
+	if dir == "" || dir == "." {
+		return "no"
+	}
+	expanded := dir
+	if home, err := os.UserHomeDir(); err == nil {
+		if rest, ok := strings.CutPrefix(dir, "~/"); ok {
+			expanded = filepath.Join(home, rest)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(expanded, ".git")); err == nil {
+		return "yes"
+	}
+	return "no"
 }
 
 var (

@@ -148,9 +148,20 @@ func TestAdmissionThreeStates(t *testing.T) {
 	if got := p.AdmissionOf(a, "m"); got != AdmitNew {
 		t.Fatalf("grace elapsed = %v, want AdmitNew", got)
 	}
-	// Repeated failures without a rest: sticky only.
+	// Repeated failures without a rest: sticky only — while the failures are
+	// RECENT. The band is time-bounded (BP-215): an account refused every new
+	// conversation can never earn the success that clears its counter, so
+	// "failing" means "failed within the grace", which ApplyResult records by
+	// bumping UpdatedAt.
 	a.BreakerFails = 2
+	a.UpdatedAt = now
 	if got := p.AdmissionOf(a, "m"); got != AdmitSticky {
 		t.Fatalf("failing account = %v, want AdmitSticky", got)
+	}
+	// Failures older than the grace no longer hold it out: it gets new
+	// conversations back so it can prove itself, and a fresh failure re-arms.
+	a.UpdatedAt = now.Add(-5 * time.Minute)
+	if got := p.AdmissionOf(a, "m"); got != AdmitNew {
+		t.Fatalf("stale failures = %v, want AdmitNew (an unbounded band is a deadlock)", got)
 	}
 }

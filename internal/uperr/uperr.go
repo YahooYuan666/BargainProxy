@@ -95,8 +95,18 @@ type Error struct {
 	// that moment instead of applying the 2h ModelRateHoldCap — the cap is a
 	// guard against OUR invented/guessed durations, not against upstream's
 	// own numbers (BP-135: user ruling, antigravity buckets are hard).
-	ResetHard bool   `json:"-"`
-	Model     string // set when the error is scoped to a single model
+	ResetHard bool `json:"-"`
+	// SharedQuota marks a ResetAt that belongs to a SHARED, per-egress
+	// allowance rather than to this account (opencodezen's anonymous free
+	// lane: one daily allowance for the whole egress IP, spent by whoever
+	// asks first). The pool must NOT rest the account until that moment —
+	// the account is fine, and a multi-hour channel-wide rest is exactly
+	// what made a healthy free lane look dead (field 2026-10-30: one 429
+	// cooled the channel to 00:00 UTC, so every later probe answered
+	// "cooling down" without ever reaching upstream). The moment still
+	// rides ResetAt so clients and the panel report the honest wait.
+	SharedQuota bool   `json:"-"`
+	Model       string // set when the error is scoped to a single model
 	Channel   string // binding that produced the failure (final one for pool errors)
 	Sentinel  string // matched sentinel text for ClassSentinel
 	// Code is the upstream business code when the body carried one (e.g.

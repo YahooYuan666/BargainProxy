@@ -22,6 +22,9 @@ const (
 	KeyZenSyncMinutes   = "opencodezen_sync_minutes"   // int
 	KeyZenAddToGateway  = "opencodezen_add_to_gateway" // "true" | "false"
 	KeyZenRoutesEnabled = "opencodezen_routes_enabled" // "true" = routes registered
+	// KeyZenBootProbe gates the startup probe (BP-212). Default "false":
+	// probing is a real chat request against the shared anonymous allowance.
+	KeyZenBootProbe = "opencodezen_boot_probe"
 )
 
 // zenHolder wires the catalog/driver built in main into the panel.
@@ -40,12 +43,19 @@ func (p *Panel) ZenAutoTick(ctx context.Context) bool {
 	return true
 }
 
-// ZenBootProbe runs the single availability pass at startup: refresh the
-// catalog when it is empty (fresh install), probe every candidate once, then
-// apply the routes so the ZCode picker matches reality. This is deliberately
-// the only automatic probe — a scheduled one spends the shared anonymous
-// quota and turns any transient 429 into a page full of "unavailable" models.
-// After boot the user probes from the panel on demand.
+// ZenBootProbe runs the startup availability pass: refresh the catalog when
+// it is empty (fresh install), then apply the routes so the ZCode picker
+// matches reality.
+//
+// BP-212: the PROBE half is off by default (KeyZenBootProbe, default
+// "false"). Every probe is a real chat request against the shared anonymous
+// allowance, and eight of them at every boot spent that allowance before the
+// user's first real request — which then answered 429 FreeUsageLimitError
+// and read as "the channel is broken" (field 2026-10-30: 0/8 ok at boot,
+// every model 429 all day, while the models LIST still answered 200). The
+// catalog sync below is a free GET and still runs, so the picker stays
+// accurate; probing is a panel action now. An operator who wants the old
+// behaviour sets the setting back to "true".
 func (p *Panel) ZenBootProbe(ctx context.Context) {
 	c := p.zenCatalog()
 	if c == nil || p.zenDriver() == nil {
@@ -56,8 +66,12 @@ func (p *Panel) ZenBootProbe(ctx context.Context) {
 			log.Printf("opencodezen: startup sync: %v", err)
 		}
 	}
-	okCount, limitedCount, total := c.ProbeCandidates(ctx, p.zenDriver(), 60*time.Second)
-	log.Printf("opencodezen: startup probe %d/%d ok, %d limited", okCount, total, limitedCount)
+	if p.zenSetting(KeyZenBootProbe, "false") == "true" {
+		okCount, limitedCount, total := c.ProbeCandidates(ctx, p.zenDriver(), 60*time.Second)
+		log.Printf("opencodezen: startup probe %d/%d ok, %d limited", okCount, total, limitedCount)
+	} else {
+		log.Printf("opencodezen: startup probe skipped (BP-212: probing spends the shared free allowance; probe from the panel)")
+	}
 	if _, err := p.zenSyncNow(context.Background()); err != nil {
 		log.Printf("opencodezen: post-probe sync: %v", err)
 	}

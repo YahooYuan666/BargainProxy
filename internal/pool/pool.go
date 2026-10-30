@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"sync"
@@ -451,27 +452,6 @@ func (p *Pool) limitForAccount(a *model.Account) int {
 	return limit
 }
 
-// usableForModel reports whether the account can serve the model at all
-// right now (not disabled, realm-visible, not cooling). In-flight load is
-// deliberately excluded: a healthy-but-full account is waited for by its
-// bound sessions rather than swapped (no-drift sticky). Callers must hold
-// the lock.
-func (p *Pool) usableForModel(a *model.Account, modelName string, now time.Time) bool {
-	if a.Disabled || a.Paused {
-		return false
-	}
-	if a.Realm == "global" && !p.globalEnabled {
-		return false
-	}
-	if now.Before(a.AccountCooldownUntil) {
-		return false
-	}
-	if mc, ok := a.ModelCooldowns[modelName]; ok && now.Before(mc.Until) {
-		return false
-	}
-	return true
-}
-
 // floorBlockedLocked reports whether the credit floor holds the account out
 // for this model: an exhausted balance blocks only models the account has
 // been observed to bill (tier 2) — free/unknown stay eligible, and an
@@ -486,8 +466,14 @@ func (p *Pool) floorBlockedLocked(a *model.Account, modelName string, now time.T
 		costTierLocked(a, modelName, now, p.params.CostTTL) == 2
 }
 
-// earliestReset returns the earliest moment any account could become usable.
+// earliestReset returns the earliest moment any account could take NEW traffic.
 // Callers must hold the lock.
+//
+// It asks admissionAt rather than reading the cooldown fields directly (BP-215):
+// a sticky-only account is not cooling but is still refused for a new
+// conversation, and the old field-based answer said "now" for it — the client
+// was told to retry at once, retried, and got the same refusal, so a two-minute
+// sticky band read as a dead channel.
 func (p *Pool) earliestReset(channel, modelName string, now time.Time) time.Time {
 	var earliest time.Time
 	for _, id := range p.byChan[channel] {
@@ -495,15 +481,17 @@ func (p *Pool) earliestReset(channel, modelName string, now time.Time) time.Time
 		if a == nil || a.Disabled || a.Paused {
 			continue
 		}
-		t := a.AccountCooldownUntil
-		if mc, ok := a.ModelCooldowns[modelName]; ok && mc.Until.After(t) {
-			t = mc.Until
-		}
-		if t.IsZero() || !t.After(now) {
+		adm, lift := p.admissionAt(a, modelName, now)
+		if adm == AdmitNew {
 			return now // somebody is usable now (was likely just released)
 		}
-		if earliest.IsZero() || t.Before(earliest) {
-			earliest = t
+		if !lift.After(now) {
+			// Blocked with no self-lifting deadline (the realm switch, say):
+			// it will not reset on its own, so it contributes no wait.
+			continue
+		}
+		if earliest.IsZero() || lift.Before(earliest) {
+			earliest = lift
 		}
 	}
 	return earliest
@@ -545,15 +533,17 @@ func (p *Pool) NextAvailable(channel, modelName string) (bool, time.Time) {
 		if p.floorBlockedLocked(a, modelName, now) {
 			continue
 		}
-		if p.usableForModel(a, modelName, now) {
+		// Ask admission, not the raw cooldown fields (BP-215): a sticky-only
+		// account is not cooling, but it will refuse a new conversation, so
+		// reporting it "available" made the binding loop commit to a route and
+		// then discover the refusal — a bogus no-capacity failure instead of the
+		// short wait that is actually happening.
+		adm, lift := p.admissionAt(a, modelName, now)
+		if adm == AdmitNew {
 			return true, time.Time{}
 		}
-		t := a.AccountCooldownUntil
-		if mc, ok := a.ModelCooldowns[modelName]; ok && mc.Until.After(t) {
-			t = mc.Until
-		}
-		if t.After(now) && (earliest.IsZero() || t.Before(earliest)) {
-			earliest = t
+		if lift.After(now) && (earliest.IsZero() || lift.Before(earliest)) {
+			earliest = lift
 		}
 	}
 	return false, earliest
@@ -657,6 +647,8 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 	// same full queue (per-account state is untouched — this is a wait, not
 	// a cooldown).
 	if until, ok := p.channelBusyUntilLocked(channel, modelName, now); ok {
+		log.Printf("pool: %s/%s paused until %s after an upstream capacity event; refusing without dispatch",
+			channel, modelName, until.Format(time.RFC3339))
 		return nil, &ErrNoCapacity{Channel: channel, EarliestReset: until, HadCandidatesOnly: true}, false
 	}
 
@@ -743,7 +735,14 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		if p.hasHealthyButBusy(channel, modelName, now) {
 			return nil, nil, true // bounded wait for a slot
 		}
-		return nil, &ErrNoCapacity{Channel: channel, EarliestReset: p.earliestReset(channel, modelName, now)}, false
+		until := p.earliestReset(channel, modelName, now)
+		// Say WHY, not just "no account" (BP-215). The anonymous version of this
+		// refusal is what made a healthy-but-sticky account look like a dead
+		// channel: the line named no account and no reason, so the only way to
+		// find the sticky band was to read the scheduler itself.
+		log.Printf("pool: %s/%s has no account for a new conversation until %s (%s)",
+			channel, modelName, until.Format(time.RFC3339), p.noCandidateReasonLocked(channel, modelName, now))
+		return nil, &ErrNoCapacity{Channel: channel, EarliestReset: until}, false
 	}
 
 	picked := p.pickLocked(channel, modelName, candidates, now)
@@ -776,6 +775,47 @@ func (p *Pool) hasHealthyButBusy(channel, modelName string, now time.Time) bool 
 		}
 	}
 	return false
+}
+
+// noCandidateReasonLocked explains in one line why no account was offered for
+// a new conversation. It exists because the refusal used to be anonymous — the
+// gateway printed "no available account" per request while every account was
+// healthy and idle, and the sticky-only band that was actually holding them out
+// could only be found by reading this file (BP-215). Callers must hold the lock.
+func (p *Pool) noCandidateReasonLocked(channel, modelName string, now time.Time) string {
+	var parts []string
+	for _, id := range p.byChan[channel] {
+		a := p.accounts[id]
+		if a == nil {
+			continue
+		}
+		switch {
+		case a.Disabled:
+			parts = append(parts, a.Nickname+": disabled")
+			continue
+		case a.Paused:
+			parts = append(parts, a.Nickname+": paused")
+			continue
+		case a.Realm == "global" && !p.globalEnabled:
+			parts = append(parts, a.Nickname+": international realm switched off")
+			continue
+		}
+		adm, lift := p.admissionAt(a, modelName, now)
+		switch adm {
+		case AdmitNone:
+			parts = append(parts, fmt.Sprintf("%s: cooling until %s", a.Nickname, lift.Format(time.RFC3339)))
+		case AdmitSticky:
+			parts = append(parts, fmt.Sprintf("%s: sticky-only %.0fs more (breaker %d, no new conversations)",
+				a.Nickname, lift.Sub(now).Seconds(), a.BreakerFails))
+		default:
+			parts = append(parts, fmt.Sprintf("%s: full (%d/%d in flight)",
+				a.Nickname, p.inflight[a.ID], p.limitForAccount(a)))
+		}
+	}
+	if len(parts) == 0 {
+		return "no accounts"
+	}
+	return strings.Join(parts, ", ")
 }
 
 // leaseLocked reserves an in-flight slot and builds the lease. Callers must
@@ -1008,6 +1048,34 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		until := upstreamErr.ResetAt
 		if until.IsZero() || !until.After(now) {
 			until = now.Add(p.softRateBase(a.BreakerFails))
+		}
+		if upstreamErr.SharedQuota {
+			// BP-213: a SHARED per-egress allowance (opencodezen's anonymous
+			// free lane) has run out. The account is healthy and the wall is
+			// not its own, so resting it until the stated reset turns one 429
+			// into a channel-wide outage that outlives the failure (field
+			// 2026-10-30: a single 429 rested the channel to 00:00 UTC and
+			// every later request answered "cooling down" without reaching
+			// upstream at all). Fall back to the ordinary short backoff and
+			// let the next request re-probe: if the allowance really is gone
+			// the upstream says so again in one round trip.
+			// BP-215: without the breaker, and with the plain base backoff. The
+			// ladder exists to make OUR cooling-in periods gentle towards an
+			// account that keeps failing; a shared allowance has nothing to do
+			// with this account's history, and letting a stale breaker stretch
+			// the wait turns the base window into 40 minutes for a wall the
+			// account cannot influence.
+			until = now.Add(p.softRateBase(0))
+			p.restAccount(a, until, "shared quota", "fixed", now)
+			upstreamErr.HoldUntil = until
+			p.sinkLocked(a, now)
+			// BP-215: do NOT raise the breaker. This allowance belongs to the
+			// egress, not to the account, so the account is not the party that
+			// misbehaved; charging it here is what pushed opencodezen's one
+			// account to breaker_fails=2, at which point admissionLocked
+			// refused it new conversations forever (the counter clears only on
+			// a success it could no longer reach).
+			break
 		}
 		if upstreamErr.Model != "" {
 			// Model-scoped soft rate: same hold semantics as model_rate (BP-49).

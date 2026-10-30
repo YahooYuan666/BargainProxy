@@ -22,8 +22,18 @@ func TestEnvBlockNeverSaysUnknown(t *testing.T) {
 	if wd, err := os.Getwd(); err == nil && !strings.Contains(env, wd) {
 		t.Fatalf("fallback should be the process working directory %q: %q", wd, env)
 	}
-	if !strings.HasPrefix(env, "<env>\n  Working directory: ") || !strings.HasSuffix(env, "\n</env>") {
+	// BP-212: the block is now OpenCode 2.2.0's own six-line shape — a
+	// shortened block is itself a fingerprint (upstream provider.mjs).
+	if !strings.HasPrefix(env, "Here is some useful information about the environment you are running in:\n<env>\n  Working directory: ") {
 		t.Fatalf("env block shape changed: %q", env)
+	}
+	for _, want := range []string{"\n  Workspace root folder: ", "\n  Is directory a git repo: ", "\n  Platform: ", "\n</env>"} {
+		if !strings.Contains(env, want) {
+			t.Fatalf("env block missing %q: %q", want, env)
+		}
+	}
+	if strings.HasSuffix(env, "\n</env>\n") {
+		t.Fatalf("the block must end at </env>: %q", env)
 	}
 }
 

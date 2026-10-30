@@ -666,6 +666,11 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 		if strings.Contains(text, "FreeUsageLimit") || strings.Contains(text, "Free usage limit") {
 			e := uperr.New(uperr.ClassSoftRate, status, "opencodezen: free usage limit reached, resets at 00:00 UTC: %s", truncate(body, 300))
 			e.ResetAt = nextUTCMidnight(time.Now())
+			// BP-213: the allowance is per EGRESS, shared by every caller of
+			// this anonymous identity — not this account's own quota. Without
+			// this mark the pool would rest the account until the stated
+			// midnight, turning one 429 into a day-long outage.
+			e.SharedQuota = true
 			return e
 		}
 		return uperr.New(uperr.ClassUpstreamBusy, status, "opencodezen: %s", truncate(body, 300))
