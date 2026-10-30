@@ -34,19 +34,7 @@ Bun.serve({
     });
     let body: BodyInit | undefined;
     if (req.method !== "GET" && req.method !== "HEAD") {
-      const text = await req.text();
-      body = text;
-      if (capturePath) {
-        try {
-          const hdrs: Record<string, string> = {};
-          req.headers.forEach((v, k) => {
-            const name = k.toLowerCase();
-            if (name === "authorization") hdrs[k] = v === "Bearer public" ? "Bearer public (literal)" : "<redacted>";
-            else if (name !== "x-bp-target") hdrs[k] = v;
-          });
-          appendFileSync(capturePath, JSON.stringify({ ts: new Date().toISOString(), target, headers: hdrs, body: text }) + "\n");
-        } catch {}
-      }
+      body = await req.text();
     }
     let upstream: Response;
     try {
