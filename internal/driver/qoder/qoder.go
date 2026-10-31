@@ -168,6 +168,12 @@ type Driver struct {
 	// the driver's data dir, never changed afterwards.
 	saltOnce sync.Once
 	saltVal  string
+
+	// Check-in device identity read from Qoder's own helper (BP-237), cached
+	// per uid for checkinIdentityTTL. Only the campaigns/check-in path reads
+	// it; chat headers keep the derived identity.
+	identMu    sync.Mutex
+	identCache map[string]cachedIdentity
 }
 
 // New builds the driver.
@@ -1453,7 +1459,11 @@ func (d *Driver) checkinJSON(ctx context.Context, method, url string, body []byt
 	if err != nil {
 		return nil, err
 	}
-	mt, mty := d.machineIdentityFor(uid)
+	// The campaigns endpoints only offer the daily credits to a device Qoder's
+	// own client registered (BP-237); the derived identity is an unknown
+	// device there. See checkinIdentity for the precedence and why this is
+	// scoped to the check-in path.
+	mt, mty, _ := d.checkinIdentity(ctx, uid)
 	for k, v := range checkinHeaders(bearer, uid, mt, mty) {
 		req.Header.Set(k, v)
 	}
@@ -1507,6 +1517,17 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 	rt.mu.Lock()
 	uid := rt.uid
 	rt.mu.Unlock()
+	// BP-237: the device-identity helper keys on the account uid. A runtime
+	// that has not bootstrapped yet leaves rt.uid empty; acc.UID is the
+	// authoritative value the account was onboarded under.
+	if uid == "" {
+		uid = acc.UID
+	}
+	// Which identity the campaigns requests will carry: the real one read from
+	// Qoder's helper, a pinned pair, or the derived (unknown-device) one. The
+	// "no campaign" answer means different things per source, so it travels
+	// with the result.
+	_, _, identSource := d.checkinIdentity(ctx, uid)
 	out, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+pathCheckStatus, nil, uid, bearer)
 	if err != nil {
 		return false, 0, false, qoderError(err)
@@ -1526,7 +1547,7 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 		// claimStatus was CLAIMED, i.e. the account HAD been claiming — just
 		// never through us. Fall through to the campaigns path; it is the only
 		// path that can still answer "claimable" on today's upstream.
-		return d.checkinCampaigns(ctx, uid, bearer)
+		return d.checkinCampaigns(ctx, uid, bearer, identSource)
 	case "CLAIMABLE":
 		claim, cerr := d.checkinJSON(ctx, http.MethodPost, d.openAPIBase()+pathCheckClaim, []byte("{}"), uid, bearer)
 		if cerr != nil {
@@ -1549,7 +1570,7 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 	default:
 		// The legacy endpoint no longer describes the daily credit: read the
 		// campaigns page the current client uses.
-		return d.checkinCampaigns(ctx, uid, bearer)
+		return d.checkinCampaigns(ctx, uid, bearer, identSource)
 	}
 }
 
@@ -1565,7 +1586,7 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 // NESTED benefit.amount — `rewardCredits` and a flat `benefit.amount` key
 // belong to the retired daily-check-in endpoints, so reading them reported a
 // successful claim as "+0 credits".
-func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool, int64, bool, error) {
+func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer, identSource string) (bool, int64, bool, error) {
 	list, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+campaignPath, nil, uid, bearer)
 	if err != nil {
 		return false, 0, false, qoderError(err)
@@ -1621,14 +1642,38 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer string) (bool
 				msg: "qoder campaigns: daily benefit exists but is not claimable yet — retry at a later slot",
 			}
 		}
-		// No daily-benefit campaign AT ALL: the channel genuinely has no
-		// check-in programme right now. enable=false so the task ledger says
-		// "not available" (settled) instead of a misleading "checkin ok (+0
-		// credits)" — and so this stays a quiet ok rather than a daily
-		// failure row for an upstream that retired the programme.
+		// No daily-benefit campaign AT ALL. Two very different causes share
+		// this document shape (BP-237):
+		//
+		//   - the channel genuinely has no check-in programme right now, or
+		//   - our request carried a device identity Qoder never issued, so it
+		//     offered this "unknown device" nothing — the exact state that
+		//     produced two weeks of misleading "not available" rows while the
+		//     credits sat claimable for the real device.
+		//
+		// The second cause is actionable, so it must not be reported as a
+		// settled "not available": say which identity was used and why it
+		// matters. enable stays true (retryable) only for the identity case —
+		// a later slot cannot fix it either, but a settled ok would hide it
+		// from the panel and from the operator.
+		if identSource == "derived" {
+			return false, 0, true, &campaignRetryableError{
+				msg: "qoder campaigns: no daily benefit offered to our device identity (" + identSource +
+					") — Qoder only offers it to a device its own client registered; install Qoder CN or set channels.qoder.checkin_runtime_info",
+			}
+		}
+		// A real device identity saw no campaign: this is the upstream's
+		// answer for this device, and it is settled.
 		return false, 0, false, nil
 	}
-	id := toString(claimable["id"])
+	// The live document names the campaign `campaignId` (read 2026-11-01); the
+	// fixture-shaped `id` is kept as a fallback. Reading only `id` made every
+	// real claim fail with "campaign without id" — the campaign was there and
+	// claimable, and we refused to name it.
+	id := toString(claimable["campaignId"])
+	if id == "" {
+		id = toString(claimable["id"])
+	}
 	if id == "" {
 		return false, 0, true, fmt.Errorf("qoder campaigns: CLAIM_BENEFIT campaign without id")
 	}

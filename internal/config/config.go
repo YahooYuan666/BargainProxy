@@ -242,6 +242,32 @@ type QoderSettings struct {
 	// 2671a21). Default off: it changes the account's client fingerprint, so
 	// flip it after an A/B probe, not on faith.
 	DesktopProtocol bool `json:"desktop_protocol"`
+
+	// --- Daily check-in device identity (BP-237) ---
+	//
+	// Qoder only offers the daily 100 credits to a device ITS OWN client
+	// registered: the campaigns list answers 200 with NO CLAIM_BENEFIT entry
+	// for a request carrying an identity Qoder never issued (magpie 0.2.50:
+	// "without it the list answers 200 with no CLAIM_BENEFIT"). Our derived
+	// identity (md5/sha512 of the uid + salt) is exactly such an identity, so
+	// every check-in reported "not available" while the credits sat unclaimed.
+	//
+	// The fix reads the real identity from Qoder's own signed helper. These
+	// fields stay scoped to the CHECK-IN path only: chat headers keep using
+	// the derived identity, so a check-in cannot change how chats fingerprint.
+	//
+	// CheckinRuntimeInfo is the helper's path. Empty = auto-detect the known
+	// Qoder CN / Qoder install locations (see findQoderRuntimeInfo).
+	CheckinRuntimeInfo string `json:"checkin_runtime_info"`
+	// CheckinRuntimeEnv is the helper's environment argument: "0" = Qoder CN,
+	// "3" = international Qoder. Default "0" (the CN client this repo targets).
+	CheckinRuntimeEnv string `json:"checkin_runtime_env"`
+	// CheckinMachineToken / CheckinMachineType pin the identity by hand for
+	// machines without Qoder installed. Both must be set to take effect.
+	// They are a snapshot: Qoder's desktop client renews its native identity
+	// hourly, so a hand-pinned pair goes stale — prefer the helper.
+	CheckinMachineToken string `json:"checkin_machine_token"`
+	CheckinMachineType  string `json:"checkin_machine_type"`
 }
 
 // OpenAICompatSettings configures the generic fallback channel.

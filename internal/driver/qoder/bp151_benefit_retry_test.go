@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -50,7 +51,17 @@ func (m *campaignsSrv) server(t *testing.T) *httptest.Server {
 
 func runCheckin(t *testing.T, srv *httptest.Server) (bool, int64, bool, error) {
 	t.Helper()
-	d := New(config.QoderSettings{GatewayBase: srv.URL, OpenBase: srv.URL}, nil)
+	// BP-237: these cases are about what upstream says to a REAL device
+	// identity, so pin one. Without an identity the driver correctly reports
+	// "no daily benefit offered to our device identity" — a different answer
+	// than the ones under test here, and one that must stay distinguishable.
+	d := New(config.QoderSettings{
+		GatewayBase:         srv.URL,
+		OpenBase:            srv.URL,
+		CheckinRuntimeInfo:  filepath.Join(t.TempDir(), "absent-runtime-info"),
+		CheckinMachineToken: "test-machine-token",
+		CheckinMachineType:  "test-machine-type",
+	}, nil)
 	return d.Checkin(context.Background(), testQoderAccount(t))
 }
 

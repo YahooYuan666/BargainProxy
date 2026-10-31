@@ -123,6 +123,11 @@ func (d *Driver) CheckinStatus(ctx context.Context, acc *model.Account) (*Checki
 	rt.mu.Lock()
 	uid := rt.uid
 	rt.mu.Unlock()
+	// BP-237: the device-identity helper keys on the uid; a runtime that has
+	// not bootstrapped leaves it empty, and acc.UID is the authoritative value.
+	if uid == "" {
+		uid = acc.UID
+	}
 	out, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+pathCheckStatus, nil, uid, bearer)
 	if err != nil {
 		return nil, qoderError(err)
