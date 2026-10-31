@@ -34,7 +34,8 @@
     },
     "zcode": {
       "enabled": true,
-      "max_in_flight": 2
+      "max_in_flight": 2,
+      "proxy": ""
     },
     "autoclaw": {
       "enabled": true,
@@ -234,6 +235,24 @@
       "priority": 9
     },
     {
+      "canonical": "kimi-k3.1-pro",
+      "channel": "workbuddy",
+      "upstream_model": "kimi-k3.1-pro",
+      "priority": 0
+    },
+    {
+      "canonical": "kimi-k3.1-pro",
+      "channel": "trae",
+      "upstream_model": "kimi-k3.1-pro",
+      "priority": 1
+    },
+    {
+      "canonical": "kimi-k3.1-pro",
+      "channel": "lobster",
+      "upstream_model": "kimi-k3.1-pro",
+      "priority": 9
+    },
+    {
       "canonical": "mimo-v2.6-flash-free",
       "channel": "opencodezen",
       "upstream_model": "mimo-v2.6-flash-free",
@@ -250,6 +269,30 @@
       "channel": "opencodezen",
       "upstream_model": "nemotron-3.5-super-vl-free",
       "priority": 5
+    },
+    {
+      "canonical": "open-design-byok/deepseek-v4.1-flash",
+      "channel": "workbuddy",
+      "upstream_model": "deepseek-v4.1-flash",
+      "priority": 0
+    },
+    {
+      "canonical": "open-design-byok/deepseek-v4.1-flash",
+      "channel": "trae",
+      "upstream_model": "deepseek-v4.1-flash",
+      "priority": 1
+    },
+    {
+      "canonical": "open-design-byok/deepseek-v4.1-flash",
+      "channel": "qoder",
+      "upstream_model": "DeepSeek-Flash",
+      "priority": 2
+    },
+    {
+      "canonical": "open-design-byok/deepseek-v4.1-flash",
+      "channel": "lobster",
+      "upstream_model": "deepseek-flash",
+      "priority": 9
     },
     {
       "canonical": "qwen3.8-flash",
@@ -279,24 +322,6 @@
       "canonical": "qwen3.8-max",
       "channel": "lobster",
       "upstream_model": "qwen3.8-max",
-      "priority": 9
-    },
-    {
-      "canonical": "kimi-k3.1-pro",
-      "channel": "workbuddy",
-      "upstream_model": "kimi-k3.1-pro",
-      "priority": 0
-    },
-    {
-      "canonical": "kimi-k3.1-pro",
-      "channel": "trae",
-      "upstream_model": "kimi-k3.1-pro",
-      "priority": 1
-    },
-    {
-      "canonical": "kimi-k3.1-pro",
-      "channel": "lobster",
-      "upstream_model": "kimi-k3.1-pro",
       "priority": 9
     }
   ],
