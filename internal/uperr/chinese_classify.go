@@ -29,3 +29,23 @@ func PaceLimited(text string) bool {
 func Overflowed(text string) bool {
 	return overflowRe.MatchString(text)
 }
+
+// MarkOverflow sets ContextOverflow on err when the text words a prompt-too-long
+// refusal (BP-244). It returns the same error so callers can wrap it inline:
+//
+//	return uperr.MarkOverflow(e, bodyText)
+//
+// The flag is what lets the protocol writers tell the client "compact and
+// retry" instead of handing back a generic 400 that a client like Codex will
+// answer by resending the identical oversized body.
+func MarkOverflow(err *Error, text string) *Error {
+	// Pace words decide FIRST, exactly as BP-232 established for classification:
+	// 「内容太长，已达到速率限制」 carries overflow wording but is a momentary
+	// rate cap — the same request can pass a minute later on another account.
+	// Labelling it an overflow would tell the client to permanently shrink a
+	// prompt that was never too big.
+	if err != nil && !PaceLimited(text) && Overflowed(text) {
+		err.ContextOverflow = true
+	}
+	return err
+}

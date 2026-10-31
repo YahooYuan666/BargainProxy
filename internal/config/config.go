@@ -12,8 +12,17 @@ import (
 
 // Config is the top-level gateway configuration (config.json).
 type Config struct {
-	Listen string `json:"listen"`  // default 127.0.0.1:13140
-	APIKey string `json:"api_key"` // empty = no auth (local use)
+	Listen string `json:"listen"` // default 127.0.0.1:13140
+	// TrustForwardedFor honours X-Forwarded-For from the caller (BP-246).
+	//
+	// Default false: the header is caller-controlled, and both the request log
+	// and the panel's login rate limiter used to read it first — so any client
+	// could choose its own source IP and its own rate-limit bucket. Set this
+	// only when a reverse proxy you control sits in front and appends the
+	// header; the RIGHTMOST hop is then used (what that proxy observed), not
+	// the leftmost (what the client typed).
+	TrustForwardedFor bool   `json:"trust_forwarded_for,omitempty"`
+	APIKey            string `json:"api_key"` // empty = no auth (local use)
 
 	Store       string `json:"store"`         // "memory" | "postgres"
 	Database    string `json:"database"`      // postgres dsn
@@ -118,13 +127,27 @@ type ChannelSettings struct {
 // them in config.json (the panel import helper can copy them from an
 // existing AIClient2API installation).
 type AntigravitySettings struct {
-	Enabled                 bool   `json:"enabled"`
-	BaseURL                 string `json:"base_url"`  // default https://cloudcode-pa.googleapis.com (tests override)
-	DailyURL                string `json:"daily_url"` // fallback https://daily-cloudcode-pa.googleapis.com
-	TokenURL                string `json:"token_url"` // default https://oauth2.googleapis.com/token
-	GoogleOAuthClientID     string `json:"google_oauth_client_id"`
-	GoogleOAuthClientSecret string `json:"google_oauth_client_secret"`
-	MaxInFlight             int    `json:"max_in_flight"` // default 3
+	Enabled  bool   `json:"enabled"`
+	BaseURL  string `json:"base_url"`  // default https://cloudcode-pa.googleapis.com (tests override)
+	DailyURL string `json:"daily_url"` // fallback https://daily-cloudcode-pa.googleapis.com
+	// HostDeadline bounds ONE host's wait for response headers (BP-256).
+	//
+	// Field 2026-11-01: gemini "你好" hung for minutes; the log only showed
+	// `daily-cloudcode-pa… http2: timeout awaiting response headers` after
+	// 6m40s, because the host fallback triggers on transport errors and 5xx and
+	// a HANG is neither. The hung request also held one of the channel's three
+	// in-flight slots for its whole life, so a few of them made the channel
+	// look dead while every account answered a direct probe in seconds.
+	//
+	// This is a hang cutter, not a latency budget. The longest REAL first byte
+	// measured on this channel is 224s (76k-token prompt, 2026-10-31 21:22), so
+	// the default sits above it: only waits that exceed every observed
+	// legitimate prefill are cut. 0 disables it.
+	HostDeadline            Duration `json:"host_deadline"`
+	TokenURL                string   `json:"token_url"` // default https://oauth2.googleapis.com/token
+	GoogleOAuthClientID     string   `json:"google_oauth_client_id"`
+	GoogleOAuthClientSecret string   `json:"google_oauth_client_secret"`
+	MaxInFlight             int      `json:"max_in_flight"` // default 3
 	// DumpDir, when non-empty, writes one self-contained file per FAILED chat
 	// request: the exact body we sent plus the upstream's raw answer (BP-115).
 	// Empty = off, because a body contains the user's prompts. This exists
@@ -357,11 +380,12 @@ func Default() *Config {
 		LogKeepDays: 14,
 		Channels: ChannelSettings{
 			Antigravity: AntigravitySettings{
-				Enabled:     true,
-				BaseURL:     "https://cloudcode-pa.googleapis.com",
-				DailyURL:    "https://daily-cloudcode-pa.googleapis.com",
-				TokenURL:    "https://oauth2.googleapis.com/token",
-				MaxInFlight: 3,
+				Enabled:      true,
+				BaseURL:      "https://cloudcode-pa.googleapis.com",
+				DailyURL:     "https://daily-cloudcode-pa.googleapis.com",
+				HostDeadline: Duration(240 * 1e9), // 240s: above the 224s最长实测成功首字，只切真正的挂死
+				TokenURL:     "https://oauth2.googleapis.com/token",
+				MaxInFlight:  3,
 			},
 			WorkBuddy: WorkBuddySettings{
 				Enabled:     true,

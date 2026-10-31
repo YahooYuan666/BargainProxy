@@ -308,8 +308,55 @@ func (d *Driver) doStream(ctx context.Context, token, upstreamModel string, body
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/event-stream")
+	// BP-256: bound ONE host's wait for response headers, so a HANGING primary
+	// falls through to the fallback instead of eating the whole request.
+	//
+	// Field 2026-11-01: gemini "你好" hung for minutes and the log showed
+	// `daily-cloudcode-pa… : http2: timeout awaiting response headers` only
+	// after 6m40s. The failover below triggers on transport errors and 5xx — a
+	// hang is neither, so the fallback host (which answers 429 immediately) was
+	// never consulted. Meanwhile the hung request held one of antigravity's
+	// three in-flight slots for its whole life, so a few of them made the
+	// channel look completely dead.
+	//
+	// hostDeadline is deliberately generous: measured real first-byte times on
+	// this channel reach 224s for 76k-token prompts, so this is a hang cutter,
+	// not a latency budget. 0 disables it.
+	hostDeadline := d.cfg.HostDeadline.D()
+	//
+	// BP-258: this deadline covers the wait for response HEADERS only, and it
+	// must NOT outlive this function. The body of a streaming response is read
+	// by the CALLER (parseSSE), and canceling the request context kills that
+	// read. The first cut of BP-256 used `context.WithTimeout` + `defer
+	// cancelHost()`, so the cancel fired the instant doStream returned — i.e.
+	// the instant headers arrived — and every stream died 1-4s in with
+	// "context canceled" (field 2026-11-01 02:57: three antigravity legs,
+	// status=0, class=transport, while the client was still connected). The
+	// faster the host answered headers, the faster the stream died, which is
+	// why it looked like a Gemini/Claude regression rather than a driver bug.
+	//
+	// So: WithCancel + a timer we STOP once headers are in, and the cancel is
+	// handed to the body so the context lives exactly as long as the stream.
+	hostCtx := ctx
+	var cancelHost context.CancelFunc
+	var stopWaitTimer func() bool
+	if hostDeadline > 0 {
+		hostCtx, cancelHost = context.WithCancel(ctx)
+		stopWaitTimer = time.AfterFunc(hostDeadline, cancelHost).Stop
+	}
+	req = req.WithContext(hostCtx)
 	resp, err := d.http.Do(req)
+	if stopWaitTimer != nil {
+		stopWaitTimer() // headers are here (or the attempt is already over)
+	}
 	if err != nil {
+		if cancelHost != nil {
+			cancelHost()
+		}
+		// The fallback below uses the PARENT ctx on purpose: a primary that ran
+		// out of ITS deadline is a hang, and reusing the expired host context
+		// would make the fallback fail instantly — which is exactly how a
+		// hanging daily host looked like a dead channel.
 		// Transport error on the primary host: try the fallback host once.
 		if len(hosts) > 1 {
 			u2 := fmt.Sprintf("%s/v1internal:streamGenerateContent?alt=sse", strings.TrimRight(hosts[1], "/"))
@@ -323,10 +370,24 @@ func (d *Driver) doStream(ctx context.Context, token, upstreamModel string, body
 		}
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "antigravity: %v", err)
 	}
-	if resp.StatusCode >= 500 && len(hosts) > 1 {
-		// Server-side failure on primary: retry once on the fallback host.
+	// BP-259: a 429 on one host does NOT mean the account is out of quota.
+	//
+	// The daily and prod hosts keep SEPARATE quota ledgers — measured
+	// 2026-11-01 03:10 with one 180KB / 45k-token body against all three
+	// accounts: daily answered 200 in 2.5s/3.4s/19.7s while prod answered 429
+	// RESOURCE_EXHAUSTED in 0.7-0.9s for the SAME token and body. The old code
+	// only failed over on transport errors and 5xx, so a 429 on the primary
+	// ended the request even though the other host had headroom. That is
+	// exactly the reported shape: the Antigravity IDE answers in seconds while
+	// the gateway reports "upstream rate limited".
+	if (resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests) && len(hosts) > 1 {
+		// Server-side failure or quota wall on the primary: retry once on the
+		// fallback host.
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
+		if cancelHost != nil {
+			cancelHost()
+		}
 		u2 := fmt.Sprintf("%s/v1internal:streamGenerateContent?alt=sse", strings.TrimRight(hosts[1], "/"))
 		req2, rerr := http.NewRequestWithContext(ctx, http.MethodPost, u2, bytes.NewReader(body))
 		if rerr == nil {
@@ -335,6 +396,24 @@ func (d *Driver) doStream(ctx context.Context, token, upstreamModel string, body
 			req2.Header.Set("User-Agent", ua)
 			req2.Header.Set("Accept", "text/event-stream")
 			if resp2, err2 := d.http.Do(req2); err2 == nil {
+				// The fallback answered. A 2xx is a real answer; anything else
+				// is still an error, but it must not mask a 429 from the
+				// primary with an unrelated fallback failure — report whichever
+				// says more (a 429 stays a 429 so the model-scoped cooldown is
+				// applied to the right bucket).
+				if resp2.StatusCode < 300 {
+					return resp2, nil
+				}
+				if resp2.StatusCode != http.StatusTooManyRequests {
+					resp2.Body.Close()
+					// Keep the primary's diagnosis: it is the host that was
+					// actually asked first.
+					return &http.Response{
+						StatusCode: resp.StatusCode,
+						Body:       io.NopCloser(bytes.NewReader(raw)),
+						Header:     http.Header{},
+					}, nil
+				}
 				return resp2, nil
 			}
 		}
@@ -346,7 +425,25 @@ func (d *Driver) doStream(ctx context.Context, token, upstreamModel string, body
 		}
 		return resp2, nil
 	}
+	if cancelHost != nil {
+		// The stream context must live exactly as long as the body: hand the
+		// cancel to the reader so the timer's context is released when the
+		// caller finishes (or drops) the stream, not before.
+		resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancelHost}
+	}
 	return resp, nil
+}
+
+// cancelOnClose releases the per-host wait context when the stream ends.
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnClose) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
 
 // parseSSE consumes the Gemini SSE stream, emitting IR events and building
@@ -996,6 +1093,18 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 		}
 	}
 	ensureAntigravityToolIDs(contents)
+	// BP-257: ALL declarations go into ONE tools element.
+	//
+	// We used to emit one {"functionDeclarations":[decl]} per tool — 113 tools
+	// became 113 separate tool objects. AIClient2API (the reference this driver
+	// was ported from) keeps the caller's grouping and the Gemini family has a
+	// single `tools[]` entry holding one `functionDeclarations[]` array; a
+	// payload with a hundred sibling entries is not a shape it accepts.
+	//
+	// Field 2026-11-01: the same account answered a tool-free prompt in 6.4s
+	// while a 113-tool "你好" hung until the client gave up. The tool grouping
+	// was the one structural difference left.
+	var decls []map[string]any
 	for _, t := range req.Tools {
 		decl := map[string]any{"name": t.Name}
 		if t.Description != "" {
@@ -1011,7 +1120,10 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 				}
 			}
 		}
-		tools = append(tools, map[string]any{"functionDeclarations": []map[string]any{decl}})
+		decls = append(decls, decl)
+	}
+	if len(decls) > 0 {
+		tools = append(tools, map[string]any{"functionDeclarations": decls})
 	}
 	if len(tools) > 0 {
 		mode := "AUTO"
@@ -1034,7 +1146,25 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 	if req.TopK != nil {
 		genConfig["topK"] = *req.TopK
 	}
-	if req.MaxTokens > 0 {
+	// BP-257: maxOutputTokens is only sent for CLAUDE models.
+	//
+	// AIClient2API (the reference this driver was ported from, and the one the
+	// user confirms worked) deletes it for every non-Claude model:
+	//
+	//	if (!isClaudeModel && template.request.generationConfig?.maxOutputTokens !== undefined) {
+	//	    delete template.request.generationConfig.maxOutputTokens;
+	//	}
+	//
+	// It first CLAMPS the value to the model's catalogue maximum, which for
+	// gemini-3-flash is 65536 and for gemini-3-pro 65535 — but for the Gemini
+	// family the field is then removed outright. We were forwarding the
+	// client's value (ZCode asks for 32768) on every request, which is the one
+	// structural difference between our payload and the one that is known to
+	// work. The Gemini side picks its own output budget.
+	//
+	// Claude keeps the field: that endpoint bills thinking against it, and the
+	// reference clamps rather than deletes there.
+	if req.MaxTokens > 0 && strings.HasPrefix(upstreamModel, "claude-") {
 		genConfig["maxOutputTokens"] = req.MaxTokens
 	}
 	if len(req.Stop) > 0 {

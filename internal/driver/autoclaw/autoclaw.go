@@ -1623,6 +1623,11 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			break
 		}
 		if fe := detectFrameError(payload); fe != nil {
+			// BP-241: a mid-stream throttle is per route; scope it so one
+			// route's burst does not freeze the account's other models.
+			if fe.Model == "" && fe.Class == uperr.ClassSoftRate {
+				fe.Model = call.UpstreamModel
+			}
 			return nil, fe
 		}
 		var chunk struct {
@@ -1921,6 +1926,13 @@ func classifyHTTPFor(status int, body []byte, model string) *uperr.Error {
 	// model's problem — scoping that to one route would keep the other routes
 	// hammering an empty account (BP-100).
 	if e != nil && e.Model == "" && model != "" && e.Code != "" && quotaCodes[e.Code] {
+		e.Model = model
+	}
+	// BP-241: a transient throttle is per route too. busyCodes ("自忙"/并发
+	// 上限) is counted per route upstream, so an account-wide rest for one
+	// route's burst freezes every other route the account serves — the defect
+	// BP-189 fixed on workbuddy and BP-240 on trae.
+	if e != nil && e.Model == "" && model != "" && e.Class == uperr.ClassSoftRate {
 		e.Model = model
 	}
 	return e

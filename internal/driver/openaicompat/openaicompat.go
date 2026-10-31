@@ -81,7 +81,8 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		e := classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+		return nil, e
 	}
 	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer streamBody.Close()
@@ -413,7 +414,9 @@ func detectFrameError(payload string) *uperr.Error {
 			status = 401
 		}
 	}
-	return classifyHTTP(status, []byte(payload))
+	// detectFrameError has no model in hand: the frame's own status is what
+	// matters, and the pool falls back to an account rest when Model is empty.
+	return classifyHTTP(status, []byte(payload), "")
 }
 
 func toStr(v any) string {
@@ -470,7 +473,11 @@ var authLapsed401 = regexp.MustCompile(
 var contentPolicy403 = regexp.MustCompile(
 	`(?i)content_policy_rejected|(?i)content[_ ]?filter|(?i)content policy|内容安全|内容审核|合规审查`)
 
-func classifyHTTP(status int, body []byte) *uperr.Error {
+// classifyHTTP maps an HTTP-level failure. upstreamModel scopes a soft rate
+// limit to the MODEL (BP-241): a 429 is per model/endpoint in practice, and an
+// account-wide rest for one model's wall freezes every other model the account
+// serves — the defect BP-189 fixed on workbuddy and BP-240 on trae.
+func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	text := string(body)
 	lower := strings.ToLower(text)
 	switch {
@@ -493,12 +500,14 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 		if minuteLimitBody(lower) || strings.Contains(lower, "allocated quota exceeded") || strings.Contains(lower, "increase your quota limit") {
 			e.ResetAt = time.Now().Add(5 * time.Second)
 		}
+		e.Model = upstreamModel // BP-241: model-scoped rest, not account-wide
 		return e
 	case minuteLimitBody(lower):
 		// A frequency throttle wearing quota wording (BP-153): rest for a
 		// few seconds, not the balance death the old quota match gave it.
 		e := uperr.New(uperr.ClassSoftRate, status, "openaicompat: %s", truncate(body, 300))
 		e.ResetAt = time.Now().Add(5 * time.Second)
+		e.Model = upstreamModel // BP-241: model-scoped rest
 		return uperr.WithFields(e, body)
 	case status == 402 || creditShortfallWords.MatchString(text) || strings.Contains(lower, "insufficient") || strings.Contains(text, "余额"):
 		// BP-193: the shortfall wording decides over the status — a 400
@@ -528,7 +537,12 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 		if status == 400 && uperr.PaceLimited(text) {
 			return uperr.WithFields(uperr.New(uperr.ClassSoftRate, status, "openaicompat: rate-worded 400: %s", truncate(body, 300)), body)
 		}
-		return uperr.WithFields(uperr.New(uperr.ClassBadRequest, status, "openaicompat: %s", truncate(body, 300)), body)
+		// BP-244: mark a prompt-too-long 400 so the Responses writer can answer
+		// `context_length_exceeded` and the client compacts instead of
+		// resending the same oversized body.
+		e := uperr.New(uperr.ClassBadRequest, status, "openaicompat: %s", truncate(body, 300))
+		uperr.MarkOverflow(e, text)
+		return uperr.WithFields(e, body)
 	case status >= 500:
 		return uperr.WithFields(uperr.New(uperr.ClassTransport, status, "openaicompat: %s", truncate(body, 300)), body)
 	default:

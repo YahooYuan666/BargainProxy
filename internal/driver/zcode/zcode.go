@@ -20,8 +20,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/url"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -100,8 +100,8 @@ func ResolveModel(name string) string {
 
 // Driver implements driver.Driver for the zcode channel.
 type Driver struct {
-	cfg  config.ZCodeSettings
-	http *http.Client // streaming chat calls (no total timeout + header/idle watchdogs)
+	cfg        config.ZCodeSettings
+	http       *http.Client // streaming chat calls (no total timeout + header/idle watchdogs)
 	rpc        *http.Client // short probe / plan calls (total timeout)
 	giftClient *http.Client // billing-plane gift calls (30s, BP-231a)
 	// allowUnsignedThinking gates replay of history thinking blocks whose
@@ -263,6 +263,31 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		return nil, classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+	}
+	// BP-254: a 200 does NOT promise a stream. The start-plan endpoint answers
+	// quota/entitlement refusals as a plain JSON object under HTTP 200:
+	//
+	//	{"code":1005,"msg":"exceed quota limit","logid":"..."}
+	//
+	// Feeding that into the SSE parser produced "stream ended without
+	// message_stop" (class=transport, status=0) in ~40ms — which reads as a
+	// broken channel, costs 3 account attempts per request, and leaves the
+	// per-model quota wall in classifyBusiness unreachable even though the code
+	// was already written for it. Field 2026-11-01: every GLM request through
+	// zcode died this way, so p0 was permanently dead and every turn cascaded
+	// to qoder (and deepseek's overflow reached lobster, which cannot take a
+	// 5MB body).
+	//
+	// "An answer that isn't a stream is an error in a 200" — the same rule the
+	// trae driver adopted (magpie 0.2.19).
+	if ct := resp.Header.Get("Content-Type"); ct != "" && !strings.Contains(ct, "event-stream") {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if code, msg, ok := detectBusinessError(raw); ok {
+			return nil, classifyBusiness(code, msg, call.UpstreamModel)
+		}
+		return nil, uperr.New(uperr.ClassTransport, resp.StatusCode,
+			"zcode: answer is not a stream (%s): %.200s", ct, raw)
 	}
 	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer streamBody.Close()
@@ -545,11 +570,22 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 		gotUsage   bool
 		terminated bool
 	)
+	// firstBytes keeps the stream's opening bytes so a parse that ends without
+	// message_stop can SAY what the upstream actually sent (BP-253). Field
+	// 2026-11-01: every zcode leg died in ~40ms with "stream ended without
+	// message_stop" — a 200 whose body the parser could not use — and the error
+	// named neither the shape nor a body, so the cause was unanswerable from
+	// the log. An error that cannot be diagnosed is not an error report.
+	var firstBytes strings.Builder
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
 			return nil, uperr.New(uperr.ClassCanceled, 0, "zcode: stream canceled: %v", err)
 		}
 		line := strings.TrimSpace(sc.Text())
+		if firstBytes.Len() < 512 {
+			firstBytes.WriteString(line)
+			firstBytes.WriteByte('\n')
+		}
 		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
@@ -692,7 +728,11 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 		return nil, uperr.New(uperr.ClassCanceled, 0, "zcode: stream canceled: %v", ctx.Err())
 	}
 	if !terminated {
-		return nil, uperr.New(uperr.ClassTransport, 0, "zcode: stream ended without message_stop")
+		// BP-253: name what arrived. A 200 whose stream carries no message_stop
+		// is either an upstream error wearing a 200, a shape change, or a
+		// truncated stream — and only the bytes can tell which.
+		return nil, uperr.New(uperr.ClassTransport, 0,
+			"zcode: stream ended without message_stop; first bytes: %s", snippet(firstBytes.String()))
 	}
 	// An exhausted plan / rejected model can end the SSE stream with no text,
 	// no tool call and no usage. Treat that as a failure so the gateway moves
@@ -995,4 +1035,18 @@ func sessionIDFor(creds *Creds, accountID, sessionKey string) string {
 		return bareUUID(k)
 	}
 	return bareUUID(deviceIDFor(creds, accountID))
+}
+
+// snippet compacts a captured head of a stream for one log line: newlines
+// become " | " so the whole shape stays on one line and greppable.
+func snippet(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "(empty)"
+	}
+	s = strings.ReplaceAll(s, "\n", " | ")
+	if len(s) > 400 {
+		s = s[:400] + "…"
+	}
+	return s
 }

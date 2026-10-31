@@ -14,6 +14,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -21,7 +22,10 @@ import (
 	"time"
 )
 
-const processQueryLimitedInformation = 0x1000
+const (
+	processQueryLimitedInformation = 0x1000
+	processQueryInformation        = 0x0400
+)
 
 type lockHolder struct {
 	pid      int
@@ -80,20 +84,80 @@ func readHolder(path string) lockHolder {
 // the lock: alive, and its creation time equals the recorded one. A recycled
 // pid has a different start and reads as stale.
 func processStartMatches(h lockHolder) bool {
-	handle, err := syscall.OpenProcess(processQueryLimitedInformation, false, uint32(h.pid))
+	handle, err := openForQuery(uint32(h.pid))
 	if err != nil {
 		return false // no such process — stale lock
 	}
 	defer syscall.CloseHandle(handle)
+	// BP-252 (second half): a KILLED process keeps its pid and its creation
+	// time as a "zombie" object while any handle to it is still open. Windows
+	// still lets OpenProcess succeed and GetProcessTimes return the original
+	// values, so the identity check says "alive" for a process that has
+	// already exited. Field 2026-11-01 01:34: the gateway was killed, and TWO
+	// restart attempts refused ("another instance is running, pid 35052") with
+	// nothing listening on the port and Get-Process reporting no such pid.
+	// The exit code is the discriminator: STILL_ACTIVE means running, anything
+	// else means it has exited and the lock is stale.
+	if exited, code := processExited(handle); exited {
+		log.Printf("instance lock: pid %d has exited (code %d); treating the lock as stale", h.pid, code)
+		return false
+	}
 	var c, e, k, u syscall.Filetime
 	if err := syscall.GetProcessTimes(handle, &c, &e, &k, &u); err != nil {
-		return true // cannot tell — stay conservative
+		// BP-252: this used to `return true` ("cannot tell — stay
+		// conservative"), which turned a coincidence into a deadlock.
+		// Field 2026-11-01 01:28: the gateway was stopped, Windows handed its
+		// pid to an unrelated process within seconds, OpenProcess succeeded on
+		// that stranger but GetProcessTimes was refused — so the lock declared
+		// a live instance forever and EVERY start exited "another instance is
+		// running" with the port free. The service stayed down until the lock
+		// file was deleted by hand.
+		//
+		// A lock that cannot be verified must not block a start: the operator
+		// asked for a restart, and the pid we recorded is not provably ours.
+		// Treat it as stale and say so, so a genuine double-start is still
+		// visible in the log rather than silent.
+		log.Printf("instance lock: cannot query pid %d (%v); treating the lock as stale", h.pid, err)
+		return false
 	}
 	if h.creation.IsZero() {
 		// Legacy pid-only lock: fall back to the old pid-alive verdict.
 		return true
 	}
 	return time.Unix(0, c.Nanoseconds()).Equal(h.creation)
+}
+
+// stillActive is STILL_ACTIVE from GetExitCodeProcess: the only exit code that
+// means "the process is still running".
+const stillActive = 259
+
+// processExited reports whether the process behind handle has already
+// terminated, with its exit code. On any error it answers "not exited", so a
+// process we cannot inspect keeps its lock (the conservative direction is
+// correct HERE — unlike identity, where being unable to verify must not block
+// a start).
+func processExited(handle syscall.Handle) (bool, uint32) {
+	var code uint32
+	if err := syscall.GetExitCodeProcess(handle, &code); err != nil {
+		return false, 0
+	}
+	return code != stillActive, code
+}
+
+// openForQuery opens a pid for status queries, trying the limited-information
+// right first and the older right second (BP-252). Some processes refuse
+// PROCESS_QUERY_LIMITED_INFORMATION but allow PROCESS_QUERY_INFORMATION, and
+// vice versa; trying both keeps the liveness answer available in more cases
+// instead of falling into the "cannot tell" path.
+func openForQuery(pid uint32) (syscall.Handle, error) {
+	h, err := syscall.OpenProcess(processQueryLimitedInformation, false, pid)
+	if err == nil {
+		return h, nil
+	}
+	if h2, err2 := syscall.OpenProcess(processQueryInformation, false, pid); err2 == nil {
+		return h2, nil
+	}
+	return 0, err
 }
 
 // ownCreationTime is this process's creation time, recorded with the lock.

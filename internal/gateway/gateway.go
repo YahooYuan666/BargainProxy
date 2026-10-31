@@ -349,17 +349,44 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// Single-active mode: if this pool already has an account interacting,
 		// do not wait and do not use a second account — walk to the next pool.
 		// When every pool answers busy, the request ends as 并行数量超发.
+		// BP-250: a conversation already BOUND to this pool must not be turned
+		// away just because the pool is busy.
+		//
+		// The busy check runs here, before Acquire, while the sticky binding
+		// lives INSIDE Acquire. So any in-flight request on the pool made every
+		// other request of the same conversation skip it — and a conversation
+		// that skips its bound pool never reaches Acquire to be served or to
+		// wait. Field evidence 2026-11-01: one agent session sent a request
+		// every ~5s while each took 15s+, so zcode/autoclaw/workbuddy were
+		// ALWAYS busy; every turn cascaded to qoder (trace
+		// zcode→autoclaw→workbuddy→qoder, attempts=4, 9 times in a row) and the
+		// deepseek route fell all the way to lobster. Stickiness was
+		// effectively disabled exactly when it mattered.
+		//
+		// A bound conversation falls through to Acquire, whose sticky path
+		// either serves it on the bound account or returns "wait" — which is
+		// the intended no-drift queue.
 		if busy, who := g.pool.ChannelBusy(binding.Channel); busy {
-			busyCount++
-			lastErr = concurrencyError(binding.Channel, who)
-			// The skip must leave a name in the trace (BP-110): a binding
-			// skipped for being busy otherwise vanishes from attempt_channels,
-			// and "why didn't it use workbuddy? it was fine" becomes
-			// unanswerable — the pool WAS considered, it was full (field
-			// 2026-10-25 14:56: one conversation's own earlier requests held
-			// every slot, the chain read trae→lobster with no workbuddy at all).
-			tr.note(binding.Channel)
-			continue
+			if bound, _ := g.sessionBoundTo(binding.Channel, req.SessionKey); !bound {
+				busyCount++
+				lastErr = concurrencyError(binding.Channel, who)
+				// The skip must leave a name in the trace (BP-110): a binding
+				// skipped for being busy otherwise vanishes from
+				// attempt_channels, and "why didn't it use workbuddy? it was
+				// fine" becomes unanswerable — the pool WAS considered, it was
+				// full (field 2026-10-25 14:56: one conversation's own earlier
+				// requests held every slot, the chain read trae→lobster with
+				// no workbuddy at all).
+				tr.note(binding.Channel)
+				// BP-251: say WHY in the log too. The trace is only visible
+				// after the fact in the panel; without a line here, "why did my
+				// request go to qoder" cannot be answered from the logs at all
+				// (2026-11-01: nine consecutive requests cascaded through four
+				// pools and not one skip was logged).
+				log.Printf("gateway: %s/%s skipped: pool busy (holder %s); %s is not bound here",
+					binding.Channel, req.Model, who, describeSession(req.SessionKey))
+				continue
+			}
 		}
 		// Pre-flight mirrors the single-active rule: if this pool is already
 		// interacting, the preflight above reports "usable" (it only sees
@@ -398,6 +425,13 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 				// must still be named in the trace (BP-110), or the chain lies
 				// by omission about what was considered.
 				tr.note(binding.Channel)
+				// BP-251: and named in the LOG, with the reason and the moment
+				// it becomes usable. Trace alone is invisible while the request
+				// is running — the operator asking "why did this go to qoder"
+				// had nothing to grep (2026-11-01).
+				log.Printf("gateway: %s/%s skipped in pre-flight: %s (usable from %s)",
+					binding.Channel, req.Model, skippedReason(lastErr),
+					earliest.Format(time.RFC3339))
 				continue
 			}
 		}

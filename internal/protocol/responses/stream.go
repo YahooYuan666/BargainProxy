@@ -311,6 +311,17 @@ func (s *StreamWriter) finish(incomplete bool) error {
 // FinishWithError closes the stream with a failed status after a mid-stream
 // upstream failure.
 func (s *StreamWriter) FinishWithError(msg string) error {
+	return s.FinishWithErrorCode("stream_error", msg)
+}
+
+// FinishWithErrorCode is FinishWithError with an explicit error code.
+//
+// BP-244 (magpie 2cca1117, #4425): the code is what a client branches on, and
+// a context overflow needs `context_length_exceeded` — the one code Codex
+// compacts on. It used to always be `stream_error`, so an oversized prompt
+// looked like a transient stream fault and Codex reconnected with the identical
+// body five times instead of compacting.
+func (s *StreamWriter) FinishWithErrorCode(code, msg string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.completed {
@@ -318,7 +329,7 @@ func (s *StreamWriter) FinishWithError(msg string) error {
 	}
 	_ = s.openMessageItemLocked()
 	env := s.responseEnvelope("failed")
-	env["error"] = map[string]any{"code": "stream_error", "message": msg}
+	env["error"] = map[string]any{"code": code, "message": msg}
 	if err := s.event("response.failed", map[string]any{"response": env}); err != nil {
 		return err
 	}

@@ -65,18 +65,39 @@ const (
 	soloUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TraeCN/" +
 		uaBaseVersion + " Chrome/142.0.7444.235 Electron/39.2.7 Safari/537.36"
 
-	// traeToolInputCeiling is the measured input ceiling of the tool-bearing
-	// surface (llm_utils_chat). Field evidence 2026-10-23: binary search shows
-	// 261623 tokens pass and ~264000 answer 4026 "context length has exceeded
-	// the maximum limit"; the same wall holds for every model (glm-5.3-flash
-	// and deepseek-v4.1-flash both stop at the same number), and the vendor
-	// catalogue reports exactly this value as context_window_tokens.dev.
+	// traeToolInputCeiling is the input ceiling of the tool-bearing surface
+	// (llm_utils_chat), re-measured 2026-11-01.
 	//
-	// A tool-carrying prompt above it can never succeed on this channel, so the
-	// driver refuses it before dispatch rather than burning a leg on a certain
-	// 4026 (measured: the refusal takes ~4s and often ~2 minutes on big
-	// prompts).
-	traeToolInputCeiling = 262144
+	// HISTORY — the old value 262144 was WRONG as a channel ceiling.
+	// research/2026-10-24-trae-dual-channel-1m.md §2.2 recorded 261623 passing
+	// and ~264000 answering 4026, and concluded "channel-wide wall, model
+	// independent". That drove a hard pre-dispatch refusal for any tool-carrying
+	// prompt above 262144 (BP-103), which pushed every large tool turn to
+	// another channel and failed it outright on a Trae-only route.
+	//
+	// 2026-11-01 re-measurement (scripts/tmaxmode; a unique needle near the
+	// prompt's start is echoed back, so a silent truncation cannot pass as
+	// success):
+	//
+	//	 300,501 tokens + tools -> 200
+	//	 453,481 tokens + tools -> 200
+	//	 850,179 tokens + tools -> 200
+	//	 991,840 tokens + tools -> 200
+	//	1,014,501 tokens + tools -> 200
+	//	1,020,179 tokens + tools -> 200   (needle echoed: whole prompt read)
+	//	1,800,000 tokens + tools -> 4022 "prompt tokens exceeded the maximum limit"
+	//
+	// Two facts settle it: (a) a tool-bearing prompt reaches ~1.02M tokens on
+	// this surface, and (b) probes WITHOUT is_max_mode got exactly as far as
+	// those with it — Max Mode is NOT what lifts the ceiling; the surface
+	// simply allows ~1M now. The remaining wall is 4022 (a different code from
+	// the 4026 seen on 10-23), at ~1.02M.
+	//
+	// So the ceiling is the catalogue's own context_window_tokens.max
+	// (1000000) plus a tokenizer allowance, with tools supported all the way
+	// to it. Keeping 262144 here would keep discarding ~4x the context the
+	// channel actually serves.
+	traeToolInputCeiling = 1024000
 
 	// functionsTrae is the ladder of SOLO functions, tried in order. A model
 	// or tool set that one function refuses is often taken by the next: the
@@ -257,27 +278,28 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
-	// The channel has two surfaces with different ceilings (see sessions.go):
-	// llm_utils_chat serves our tools but stops at 262144; chat_sessions reaches
-	// 1M but runs the vendor's own agent and ignores our tool declarations.
+	// The channel has two surfaces (see sessions.go):
+	// llm_utils_chat serves our tools and, re-measured 2026-11-01, carries a
+	// tool-bearing prompt to ~1.02M tokens; chat_sessions reaches 1M but runs
+	// the vendor's own agent and ignores our tool declarations.
 	//
 	// llm_utils_chat stays the DEFAULT because it is the only surface that
 	// speaks our protocol (tool calls round-trip, sampling params, the function
-	// ladder). The session surface is entered only when the request cannot fit
-	// the ladder — that is the sole thing it can do better, and using it for
-	// ordinary traffic would silently change how every answer is produced.
+	// ladder). The session surface is entered only for a tool-FREE request too
+	// large for the ladder — using it for ordinary traffic would silently change
+	// how every answer is produced.
 	est := estimateInputTokens(call.Request)
 	hasTools := len(call.Request.Tools) > 0
 	switch {
 	case est <= traeToolInputCeiling:
-		// Fits the ladder: unchanged behaviour.
+		// Fits the ladder, with or without tools: unchanged behaviour.
 	case hasTools:
-		// A tool-carrying prompt above the ceiling can never succeed here
-		// (sessions would drop every tool). Fail before dispatch so the router
-		// cascades instead of paying a guaranteed 4026 — measured at ~4s, and
-		// minutes on large prompts.
+		// Above ~1.02M even for tools: the upstream answers 4022 and no
+		// account can fix it, so fail before dispatch instead of burning a
+		// leg. (This branch used to fire at 262144, which was wrong — the
+		// measurement above shows tools survive to ~1.02M.)
 		return nil, uperr.New(uperr.ClassModelUnavailable, 400,
-			"trae: %d-token prompt with tools exceeds this channel's %d-token tool ceiling; another channel is required",
+			"trae: %d-token prompt with tools exceeds this channel's %d-token ceiling; another channel is required",
 			est, traeToolInputCeiling)
 	case est > chatSessionMaxInput:
 		return nil, uperr.New(uperr.ClassModelUnavailable, 400,
@@ -359,7 +381,7 @@ func (d *Driver) chatOnce(ctx context.Context, creds *Creds, body []byte, call d
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		return nil, classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
 	}
 	// A 200 whose content-type is JSON (not event-stream) is an error in a
 	// 200: classify the business error it carries instead of feeding JSON
@@ -818,11 +840,22 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			// OpenAI shape keeps working. CacheKnown is set only when a field is
 			// PRESENT: an absent field means "not reported", which the panel
 			// must show as unknown rather than as a 0% hit rate (BP-53).
+			//
+			// BP-242 (plugins trae 0.2.26, magpie #3991/#3979): DeepSeek spells
+			// the same number two other ways — a flat `prompt_cache_hit_tokens`
+			// and a bare top-level `cached_tokens`. Trae stopped sending
+			// cache_read_input_tokens around 10-28, so on the DeepSeek routes
+			// this channel serves (deepseek-v4.1-flash / -pro) the cache column
+			// read "unknown" while the upstream WAS reporting a hit. A count
+			// naming no cache field at all still means unknown — never 0 — which
+			// is exactly what CacheKnown=false expresses.
 			var u struct {
 				PromptTokens         int  `json:"prompt_tokens"`
 				CompletionTokens     int  `json:"completion_tokens"`
 				ReasoningTokens      int  `json:"reasoning_tokens"`
 				CacheReadInputTokens *int `json:"cache_read_input_tokens"`
+				PromptCacheHitTokens *int `json:"prompt_cache_hit_tokens"`
+				CachedTokens         *int `json:"cached_tokens"`
 				PromptTokensDetails  *struct {
 					CachedTokens *int `json:"cached_tokens"`
 				} `json:"prompt_tokens_details"`
@@ -835,8 +868,14 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 			case u.CacheReadInputTokens != nil:
 				usage.CachedInputTokens = *u.CacheReadInputTokens
 				usage.CacheKnown = true
+			case u.PromptCacheHitTokens != nil:
+				usage.CachedInputTokens = *u.PromptCacheHitTokens
+				usage.CacheKnown = true
 			case u.PromptTokensDetails != nil && u.PromptTokensDetails.CachedTokens != nil:
 				usage.CachedInputTokens = *u.PromptTokensDetails.CachedTokens
+				usage.CacheKnown = true
+			case u.CachedTokens != nil:
+				usage.CachedInputTokens = *u.CachedTokens
 				usage.CacheKnown = true
 			}
 			gotUsage = true
@@ -1225,12 +1264,32 @@ func classifyBusiness(code int, msg string) *uperr.Error {
 		e := uperr.New(uperr.ClassBadRequest, 400, "trae: code=4023 %s", msg)
 		e.Code = "4023"
 		return e
+	case 4022, 4026:
+		// The prompt itself is too big for this surface — 4026 was measured on
+		// 2026-10-23 ("context length has exceeded the maximum limit"), 4022 on
+		// 2026-11-01 ("your prompt tokens have exceeded the maximum limit") at
+		// ~1.02M. Both mean the same thing: the request cannot fit, and NO
+		// account can change that.
+		//
+		// This used to fall to `default` → ClassInternal, which is a 500-class
+		// "our fault" bucket: the gateway then treated a permanently
+		// impossible request as a transient internal error and could re-walk
+		// other bindings for the same oversized body. ClassBadRequest is
+		// honest (the request is at fault) and carries no account penalty.
+		e := uperr.New(uperr.ClassBadRequest, 400, "trae: prompt too long for this surface (code=%d): %s", code, msg)
+		e.Code = fmt.Sprint(code)
+		return e
 	default:
 		return uperr.New(uperr.ClassInternal, 200, "trae: code=%d %s", code, msg)
 	}
 }
 
-func classifyHTTP(status int, body []byte) *uperr.Error {
+// classifyHTTP maps an HTTP-level failure. upstreamModel scopes a soft rate
+// limit to the MODEL: a 429 is almost always per-model/per-endpoint, and
+// resting the whole account made one model's wall freeze every other model the
+// account serves (BP-240, same defect BP-189 fixed on workbuddy). Pass "" when
+// no model is in play (checkin, usage) so the pool falls back to account rest.
+func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	if code, msg, ok := detectError(string(body)); ok {
 		return classifyBusiness(code, msg)
 	}
@@ -1238,7 +1297,9 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 	case status == 401:
 		return uperr.New(uperr.ClassAuth, status, "trae: %s", truncate(body, 300))
 	case status == 429:
-		return uperr.New(uperr.ClassSoftRate, status, "trae: %s", truncate(body, 300))
+		e := uperr.New(uperr.ClassSoftRate, status, "trae: %s", truncate(body, 300))
+		e.Model = upstreamModel
+		return e
 	case status == 404:
 		// The path/model is missing upstream: identical on every account of
 		// this channel, so this is a binding property, not a rate limit. It
@@ -1287,7 +1348,7 @@ func (d *Driver) checkinStatus(ctx context.Context, creds *Creds, accID string) 
 	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return traeCheckinStatus{}, classifyHTTP(resp.StatusCode, raw)
+		return traeCheckinStatus{}, classifyHTTP(resp.StatusCode, raw, "")
 	}
 	// The status/credits below feed task decisions; a truncated read must not
 	// read as "not checked in, zero credits" (ticket 11).
@@ -1428,7 +1489,7 @@ func (d *Driver) claimCheckin(ctx context.Context, creds *Creds) error {
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return classifyHTTP(resp.StatusCode, raw)
+		return classifyHTTP(resp.StatusCode, raw, "")
 	}
 	// A 200 can still carry a business error; an empty or non-JSON body keeps
 	// the historical success semantics (some deployments answer `{}`).
@@ -1524,7 +1585,7 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	defer resp.Body.Close()
 	raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		return nil, classifyHTTP(resp.StatusCode, raw, "")
 	}
 	// Credit balance feeds pool scoring; a truncated read must surface as an
 	// error rather than a zero balance (ticket 11).

@@ -119,6 +119,19 @@ type Error struct {
 	// pool.ApplyResult when the failure was folded into a cooldown — it can be
 	// earlier than ResetAt (the hold is capped so a later request re-probes).
 	HoldUntil time.Time
+	// ContextOverflow marks "the prompt did not fit this model's window".
+	//
+	// BP-244 (magpie 2cca1117, #4425): this is not just another bad request.
+	// A client that knows the difference can COMPACT and retry; one that does
+	// not will resend the identical oversized body until it gives up. Codex is
+	// the concrete case — it compacts only on a `context_length_exceeded` code,
+	// and with anything else it resent the same body five times and never
+	// compacted. The flag rides the error out to the protocol writer, which
+	// renders the vocabulary that client understands.
+	//
+	// No pool behaviour changes: an overflow still never rotates an account,
+	// because no account can shorten a prompt.
+	ContextOverflow bool `json:"-"`
 }
 
 func (e *Error) Error() string {

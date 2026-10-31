@@ -84,7 +84,14 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		// BP-241: scope a soft rate limit to the MODEL. An account-wide rest
+		// for one model's wall freezes every other model the account serves —
+		// the same defect BP-189 fixed on workbuddy and BP-240 on trae.
+		e := classifyHTTP(resp.StatusCode, raw)
+		if e != nil && e.Class == uperr.ClassSoftRate && e.Model == "" {
+			e.Model = call.UpstreamModel
+		}
+		return nil, e
 	}
 	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer streamBody.Close()

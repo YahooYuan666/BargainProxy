@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bargainproxy/internal/clientip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -288,6 +289,15 @@ func main() {
 	sched.Start()
 	defer sched.Stop()
 	log.Printf("tasks: scheduler started (checkins 09:05/21:05 CST, growth 09:15, probes 30m, refresh 1h, log purge 1h)")
+
+	// BP-246: whether a trusted reverse proxy sits in front decides if
+	// X-Forwarded-For is believed. Default false — the header is
+	// caller-controlled, and it used to be the FIRST thing both the request log
+	// and the panel's login rate limiter read.
+	clientip.SetTrustForwarded(cfg.TrustForwardedFor)
+	if cfg.TrustForwardedFor {
+		log.Printf("client ip: trusting X-Forwarded-For (rightmost hop) — a proxy must be in front")
+	}
 
 	// HTTP server.
 	srv := &http.Server{

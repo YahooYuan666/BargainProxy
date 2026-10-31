@@ -24,7 +24,14 @@ import (
 // randFloat64 returns a uniform float in [0,1) from crypto/rand. Used for
 // scheduling fair draws (not security-sensitive, but no reason for weak
 // sources anywhere in the process).
-func randFloat64() float64 {
+// randFloat64 is a VARIABLE so tests can make a probabilistic assertion
+// deterministic (BP-255). Scheduling picks are deliberately a weighted draw —
+// two accounts with a 12:2 weight ratio means the weaker one legitimately wins
+// ~14% of the time, so a test that asserts "the strong one is picked" is flaky
+// by construction unless it can control the draw. Field 2026-11-01: BP-234's
+// stickiness test failed 2 runs in 5 and was mistaken for a regression from an
+// unrelated change.
+var randFloat64 = func() float64 {
 	var b [8]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return 0.5
@@ -698,15 +705,6 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		return nil, &ErrModelGone{Channel: channel, Model: modelName, Accounts: n, Reason: why}, false
 	}
 
-	// Single-active mode (2026-10-20): one account per pool may interact at a
-	// time. A second request is NOT queued on this pool and NOT sent to another
-	// account of the same pool — the caller routes to the next binding. This is
-	// the guard against the multi-account-at-once pattern upstream risk control
-	// treats as unusual activity.
-	if a, busy := p.activeAccountLocked(channel); busy {
-		return nil, &ErrChannelBusy{Channel: channel, Account: a.Nickname}, false
-	}
-
 	// Upstream capacity pause: while the channel+model pair is paused after a
 	// queue-full event, fail fast instead of sending another request into the
 	// same full queue (per-account state is untouched — this is a wait, not
@@ -752,6 +750,25 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 				return nil, nil, true
 			}
 		}
+	}
+
+	// Single-active mode (2026-10-20): one account per pool may interact at a
+	// time. A second request is NOT queued on this pool and NOT sent to another
+	// account of the same pool — the caller routes to the next binding. This is
+	// the guard against the multi-account-at-once pattern upstream risk control
+	// treats as unusual activity.
+	//
+	// BP-250: this check sits AFTER the sticky block on purpose. It used to run
+	// first, so a conversation already bound to this pool was refused as soon
+	// as the bound account reached its in-flight limit — and a bound
+	// conversation has no other pool to go to, so it drifted to a different
+	// upstream entirely. The sticky block above already handles the full case
+	// correctly: it asks the request to WAIT for its own account (no-drift
+	// queue) instead of starting a second account. Only a conversation with no
+	// binding here can start a second account, and that is what this check
+	// forbids.
+	if a, busy := p.activeAccountLocked(channel); busy {
+		return nil, &ErrChannelBusy{Channel: channel, Account: a.Nickname}, false
 	}
 
 	// 2. Candidate selection by channel strategy. Single-active mode allows

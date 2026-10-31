@@ -176,7 +176,7 @@ func (d *Driver) createSession(ctx context.Context, creds *Creds, call driver.Ch
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return "", classifyHTTP(resp.StatusCode, rb)
+		return "", classifyHTTP(resp.StatusCode, rb, call.UpstreamModel)
 	}
 	var out sessionCreateResp
 	if err := json.Unmarshal(rb, &out); err != nil {
@@ -242,7 +242,7 @@ func (d *Driver) sessionMessages(ctx context.Context, creds *Creds, sid string) 
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, classifyHTTP(resp.StatusCode, rb)
+		return nil, classifyHTTP(resp.StatusCode, rb, "")
 	}
 	var env struct {
 		Code int    `json:"code"`

@@ -1450,7 +1450,13 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	}
 	if status == 400 || status == 404 || status == 413 {
 		if isPromptTooLong(lower) || uperr.Overflowed(text) {
-			return uperr.New(uperr.ClassBadRequest, status, "workbuddy: prompt too long: %s", truncate(body, 300))
+			// BP-244: flag it as a context overflow so the Responses writer can
+			// answer `context_length_exceeded` — the one code a client like
+			// Codex compacts on. Without the flag it is a generic 400 and the
+			// client resends the identical oversized body.
+			e := uperr.New(uperr.ClassBadRequest, status, "workbuddy: prompt too long: %s", truncate(body, 300))
+			e.ContextOverflow = true
+			return e
 		}
 	}
 	switch {

@@ -228,8 +228,18 @@ func TestBuildRequestShape(t *testing.T) {
 		t.Fatal("tools missing")
 	}
 	gen := inner["generationConfig"].(map[string]any)
-	if gen["temperature"].(float64) != 0.7 || gen["maxOutputTokens"].(float64) != 100 {
-		t.Fatalf("generationConfig = %v", gen)
+	if gen["temperature"].(float64) != 0.7 {
+		t.Fatalf("temperature = %v, want 0.7", gen["temperature"])
+	}
+	// BP-257: maxOutputTokens is NOT sent for antigravity's Gemini models.
+	// magpie (internal/gateway/codeassist.go) is explicit:
+	//
+	//	if r.MaxTokens > 0 && (!ag || claude) { gen["maxOutputTokens"] = r.MaxTokens }
+	//
+	// and AIClient2API deletes the field outright for non-Claude models. Both
+	// references agree; this test used to pin the opposite and was wrong.
+	if _, present := gen["maxOutputTokens"]; present {
+		t.Fatalf("maxOutputTokens must not be sent to antigravity's Gemini family: %v", gen)
 	}
 }
 

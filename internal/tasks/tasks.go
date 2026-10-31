@@ -8,6 +8,7 @@
 package tasks
 
 import (
+	"bargainproxy/internal/safego"
 	"context"
 	"fmt"
 	"log"
@@ -37,14 +38,14 @@ var Shanghai = time.FixedZone("CST", 8*3600)
 
 // Task type identifiers.
 const (
-	TaskCheckinWorkBuddy  = "checkin_workbuddy"
-	TaskCheckinTrae       = "checkin_trae"
-	TaskCheckinAutoClaw   = "checkin_autoclaw"
-	TaskCheckinQoder      = "checkin_qoder"
-	TaskCheckinLobster    = "checkin_lobster"
+	TaskCheckinWorkBuddy = "checkin_workbuddy"
+	TaskCheckinTrae      = "checkin_trae"
+	TaskCheckinAutoClaw  = "checkin_autoclaw"
+	TaskCheckinQoder     = "checkin_qoder"
+	TaskCheckinLobster   = "checkin_lobster"
 	// TaskCheckinZCode is BP-231: ZCode's daily gift-plan claim — the
 	// channel's daily reward action (its sign-in does not exist).
-	TaskCheckinZCode = "checkin_zcode"
+	TaskCheckinZCode      = "checkin_zcode"
 	TaskProbeAll          = "probe_all"
 	TaskRefreshTokens     = "refresh_tokens"
 	TaskGrowthWorkBuddy   = "growth_workbuddy"
@@ -630,7 +631,13 @@ func checkinFanOutTasks() []string {
 // (default 09:05/21:05 Asia/Shanghai), probes every probe_minutes, token
 // refresh every refresh_minutes — all panel-editable and hot-applied.
 func (s *Scheduler) Start() {
-	s.startOnce.Do(func() { s.loopWG.Add(1); go func() { defer s.loopWG.Done(); s.loop() }() })
+	s.startOnce.Do(func() {
+		s.loopWG.Add(1)
+		// BP-245: the minute tick is a background job, not a request handler —
+		// net/http's panic guard does not cover it. One nil-pointer in a
+		// checkin parser used to end the whole process.
+		go func() { defer s.loopWG.Done(); defer safego.Recover("tasks.loop"); s.loop() }()
+	})
 }
 
 // Stop terminates the loop.

@@ -386,3 +386,18 @@ func RenderError(kind, message string) *ErrorBody {
 	e.Error.Message = message
 	return e
 }
+
+// RenderContextOverflow builds the envelope for "the prompt did not fit".
+//
+// BP-244 (magpie 2cca1117, #4425): the code must be `context_length_exceeded`.
+// That is the one code Codex acts on — it compacts and retries. With any other
+// code (we used to send `upstream_error` with a bad_request class) Codex
+// treated it as an unexpected failure, resent the identical oversized body five
+// times ("reconnecting 5/5"), and never compacted. The type is
+// `invalid_request_error` because the request, not the account or the gateway,
+// is what did not fit.
+func RenderContextOverflow(message string) *ErrorBody {
+	e := RenderError("invalid_request_error", message)
+	e.Error.Code = "context_length_exceeded"
+	return e
+}

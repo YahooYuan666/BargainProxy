@@ -231,7 +231,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			_, _, msg := gateway.DescribeError(err)
 			if tw.sent {
-				_ = sw.FinishWithError(msg)
+				// BP-244: name an overflow in the vocabulary the client acts on.
+				if ue, ok := uperr.As(err); ok && ue.ContextOverflow {
+					_ = sw.FinishWithErrorCode("context_length_exceeded", msg)
+				} else {
+					_ = sw.FinishWithError(msg)
+				}
 			}
 			logRow.Status, logRow.ErrorClass, logRow.DurationMs = statusOf(err), classOf(err), int(time.Since(start).Milliseconds())
 			s.gw.LogRequest(logRow)
@@ -256,10 +261,17 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}, logRow)
 	if err != nil {
-		status, class, _ := gateway.DescribeError(err)
+		status, class, msg := gateway.DescribeError(err)
 		logRow.Status, logRow.ErrorClass, logRow.DurationMs = status, class, int(time.Since(start).Milliseconds())
 		s.gw.LogRequest(logRow)
 		withRetryAfter(w, status, err)
+		// BP-244: a context overflow must be told in the vocabulary this
+		// client acts on. Codex compacts only on `context_length_exceeded`;
+		// with anything else it resends the same oversized body.
+		if ue, ok := uperr.As(err); ok && ue.ContextOverflow {
+			writeJSON(w, status, responses.RenderContextOverflow(msg))
+			return
+		}
 		writeJSON(w, status, openAIError(err))
 		return
 	}

@@ -42,6 +42,7 @@ func TestBP234NewSessionsSpreadOverLeastHeld(t *testing.T) {
 // The spread must NOT break stickiness: an already-bound conversation keeps
 // its account even when it holds more sessions than the other.
 func TestBP234StickinessUnbroken(t *testing.T) {
+	pinDraw(t, 0) // deterministic: the highest-weighted candidate wins
 	p := New(Params{MaxQueueWait: time.Second},
 		map[string]int{model.ChannelWorkBuddy: 2}, nil)
 	rich := mkAccount("wb-rich", model.ChannelWorkBuddy)
@@ -97,4 +98,14 @@ func TestBP234LeastHeldGateUnit(t *testing.T) {
 	if out := p2.leastHeldLocked("workbuddy", []*model.Account{rich, poor}, now); len(out) != 2 {
 		t.Fatalf("equal densities must pass through, got %d candidates", len(out))
 	}
+}
+
+// pinDraw forces the weighted draw to a fixed value for one test, so an
+// assertion about WHICH account wins is deterministic instead of a coin flip
+// (BP-255). 0 means "take the first candidate in weight order".
+func pinDraw(t *testing.T, v float64) {
+	t.Helper()
+	prev := randFloat64
+	randFloat64 = func() float64 { return v }
+	t.Cleanup(func() { randFloat64 = prev })
 }

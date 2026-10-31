@@ -12,6 +12,7 @@
 package panel
 
 import (
+	"bargainproxy/internal/clientip"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -341,13 +342,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = enc.Encode(v)
 }
 
-func clientIP(r *http.Request) string {
-	if h := r.Header.Get("X-Forwarded-For"); h != "" {
-		return strings.TrimSpace(strings.Split(h, ",")[0])
-	}
-	host := r.RemoteAddr
-	if i := strings.LastIndexByte(host, ':'); i > 0 {
-		host = host[:i]
-	}
-	return host
-}
+// clientIP delegates to clientip.From (BP-246). The panel's login rate
+// limiter keys on this value, so the old unconditional X-Forwarded-For read
+// let a caller rotate the header and defeat the limiter outright.
+func clientIP(r *http.Request) string { return clientip.From(r) }

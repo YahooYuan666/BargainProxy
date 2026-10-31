@@ -14,6 +14,7 @@
 package panel
 
 import (
+	"bargainproxy/internal/safego"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -546,7 +547,9 @@ func (p *Panel) handleWBStart(w http.ResponseWriter, r *http.Request) {
 	// silently stop (2026-10-22: the dialog said 自动检测中 while not a single
 	// poll reached the gateway). Watch from the gateway side too, so a login
 	// completes without depending on the browser tab staying alive.
-	go p.watchWBFlow(key)
+	// BP-245: a login watcher is a background job — an unexpected nil in the
+	// upstream flow JSON must not end the process that is serving traffic.
+	go func() { defer safego.Recover("panel.watchWBFlow"); p.watchWBFlow(key) }()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"auth_url": st.AuthURL,
 		"state":    st.State,

@@ -4,6 +4,7 @@
 package server
 
 import (
+	"bargainproxy/internal/clientip"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -11,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -112,6 +112,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		if tier, ok := costTierFor(s.gw, mi.Model, natives); ok {
 			entry["pricing"] = map[string]any{"tier": tier, "note": tierNote(tier)}
 		}
+		// BP-243: append the models.dev vocabulary so clients that read THAT
+		// dialect (magpie, the OpenCode family) can see modalities, limits,
+		// tool calling and reasoning gears. Purely additive — every key above
+		// is untouched — and nothing is invented: a model with no spec row
+		// simply gets no capability keys (see config/modelspec.go).
+		applyModelsDevShape(entry, mi.Model, natives)
 		data = append(data, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
@@ -437,16 +443,11 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = enc.Encode(v)
 }
 
-func clientIP(r *http.Request) string {
-	if h := r.Header.Get("X-Forwarded-For"); h != "" {
-		return strings.TrimSpace(strings.Split(h, ",")[0])
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
+// clientIP delegates to clientip.From (BP-246): X-Forwarded-For is
+// caller-controlled and used to be trusted unconditionally, so any client
+// could choose its own source IP in the logs and, in the panel, its own
+// rate-limit bucket.
+func clientIP(r *http.Request) string { return clientip.From(r) }
 
 func accountLabel(a *model.Account) string {
 	if a.Nickname != "" {
