@@ -1359,6 +1359,22 @@ var refusedIdentities = []string{
 // "the GLM-x model" form.
 var glmOpeningRe = regexp.MustCompile(`(?i)this conversation is powered by GLM-([\w.-]+)`)
 
+// identityRewrites are the identity lines the gateway accepts once REWORDED
+// (BP-230, plugins autoclaw 0.2.13 acb85ed8): rewriting keeps the agent's
+// name — which the rest of its prompt refers back to — where deleting the
+// sentence would amputate it. Hermes Agent's opener measured 406→200 with
+// the reworded forms; the other three are read from each agent's source.
+var identityRewrites = []struct {
+	re *regexp.Regexp
+	to string
+}{
+	{regexp.MustCompile(`(?i)You are Hermes(?: Agent)?\b`), "You are the agent Hermes"},
+	{regexp.MustCompile(`(?i)Hermes Agent\b`), "Hermes-Agent"},
+	{regexp.MustCompile(`(?i)You are Gemini CLI\b`), "You are the Gemini CLI agent"},
+	{regexp.MustCompile(`(?i)You are Kimi Code CLI\b`), "You are the Kimi Code CLI agent"},
+	{regexp.MustCompile(`(?i)You are goose\b`), "You are the goose agent"},
+}
+
 // refusedIdentityClaim reports whether text carries a second-person identity
 // claim naming a refused product, and returns the text with just that claim
 // removed.
@@ -1374,6 +1390,10 @@ func scrubRefusedIdentity(text string) string {
 	// not a "you are" claim — rewrite it before the claim scrub.
 	if glmOpeningRe.MatchString(text) {
 		text = glmOpeningRe.ReplaceAllString(text, "This conversation is powered by the GLM-$1 model")
+	}
+	// BP-230: the known rewordable identities go first — the name survives.
+	for _, r := range identityRewrites {
+		text = r.re.ReplaceAllString(text, r.to)
 	}
 	lower := strings.ToLower(text)
 	if !strings.Contains(lower, "you are") {
@@ -1663,6 +1683,11 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				}
 			}
 			if ch.FinishReason != "" {
+				// BP-222: finish_reason "error" is the vendor's word for a
+				// failed turn — fail the attempt, never report it as a success.
+				if ir.FinishReasonFailed(ch.FinishReason) {
+					return nil, uperr.NewFailedFinishTurn("autoclaw")
+				}
 				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}

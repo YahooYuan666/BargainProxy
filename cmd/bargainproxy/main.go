@@ -60,6 +60,18 @@ func main() {
 		log.Fatalf("cryptox: %v", err)
 	}
 
+	// BP-236: one process per data directory. A second start answers who is
+	// holding the directory and exits with code 0 — "already running" is not
+	// a failure a supervisor should restart on (Coding2API 82cf0efd).
+	if dataDir := cfg.DataDir; dataDir != "" {
+		release, lerr := acquireInstanceLock(dataDir)
+		if lerr != nil {
+			log.Printf("%v; exiting cleanly", lerr)
+			return
+		}
+		defer release()
+	}
+
 	// Store.
 	var st store.Store
 	switch cfg.Store {

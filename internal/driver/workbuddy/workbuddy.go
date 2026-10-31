@@ -132,6 +132,12 @@ type Driver struct {
 	messagesAllowed atomic.Bool
 	refreshMu       sync.Mutex
 	refreshes       map[string]*refreshFlight
+	// comma11128 caches the system-prompt keys whose opener line tripped the
+	// channel check AND whose comma rewrite cleared it (BP-227): later
+	// requests with the same system pre-apply the comma instead of paying a
+	// 400 + retry round trip every time (plugins 3968cdd7's commaSystems).
+	comma11128Mu sync.Mutex
+	comma11128   map[string]struct{}
 }
 
 // New builds the driver.
@@ -251,10 +257,31 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		// official builds).
 		if ue, ok := err.(*uperr.Error); ok && ue.Class == uperr.ClassBadRequest &&
 			strings.Contains(ue.Message, "11128") {
-			moved, berr := d.buildBody(call, creds, true)
-			if berr == nil {
-				log.Printf("workbuddy: 11128 channel refusal; resending with the system prompt as the user's instructions")
-				resp, err = d.postChat(ctx, creds, call, moved, chatCompletionsPath)
+			// BP-227: the edge matches the opener line WHOLE, so one comma
+			// between the agent name and its "powered by" phrase breaks the
+			// signature while the system prompt STAYS a system prompt
+			// (measured 400→200 against the live edge, plugins 79b02cc5) —
+			// lighter than moving it into the user turn. A verified comma
+			// system is remembered, so later requests pre-apply it. The
+			// systemAsUser move stays as the fallback for anything the comma
+			// does not clear (BP-93).
+			sysKey := systemKeyOfReq(call.Request)
+			// Only retry when the comma actually changes the wire: a body
+			// without the opener shape (replaced or stripped system, no
+			// assistant quote) would burn a round trip for nothing.
+			if jb, berr := d.buildBodyOpts(call, creds, bodyOpts{commaOpeners: true}); berr == nil && !bytes.Equal(jb, body) {
+				log.Printf("workbuddy: 11128 channel refusal; resending with the opener comma")
+				if r2, jerr := d.postChat(ctx, creds, call, jb, chatCompletionsPath); jerr == nil {
+					d.rememberCommaSystem(sysKey)
+					resp, err = r2, nil
+				}
+			}
+			if err != nil {
+				moved, berr := d.buildBody(call, creds, true)
+				if berr == nil {
+					log.Printf("workbuddy: 11128 channel refusal; resending with the system prompt as the user's instructions")
+					resp, err = d.postChat(ctx, creds, call, moved, chatCompletionsPath)
+				}
 			}
 		}
 		// BP-130: a 401 is worth one PROVEN retry. Upstream sometimes
@@ -348,6 +375,16 @@ func (d *Driver) postChat(ctx context.Context, creds *Creds, call driver.ChatCal
 // the upstream's own default system line first — the shape the channel check
 // accepts when it has refused the original (BP-93).
 func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool) ([]byte, error) {
+	return d.buildBodyOpts(call, creds, bodyOpts{systemAsUser: systemAsUser})
+}
+
+// bodyOpts carries the buildBody variants the retry paths need.
+type bodyOpts struct {
+	systemAsUser bool
+	commaOpeners bool // BP-227: set the opener comma regardless of the cache
+}
+
+func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts) ([]byte, error) {
 	req := call.Request
 	// Empty-name tool calls poison the session upstream-side (business error
 	// 11133): a stream that ends before the name fragment arrives yields
@@ -433,7 +470,7 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool
 	if mode == "" {
 		mode = "custom"
 	}
-	if systemAsUser {
+	if opts.systemAsUser {
 		// The retry must carry the caller's OWN system text, moved — not the
 		// replaced or stripped version — or the agent's instructions are lost
 		// and the model behaves like a different agent (BP-93).
@@ -442,6 +479,14 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool
 		messages = prompt.ReplaceSystem(messages, prompt.DefaultSystemPrompt)
 	} else {
 		messages = prompt.StripSystem(messages)
+	}
+	// BP-227: a system whose opener line the 11128 check already refused
+	// gets the comma set BEFORE the first byte — the cache spares later
+	// requests the 400 + retry round trip. Applied after the mode handling:
+	// a replaced or stripped system cannot trip the check, and the rewrite
+	// only touches lines that match the opener shape.
+	if opts.commaOpeners || d.needsCommaSystem(systemKeyOfReq(req)) {
+		commaOpeners(messages)
 	}
 
 	body := map[string]any{
@@ -764,6 +809,13 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 				}
 			}
 			if ch.FinishReason != "" {
+				// BP-222: finish_reason "error" is the vendor's word for a
+				// failed turn, not a finished one — fail the attempt instead of
+				// reporting a half answer as a success (ClassTransport: no
+				// account penalty; the gateway cascades or continues).
+				if ir.FinishReasonFailed(ch.FinishReason) {
+					return nil, uperr.NewFailedFinishTurn("workbuddy")
+				}
 				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}
@@ -841,6 +893,75 @@ func mapFinish(reason string) ir.StopReason {
 	default:
 		return ir.StopEnd
 	}
+}
+
+// openerCommaRe is BP-227's rewrite: WorkBuddy's 11128 channel check matches
+// another agent's opener line WHOLE, and a comma between the agent noun and
+// its "powered by / running on / …" phrase breaks the signature while
+// keeping the line — and the harness name the rest of the prompt refers
+// back to — intact (plugins 79b02cc5 measured 400→200; 3968cdd7 generalized
+// the shape).
+var openerCommaRe = regexp.MustCompile(`(?i)(\bYou are (?:an?|the)\s[^\n.,]{0,60}?\b(?:agent|assistant))\s+(powered by|running on|running in|built on|based on)\b`)
+
+// commaOpeners sets the opener comma in the wire messages WorkBuddy reads —
+// its own words: system and assistant messages only.
+func commaOpeners(messages []map[string]any) {
+	for _, m := range messages {
+		role, _ := m["role"].(string)
+		if role != "system" && role != "assistant" {
+			continue
+		}
+		switch c := m["content"].(type) {
+		case string:
+			if ns := openerCommaRe.ReplaceAllString(c, "$1, $2"); ns != c {
+				m["content"] = ns
+			}
+		case []map[string]any:
+			for _, p := range c {
+				if t, ok := p["text"].(string); ok {
+					if ns := openerCommaRe.ReplaceAllString(t, "$1, $2"); ns != t {
+						p["text"] = ns
+					}
+				}
+			}
+		}
+	}
+}
+
+// systemKeyOfReq hashes the request's own system text — the identity the
+// comma cache keys on (stable across turns of one conversation).
+func systemKeyOfReq(req *ir.ChatRequest) string {
+	var b strings.Builder
+	for _, m := range req.Messages {
+		if m.Role != ir.RoleSystem {
+			continue
+		}
+		b.WriteString(ir.TextOf(m.Content))
+		b.WriteByte(0)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:16])
+}
+
+// rememberCommaSystem records a system whose comma rewrite cleared 11128.
+// Bounded: a runaway cache must not grow with the process lifetime.
+func (d *Driver) rememberCommaSystem(key string) {
+	d.comma11128Mu.Lock()
+	defer d.comma11128Mu.Unlock()
+	if d.comma11128 == nil {
+		d.comma11128 = make(map[string]struct{})
+	}
+	if len(d.comma11128) >= 1024 {
+		return
+	}
+	d.comma11128[key] = struct{}{}
+}
+
+func (d *Driver) needsCommaSystem(key string) bool {
+	d.comma11128Mu.Lock()
+	defer d.comma11128Mu.Unlock()
+	_, ok := d.comma11128[key]
+	return ok
 }
 
 // detectBusinessError finds a business code + message in a JSON body.
@@ -1157,27 +1278,39 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 		req.Header.Set("X-User-Id", uid)
 	}
 	// Browser/CLI-shaped headers the desktop client never sends on chat:
-	// Origin, Referer, Accept-Language, X-Machine-ID, X-Session-ID,
-	// X-Requested-With and the X-No-* sentinels all came from the CodeBuddy
-	// CLI's conventions. Both official WorkBuddy packages omit every one of
-	// them here (BP-90) — an extra header is a fingerprint in its own right.
+	// Origin, Referer, Accept-Language, X-Machine-ID and X-Session-ID came
+	// from the CodeBuddy CLI's conventions. The official packages omit every
+	// one of them here (BP-90) — an extra header is a fingerprint in its own
+	// right. (BP-225: X-Requested-With left this list — the 2026-10-30
+	// captures show the chat SDK chain DOES carry it, below.)
 	//
 	// channels.workbuddy.send_browser_headers restores them for A/B work.
 	if d.cfg.SendBrowserHeaders {
 		req.Header.Set("Origin", origin)
 		req.Header.Set("Referer", origin+"/")
 		req.Header.Set("Accept-Language", lang)
-		req.Header.Set("X-Requested-With", "XMLHttpRequest")
-		req.Header.Set("X-No-Enterprise-Id", "1")
+		req.Header.Set("X-No-Enterprise-Id", "true")
 		machine := stableHex(uidSeed(creds, call) + "|machine")
 		req.Header.Set("X-Machine-ID", machine)
 		req.Header.Set("X-Session-ID", machine)
 	}
-	// BP-170: the model-optimization toggle rides this header; the default
-	// client state (optimization on) sends "false" — 7 real chat captures all
-	// false (misakano ee1c80d8). Enterprise builds send "true"; none of our
-	// accounts are enterprise, so it is pinned false.
-	req.Header.Set("X-Private-Data", "false")
+	// BP-225 (misakano 847deb10 global-5.9.4 golden): the chat SDK chain
+	// carries X-Requested-With — it is the REST family (/v2/report, refresh,
+	// login) that never does. BP-90's older captures predate this family
+	// split; keeping the header chat-only matches both captures.
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// BP-225 (misakano 847deb10): the value flips per DISTRIBUTION, not per
+	// account tier — the international build ships DefaultModelOptimizationOff
+	// =true (applyPrivateDataHeaderPolicy decompile), so its personal accounts
+	// declare "true" (4/4 real captures) while CN personal accounts send
+	// "false" (the BP-170 capture set, still valid for CN). Enterprise builds
+	// send "true" on both; we serve none. BP-170's pinned "false" was a CN
+	// capture wearing an international hat.
+	if global {
+		req.Header.Set("X-Private-Data", "true")
+	} else {
+		req.Header.Set("X-Private-Data", "false")
+	}
 	// The openai-node SDK / agent segment the client also sends.
 	req.Header.Set("X-Agent-Type", "main")
 	req.Header.Set("X-Agent-Intent", "craft")
@@ -1231,6 +1364,12 @@ func (d *Driver) applyClientFingerprint(req *http.Request, creds *Creds, call dr
 	req.Header.Set("b3", trace+"-"+span+"-1-"+parent)
 	req.Header.Set("traceparent", "00-"+trace+"-"+span+"-01")
 	req.Header.Set("acp-connection-id", acp)
+	// BP-225 (misakano 847deb10, TestGLBaggageExactMembers): the chat chain
+	// carries W3C baggage with EXACTLY four members in this order, the two
+	// buddy keys empty. An earlier read put x-agent-runtime/x-agent-intent in
+	// here too — the real client keeps those in their own headers, and any
+	// extra member is a fingerprint of its own.
+	req.Header.Set("baggage", "buddyId=,buddyName=,codebuddy.session_id="+conv+",codebuddy.conversation_request_id="+convReq)
 }
 
 // uidSeed is the per-account isolation seed for derived ids.
@@ -1299,8 +1438,18 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	// status fallbacks: upstream may express it with 400, 404 or 413, and on
 	// 404 the generic branch would otherwise file it as a dead route.
 	// Rotating accounts cannot shorten a prompt.
+	// BP-232: the pace words decide FIRST — a 400 whose Chinese wording is a
+	// rate cap (「内容太长，已达到速率限制」) is the account's moment, not the
+	// request's; and the overflow detector gains the Chinese families.
+	if status == 400 && uperr.PaceLimited(text) {
+		e := uperr.New(uperr.ClassSoftRate, status, "workbuddy: rate-worded 400: %s", truncate(body, 300))
+		if upstreamModel != "" {
+			e.Model = upstreamModel
+		}
+		return e
+	}
 	if status == 400 || status == 404 || status == 413 {
-		if isPromptTooLong(lower) {
+		if isPromptTooLong(lower) || uperr.Overflowed(text) {
 			return uperr.New(uperr.ClassBadRequest, status, "workbuddy: prompt too long: %s", truncate(body, 300))
 		}
 	}
@@ -1739,9 +1888,11 @@ func (d *Driver) refreshOnce(ctx context.Context, creds *Creds) ([]byte, error) 
 	// (verified 2026-10-18: empty body → 400 "refreshToken is empty" when the
 	// header is missing; a bad header value → 401 code 12153). BP-175
 	// (misakano 8ecf115a, real-device capture idx 556 = 11 headers): the
-	// client also sends X-Auth-Refresh-Source: plugin, X-Requested-With and
-	// X-Request-ID, its Accept is the loose axios value, and X-Domain is the
-	// naked host without scheme.
+	// client also sends X-Auth-Refresh-Source: plugin and X-Request-ID, its
+	// Accept is the loose axios value, and X-Domain is the naked host without
+	// scheme. (BP-225: X-Requested-With left — the 2026-10-30 captures show
+	// the REST family never carries it; BP-175's idx-556 read was the one
+	// renderer-side sample of a different family.)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.chatBase(creds)+refreshPath, strings.NewReader("{}"))
 	if err != nil {
 		return nil, err
@@ -1751,9 +1902,11 @@ func (d *Driver) refreshOnce(ctx context.Context, creds *Creds) ([]byte, error) 
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("X-Refresh-Token", creds.RefreshToken)
 	req.Header.Set("X-Auth-Refresh-Source", "plugin")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	// BP-225 (misakano 847deb10): the REST family never sends
+	// X-Requested-With (56/56 real captures across both realms) — the old
+	// line here half-matched two header families at once.
 	req.Header.Set("X-Request-ID", randomHex())
-	req.Header.Set("User-Agent", desktopUA)
+	req.Header.Set("User-Agent", workBuddyRestUA(creds.RealmOrDefault() == "global"))
 	req.Header.Set("X-Domain", nakedHost(d.chatBase(creds)))
 	req.Header.Set("X-Product", "SaaS")
 	if creds.UID != "" {

@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+
+	"bargainproxy/internal/ir"
 )
 
 // usage 网关用量（OpenAI 标准字段 + Qoder credits 扩展）。
@@ -312,6 +314,7 @@ type streamAccumulator struct {
 	pendingContent   []string
 	pendingRole      string
 	finishReason     string
+	failedFinish     bool // BP-222: the raw finish_reason was "error" (a failed turn)
 	emitted          bool
 	streamingText    bool
 	emitFn           func(string)
@@ -335,6 +338,11 @@ func (a *streamAccumulator) accept(delta *bridgeDelta) {
 		a.pendingRole = delta.Role
 	}
 	if delta.FinishReason != "" {
+		// BP-222: keep the raw word visible — finalFinishReason() may override
+		// it, but a failed turn must fail the attempt (qoder.go checks this).
+		if ir.FinishReasonFailed(delta.FinishReason) {
+			a.failedFinish = true
+		}
 		a.finishReason = delta.FinishReason
 	}
 	if delta.ReasoningContent != "" {

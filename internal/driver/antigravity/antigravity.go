@@ -967,8 +967,16 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 			}
 		case ir.RoleTool:
 			var payload map[string]any
-			if len(msg.Content) > 0 && msg.Content[0].Kind == "text" {
+			if !msg.IsError && len(msg.Content) > 0 && msg.Content[0].Kind == "text" {
 				_ = json.Unmarshal([]byte(msg.Content[0].Text), &payload)
+			}
+			if msg.IsError {
+				// BP-224: a failed tool result rides functionResponse's
+				// response.error — leave it in the success payload shape and
+				// the model reads the failure text as a real result and plans
+				// on it (CLIProxyAPI 068fe153/81de4b9c #6838: the fix that
+				// stopped dead-end loops on Bash errors).
+				payload = map[string]any{"error": textOf(msg.Content)}
 			}
 			if payload == nil {
 				payload = map[string]any{"content": textOf(msg.Content)}

@@ -262,8 +262,19 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	// inside the sentinel guard's flush target, so text the guard is still
 	// buffering (and may drop as a rejection) is never counted as delivered.
 	ledger := &streamLedger{}
+	// BP-226: lone-CR scrubber for streaming tool-argument deltas — one
+	// scrubber per client request, covering every driver's tool stream.
+	crArgs := &crTidy{}
 	firstEvent := false
 	seen := func(ev ir.StreamEvent) error {
+		switch ev.Kind {
+		case ir.EvToolArgs:
+			ev.Delta = crArgs.write(ev.Delta)
+		case ir.EvToolStart, ir.EvAttemptReset:
+			// A new tool's args (or a fresh attempt) begins: a held \r was
+			// the last byte of the previous stream — lone, dropped.
+			crArgs.flush()
+		}
 		ledger.record(ev)
 		// Only CLIENT-VISIBLE content counts as "the client has seen part of
 		// the answer" (BP-118). Usage and the terminal event are bookkeeping:
@@ -779,6 +790,26 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 						started = time.Now()
 						resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
 					}
+				} else if want := tokenFieldWanted(ue.Message); want != "" && req.MaxTokens > 0 {
+					// BP-233: the refusal names the token-budget field it
+					// wants ("Use 'max_completion_tokens' instead") — swap
+					// once on the same account. Nothing reached the client
+					// (outer guard), and a vendor that names the fix in its
+					// own words has told us the body was otherwise fine.
+					current := "max_tokens"
+					if req.MaxCompletionTokens {
+						current = "max_completion_tokens"
+					}
+					if want != current {
+						swapped := *req
+						swapped.MaxCompletionTokens = want == "max_completion_tokens"
+						retryCall := call
+						retryCall.Request = &swapped
+						log.Printf("gateway: %s asked for %s instead of %s — retrying once with the field swapped",
+							binding.Channel, want, current)
+						started = time.Now()
+						resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
+					}
 				} else if (tr == nil || !tr.BadRequestResent) && req.Stream {
 					// BP-168: upstreams do emit LYING 400s. Field evidence
 					// 2026-10-28 23:46: Google's antigravity answered a generic
@@ -1033,6 +1064,12 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				g.pool.RecordCostTier(lease.Account, binding.UpstreamModel, tier)
 			}
 			g.persistCreds(lease.Account)
+			// BP-226: the aggregated arguments are the authoritative copy on
+			// buffered protocols and the one replayed into continuations —
+			// scrub lone CRs here too, after the delta stream already was.
+			for i := range resp.Message.ToolCalls {
+				resp.Message.ToolCalls[i].Arguments = dropLoneCR(resp.Message.ToolCalls[i].Arguments)
+			}
 			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts, ToolsDeclared: len(req.Tools)}
 			if degraded {
 				res.Degraded = binding.Channel

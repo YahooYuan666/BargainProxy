@@ -407,6 +407,11 @@ func parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit dr
 				}
 			}
 			if ch.FinishReason != "" {
+				// BP-222: finish_reason "error" is the vendor's word for a
+				// failed turn — fail the attempt, never report it as a success.
+				if ir.FinishReasonFailed(ch.FinishReason) {
+					return uperr.NewFailedFinishTurn("lobster")
+				}
 				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}

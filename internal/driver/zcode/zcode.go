@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 	"net/http"
 	"regexp"
 	"strings"
@@ -101,7 +102,8 @@ func ResolveModel(name string) string {
 type Driver struct {
 	cfg  config.ZCodeSettings
 	http *http.Client // streaming chat calls (no total timeout + header/idle watchdogs)
-	rpc  *http.Client // short probe / plan calls (total timeout)
+	rpc        *http.Client // short probe / plan calls (total timeout)
+	giftClient *http.Client // billing-plane gift calls (30s, BP-231a)
 	// allowUnsignedThinking gates replay of history thinking blocks whose
 	// upstream signature is empty. If the upstream ever rejects such a replay,
 	// one 400 is enough to disable it for this process — otherwise every tool
@@ -114,7 +116,35 @@ func New(cfg config.ZCodeSettings, httpClient *http.Client) *Driver {
 	if httpClient == nil {
 		httpClient = httpx.ChatClient()
 	}
-	d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
+	rpc := httpx.RPCClient()
+	// BP-231a: an explicit per-channel proxy (Clash HTTP port) replaces the
+	// clients' default transport — the dial AND the name resolution then
+	// happen at the proxy, bypassing this process's resolver (which on a
+	// TUN/fake-ip setup was observed hanging for minutes on zcode.z.ai
+	// while short-lived processes resolved instantly).
+	var tr http.RoundTripper
+	if cfg.Proxy != "" {
+		if pu, perr := url.Parse(cfg.Proxy); perr == nil && pu.Scheme == "http" {
+			pt := http.DefaultTransport.(*http.Transport).Clone()
+			pt.Proxy = http.ProxyURL(pu)
+			tr = pt
+		} else {
+			log.Printf("zcode: proxy %q ignored (must be an http:// URL)", cfg.Proxy)
+		}
+	}
+	d := &Driver{cfg: cfg, http: httpClient, rpc: rpc}
+	if tr != nil {
+		httpClient = &http.Client{Transport: tr} // streaming chat: no total timeout
+		rpc = &http.Client{Transport: tr, Timeout: httpx.RPCTimeout()}
+		d.http, d.rpc = httpClient, rpc
+	}
+	// giftClient is the billing plane's client (BP-231): a gift claim must
+	// never hold the task for the full rpc budget — 30s and the verdict is a
+	// retryable failure.
+	d.giftClient = &http.Client{Timeout: giftCallTimeout}
+	if tr != nil {
+		d.giftClient = &http.Client{Transport: tr, Timeout: giftCallTimeout}
+	}
 	d.allowUnsignedThinking.Store(true)
 	return d
 }

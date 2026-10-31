@@ -23,6 +23,7 @@ import (
 	"bargainproxy/internal/driver/qoder"
 	"bargainproxy/internal/driver/trae"
 	"bargainproxy/internal/driver/workbuddy"
+	"bargainproxy/internal/driver/zcode"
 	"bargainproxy/internal/gateway"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
@@ -41,6 +42,9 @@ const (
 	TaskCheckinAutoClaw   = "checkin_autoclaw"
 	TaskCheckinQoder      = "checkin_qoder"
 	TaskCheckinLobster    = "checkin_lobster"
+	// TaskCheckinZCode is BP-231: ZCode's daily gift-plan claim — the
+	// channel's daily reward action (its sign-in does not exist).
+	TaskCheckinZCode = "checkin_zcode"
 	TaskProbeAll          = "probe_all"
 	TaskRefreshTokens     = "refresh_tokens"
 	TaskGrowthWorkBuddy   = "growth_workbuddy"
@@ -282,6 +286,25 @@ func fnv64a(s string) uint64 {
 
 // accountPause sleeps the configured inter-account gap. Call between accounts
 // of the same run, never after the last one.
+// spreadSkipCtxKey marks a manual (panel "run now") task run.
+type spreadSkipCtxKey struct{}
+
+// WithoutSpread returns a ctx that makes the scheduler skip the inter-account
+// spread for this run. The spread humanizes SCHEDULED bursts (accounts roll
+// out over minutes so a fleet check-in does not hit the upstream at the same
+// second); a manual run must answer immediately — BP-231a: the first
+// checkin_zcode click waited 3m19s of spread with the client's request
+// context, every client timed out, and the account dispatch ran with a dead
+// context ("context canceled" ledger rows that looked like a network fault).
+func WithoutSpread(ctx context.Context) context.Context {
+	return context.WithValue(ctx, spreadSkipCtxKey{}, true)
+}
+
+func spreadSkipped(ctx context.Context) bool {
+	v, _ := ctx.Value(spreadSkipCtxKey{}).(bool)
+	return v
+}
+
 func (s *Scheduler) accountPause(ctx context.Context) {
 	s.mu.Lock()
 	d := s.accountGap
@@ -312,8 +335,8 @@ func (s *Scheduler) TaskTypes() []string {
 	return []string{
 		TaskCheckinWorkBuddy, TaskGrowthWorkBuddy, TaskCheckinTrae,
 		TaskCheckinAutoClaw, TaskCheckinQoder, TaskCheckinLobster,
-		TaskActivityWorkBuddy, TaskTravelWorkBuddy, TaskBlackcatWorkBuddy,
-		TaskProbeAll, TaskRefreshTokens,
+		TaskCheckinZCode, TaskActivityWorkBuddy, TaskTravelWorkBuddy,
+		TaskBlackcatWorkBuddy, TaskProbeAll, TaskRefreshTokens,
 	}
 }
 
@@ -599,6 +622,7 @@ func checkinFanOutTasks() []string {
 		TaskCheckinAutoClaw,
 		TaskCheckinQoder,
 		TaskCheckinLobster,
+		TaskCheckinZCode,
 	}
 }
 
@@ -767,7 +791,7 @@ func (s *Scheduler) disabledKeepAliveEligible(taskType string) bool {
 		return false
 	}
 	switch taskType {
-	case TaskCheckinWorkBuddy, TaskCheckinTrae, TaskCheckinAutoClaw, TaskCheckinQoder, TaskActivityWorkBuddy:
+	case TaskCheckinWorkBuddy, TaskCheckinTrae, TaskCheckinAutoClaw, TaskCheckinQoder, TaskCheckinZCode, TaskActivityWorkBuddy:
 		return true
 	default:
 		return false
@@ -834,6 +858,10 @@ func (s *Scheduler) RunTask(ctx context.Context, taskType, accountID string) (st
 		return s.runPerAccount(ctx, taskType, accountID, model.ChannelAutoClaw, s.checkinAutoClaw)
 	case TaskCheckinQoder:
 		return s.runPerAccount(ctx, taskType, accountID, model.ChannelQoder, s.checkinQoder)
+	case TaskCheckinZCode:
+		// BP-231: the daily gift-plan claim. A per-plan failure is retryable
+		// (the next slot re-runs it); a captcha wall is not a failure.
+		return s.runPerAccount(ctx, taskType, accountID, model.ChannelZCode, s.claimGiftZCode)
 	case TaskCheckinLobster:
 		return s.runPerAccount(ctx, taskType, accountID, model.ChannelLobster, s.checkinLobster)
 	case TaskProbeAll:
@@ -900,9 +928,10 @@ func (s *Scheduler) runPerAccount(
 	var notes []string
 	var firstErr error
 	// Automatic runs spread their accounts over the spread window; an
-	// account-targeted run (a panel click) never waits (BP-96).
+	// account-targeted run (a panel click) never waits (BP-96), and neither
+	// does a manual full-pool run marked WithoutSpread (BP-231a).
 	var offsets []time.Duration
-	if accountID == "" {
+	if accountID == "" && !spreadSkipped(ctx) {
 		ids := make([]string, len(accounts))
 		for i, a := range accounts {
 			ids[i] = a.ID
@@ -912,6 +941,14 @@ func (s *Scheduler) runPerAccount(
 	for i, acc := range accounts {
 		if offsets != nil {
 			s.accountWait(ctx, offsets[i])
+		}
+		if ctx.Err() != nil {
+			// The wait was cut by the caller's context (panel disconnect,
+			// shutdown) — dispatching now would only run the task's first
+			// network call against a dead context and record a misleading
+			// "canceled" row (BP-231a).
+			log.Printf("task %s: %s skipped — run context canceled during the spread wait", taskType, label(acc))
+			continue
 		}
 		if acc.Disabled && !s.disabledKeepAliveEligible(taskType) {
 			continue
@@ -1281,6 +1318,29 @@ func (s *Scheduler) checkinQoder(ctx context.Context, acc *model.Account) (strin
 	default:
 		return "qoder checkin not available", nil
 	}
+}
+
+// claimGiftZCode runs BP-231's daily gift-plan claim for one account. A
+// failed claim makes the task retryable (the next check-in slot re-runs it);
+// a captcha wall (code 3007) is a known app-side wall, reported but not a
+// failure.
+func (s *Scheduler) claimGiftZCode(ctx context.Context, acc *model.Account) (string, error) {
+	drv, ok := s.gw.Driver(model.ChannelZCode).(*zcode.Driver)
+	if !ok {
+		return "", fmt.Errorf("zcode driver not installed")
+	}
+	res, err := drv.ClaimGiftPlans(ctx, acc)
+	if err != nil {
+		return "zcode gift claim failed: " + err.Error(), err
+	}
+	detail := fmt.Sprintf("claimed %d, already %d, captcha %d, failed %d", res.Claimed, res.Already, res.Captcha, res.Failed)
+	if len(res.Notes) > 0 {
+		detail += " (" + strings.Join(res.Notes, "; ") + ")"
+	}
+	if res.Failed > 0 {
+		return detail, fmt.Errorf("zcode gift claim: %d plan(s) failed", res.Failed)
+	}
+	return detail, nil
 }
 
 // activityWorkBuddy sends one chat-activity report (ticket 26, agentpoints

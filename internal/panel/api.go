@@ -24,6 +24,7 @@ import (
 	"bargainproxy/internal/model"
 	"bargainproxy/internal/router"
 	"bargainproxy/internal/store"
+	"bargainproxy/internal/tasks"
 )
 
 // TaskRunner is implemented by the task center (wired by main). Nil until
@@ -985,7 +986,13 @@ func (p *Panel) handleTaskRun(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
+	// BP-231a: a panel "run now" skips the inter-account spread — the caller
+	// is one human watching one result, not a scheduled fleet burst.
+	ctx = tasks.WithoutSpread(ctx)
+	runStart := time.Now()
+	log.Printf("tasks/run: entry type=%s account=%q remote=%s", req.TaskType, req.AccountID, r.RemoteAddr)
 	detail, err := p.taskRunner.RunTask(ctx, req.TaskType, req.AccountID)
+	log.Printf("tasks/run: done type=%s in %s err=%v", req.TaskType, time.Since(runStart).Round(time.Millisecond), err)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error(), "detail": detail})
 		return

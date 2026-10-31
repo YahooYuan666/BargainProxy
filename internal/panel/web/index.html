@@ -1928,7 +1928,7 @@ function renderModels(models){
 }
 
 /* ── 任务中心 ── */
-const taskLabels = {checkin_workbuddy:'WorkBuddy 签到+连登', checkin_trae:'Trae 签到', checkin_autoclaw:'AutoClaw 签到', checkin_qoder:'Qoder 签到', probe_all:'全量额度刷新', refresh_tokens:'Token 预刷新', growth_workbuddy:'成长任务一键完成', activity_report_workbuddy:'WorkBuddy 活跃上报', travel_workbuddy:'猫猫旅行巡检', blackcat_workbuddy:'夜猫子夜间对话'};
+const taskLabels = {checkin_workbuddy:'WorkBuddy 签到+连登', checkin_trae:'Trae 签到', checkin_autoclaw:'AutoClaw 签到', checkin_qoder:'Qoder 签到', checkin_zcode:'ZCode 礼包领取', probe_all:'全量额度刷新', refresh_tokens:'Token 预刷新', growth_workbuddy:'成长任务一键完成', activity_report_workbuddy:'WorkBuddy 活跃上报', travel_workbuddy:'猫猫旅行巡检', blackcat_workbuddy:'夜猫子夜间对话'};
 async function loadTasks(){
   try {
     const data = await api('tasks');

@@ -183,3 +183,14 @@ func CooldownScope(class string, hasModel bool) string {
 	}
 	return "account"
 }
+
+// NewFailedFinishTurn is the canonical error for a 200 stream the vendor ends
+// with finish_reason "error" — its own word for a failed turn, not a finished
+// one (BP-222; magpie 86fef947 #2471: WorkBuddy and DeepSeek harnesses). The
+// class is ClassTransport on purpose: the account is not at fault, so the
+// pool must not cool it, and the gateway either cascades to the next binding
+// (nothing emitted yet) or runs a same-account continuation (text already on
+// the wire).
+func NewFailedFinishTurn(channel string) *Error {
+	return New(ClassTransport, 0, "%s: the turn ended with finish_reason \"error\" (the vendor's word for a failed turn)", channel)
+}

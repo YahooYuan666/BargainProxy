@@ -158,7 +158,14 @@ func buildBody(call driver.ChatCall) ([]byte, error) {
 		body["top_p"] = *req.TopP
 	}
 	if req.MaxTokens > 0 {
-		body["max_tokens"] = req.MaxTokens
+		// BP-233: OpenAI's new models only accept max_completion_tokens while
+		// domestic endpoints only know max_tokens — the gateway's token-field
+		// repair sets this flag from the refusal's own words.
+		if req.MaxCompletionTokens {
+			body["max_completion_tokens"] = req.MaxTokens
+		} else {
+			body["max_tokens"] = req.MaxTokens
+		}
 	}
 	if len(req.Tools) > 0 {
 		var tools []map[string]any
@@ -283,6 +290,11 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				}
 			}
 			if ch.FinishReason != "" {
+				// BP-222: finish_reason "error" is the vendor's word for a
+				// failed turn — fail the attempt, never report it as a success.
+				if ir.FinishReasonFailed(ch.FinishReason) {
+					return nil, uperr.NewFailedFinishTurn("openaicompat")
+				}
 				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}
@@ -508,6 +520,14 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 		}
 		return uperr.WithFields(uperr.New(uperr.ClassWAF, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status == 400 || status == 404:
+		// BP-232: a 400 whose Chinese wording is a rate cap (「内容太长，已达到
+		// 速率限制」) is the account's moment, not the request's — the old
+		// branch filed every pace-worded 400 as a terminal bad_request and the
+		// healthy siblings went unasked. Overflow wording stays a bad_request:
+		// rotating accounts cannot shorten a prompt.
+		if status == 400 && uperr.PaceLimited(text) {
+			return uperr.WithFields(uperr.New(uperr.ClassSoftRate, status, "openaicompat: rate-worded 400: %s", truncate(body, 300)), body)
+		}
 		return uperr.WithFields(uperr.New(uperr.ClassBadRequest, status, "openaicompat: %s", truncate(body, 300)), body)
 	case status >= 500:
 		return uperr.WithFields(uperr.New(uperr.ClassTransport, status, "openaicompat: %s", truncate(body, 300)), body)

@@ -83,13 +83,14 @@ func TestScrubRemovesOnlyTheRefusedClaim(t *testing.T) {
 
 // TestScrubLeavesAllowedIdentitiesAlone: a system prompt naming a product the
 // gateway accepts must be sent verbatim — scrubbing it would silently change
-// the agent's behaviour for no reason.
+// the agent's behaviour for no reason. (BP-230: "You are Gemini CLI" left
+// this list — the 10-23 bisect passed it, but the gateway's 10-30 channel
+// check refuses the claim form and the upstream plugin now rewrites it.)
 func TestScrubLeavesAllowedIdentitiesAlone(t *testing.T) {
 	for _, text := range []string{
 		"You are Claude.",
 		"You are Cursor, an AI code editor.",
 		"You are Windsurf.",
-		"You are Gemini CLI, Google's coding agent.",
 		"You are an AI assistant helping with software engineering.",
 		"Claude Code is the assistant in this session.",
 	} {

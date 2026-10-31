@@ -5,7 +5,9 @@ import (
 	"time"
 )
 
-// BP-219: fbWaitFor returned the UNCAPPED base when the request estimates to
+// BP-217 boundary ticket (2026-10-31; originally misnamed bp219_* — that
+// number belongs to the OpenCode Zen disguise ticket, 6e6ed1d carried both):
+// fbWaitFor returned the UNCAPPED base when the request estimates to
 // zero tokens — bypassing channel_first_byte_windows entirely. Field
 // 2026-10-31: with workbuddy capped at 10s, the open-design memory legs ran
 // 10.278s with no window expiry and no cascade (the client's own 10s timeout
@@ -14,7 +16,7 @@ import (
 // uncapped 30s base: estimate=0 skipped the cap. A zero-estimate request is
 // exactly the one we understand LEAST — it must get the tightest window, not
 // the loosest.
-func TestBP219ZeroEstimateHonoursChannelCeiling(t *testing.T) {
+func TestBP217ZeroEstimateHonoursChannelCeiling(t *testing.T) {
 	if got := fbWaitFor(30*time.Second, reqWithText(0), 10*time.Second); got != 10*time.Second {
 		t.Fatalf("zero-estimate request: window = %s, want the 10s channel ceiling (the uncapped base defeats per-channel caps)", got)
 	}

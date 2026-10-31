@@ -810,6 +810,17 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		return nil, &ErrNoCapacity{Channel: channel, EarliestReset: until}, false
 	}
 
+	// BP-234 (magpie 06d36d41): a NEW conversation spreads across the pool —
+	// among the ready candidates, keep only those currently holding the
+	// fewest live session bindings. The strategy pick (credits/greedy/LRU)
+	// still decides inside that least-loaded band, so the density factor
+	// breaks hotspots instead of overriding the economics. The sticky path
+	// above already returned for bound conversations; anything reaching here
+	// with a session key is a new session.
+	if sessionKey != "" {
+		candidates = p.leastHeldLocked(channel, candidates, now)
+	}
+
 	picked := p.pickLocked(channel, modelName, candidates, now)
 	if picked == nil {
 		return nil, &ErrNoCapacity{Channel: channel, EarliestReset: p.earliestReset(channel, modelName, now)}, false
@@ -819,6 +830,59 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		p.sessions[channel+"|"+sessionKey] = sessionBinding{accountID: picked.ID, lastUsed: now}
 	}
 	return p.leaseLocked(picked, now), nil, false
+}
+
+// sessionsHeldLocked counts the account's live session bindings on the
+// channel — the conversations an account is currently carrying (BP-234).
+// Callers must hold the lock.
+func (p *Pool) sessionsHeldLocked(channel, accountID string, now time.Time) int {
+	window := p.params.SessionTTL
+	if window <= 0 {
+		window = 30 * time.Minute
+	}
+	n := 0
+	for key, b := range p.sessions {
+		if !strings.HasPrefix(key, channel+"|") || b.accountID != accountID {
+			continue
+		}
+		if now.Sub(b.lastUsed) <= window {
+			n++
+		}
+	}
+	return n
+}
+
+// leastHeldLocked keeps only the candidates holding the fewest live session
+// bindings (BP-234, magpie 06d36d41): a new conversation lands on a fresh
+// shoulder, not on whatever account the last turns piled onto. Equal-density
+// candidates pass through untouched, so the factor only breaks hotspots.
+// Callers must hold the lock.
+func (p *Pool) leastHeldLocked(channel string, candidates []*model.Account, now time.Time) []*model.Account {
+	if len(candidates) <= 1 {
+		return candidates
+	}
+	counts := make([]int, len(candidates))
+	min, max := -1, -1
+	for i, a := range candidates {
+		n := p.sessionsHeldLocked(channel, a.ID, now)
+		counts[i] = n
+		if min == -1 || n < min {
+			min = n
+		}
+		if n > max {
+			max = n
+		}
+	}
+	if min == max {
+		return candidates
+	}
+	out := make([]*model.Account, 0, len(candidates))
+	for i, a := range candidates {
+		if counts[i] == min {
+			out = append(out, a)
+		}
+	}
+	return out
 }
 
 // hasHealthyButBusy reports whether some account would be usable except for

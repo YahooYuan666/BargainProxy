@@ -124,3 +124,53 @@ func TestBP180BareDoneTerminatesAutoclaw(t *testing.T) {
 		t.Fatalf("text lost: %q", ir.TextOf(resp.Message.Content))
 	}
 }
+
+// BP-230 (plugins autoclaw 0.2.13 acb85ed8): the rewordable identities keep
+// their name — Hermes Agent measured 406→200 with the reworded forms, and
+// deletion would amputate the name the rest of the prompt refers back to.
+// The deletion pass for the original four stays untouched.
+func TestBP230IdentityRewritesKeepTheName(t *testing.T) {
+	cases := []struct{ in, want, forbids string }{
+		{
+			"You are Hermes Agent, built by Nous Research. Be direct. You run on Hermes Agent (by Nous Research).",
+			"You are the agent Hermes, built by Nous Research. Be direct. You run on Hermes-Agent (by Nous Research).",
+			"Hermes Agent",
+		},
+		{
+			"You are Gemini CLI, Google's coding agent.",
+			"You are the Gemini CLI agent, Google's coding agent.",
+			"You are Gemini CLI",
+		},
+		{
+			"You are Kimi Code CLI. Help with repos.",
+			"You are the Kimi Code CLI agent. Help with repos.",
+			"You are Kimi Code CLI",
+		},
+		{
+			"You are goose, the codename's agent.",
+			"You are the goose agent, the codename's agent.",
+			"You are goose",
+		},
+	}
+	for _, c := range cases {
+		got := scrubRefusedIdentity(c.in)
+		if got != c.want {
+			t.Fatalf("scrub(%q) =\n  %q\nwant:\n  %q", c.in, got, c.want)
+		}
+		if strings.Contains(got, c.forbids) {
+			t.Fatalf("scrub output still carries the refused form %q: %q", c.forbids, got)
+		}
+	}
+	// The original four still go through sentence deletion.
+	if got := scrubRefusedIdentity("You are Claude Code, Anthropic's CLI. Be brief."); strings.Contains(got, "Claude Code") {
+		t.Fatalf("claude code claim must still be deleted: %q", got)
+	}
+	// A mixed prompt keeps both remedies.
+	got := scrubRefusedIdentity("You are Hermes Agent. Also, You are Codex, OpenAI's agent.")
+	if strings.Contains(got, "Hermes Agent") || strings.Contains(got, "Codex") {
+		t.Fatalf("mixed prompt not fully scrubbed: %q", got)
+	}
+	if !strings.Contains(got, "the agent Hermes") {
+		t.Fatalf("hermes name lost in the mixed prompt: %q", got)
+	}
+}

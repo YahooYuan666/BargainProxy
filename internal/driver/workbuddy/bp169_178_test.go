@@ -60,9 +60,12 @@ func TestBP171NoBare11140Substring(t *testing.T) {
 }
 
 // BP-175: the refresh request matches the real-device capture — "{}" body,
-// loose Accept, the three missing headers, naked-host X-Domain.
+// loose Accept, X-Auth-Refresh-Source, naked-host X-Domain. BP-225
+// (misakano 847deb10, 56/56 REST captures on both realms): the REST family
+// never sends X-Requested-With — the old assertion pinned a renderer-side
+// sample of a different family.
 func TestBP175RefreshProtocol(t *testing.T) {
-	var gotBody, gotAccept, gotSource, gotXHR, gotReqID, gotDomain string
+	var gotBody, gotAccept, gotSource, gotXHR, gotReqID, gotDomain, gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		gotBody = string(raw)
@@ -71,6 +74,7 @@ func TestBP175RefreshProtocol(t *testing.T) {
 		gotXHR = r.Header.Get("X-Requested-With")
 		gotReqID = r.Header.Get("X-Request-ID")
 		gotDomain = r.Header.Get("X-Domain")
+		gotUA = r.Header.Get("User-Agent")
 		io.WriteString(w, `{"data":{"accessToken":"a","refreshToken":"r","expiresIn":60}}`)
 	}))
 	defer srv.Close()
@@ -87,8 +91,14 @@ func TestBP175RefreshProtocol(t *testing.T) {
 	if gotAccept != "application/json, text/plain, */*" {
 		t.Fatalf("Accept = %q", gotAccept)
 	}
-	if gotSource != "plugin" || gotXHR != "XMLHttpRequest" {
-		t.Fatalf("missing headers: source=%q xhr=%q", gotSource, gotXHR)
+	if gotSource != "plugin" {
+		t.Fatalf("X-Auth-Refresh-Source = %q, want plugin", gotSource)
+	}
+	if gotXHR != "" {
+		t.Fatalf("X-Requested-With = %q; the REST family never sends it (BP-225)", gotXHR)
+	}
+	if gotUA != desktopUARestCN {
+		t.Fatalf("UA = %q, want the REST-family two-segment form", gotUA)
 	}
 	if len(gotReqID) != 32 {
 		t.Fatalf("X-Request-ID = %q, want 32 hex", gotReqID)

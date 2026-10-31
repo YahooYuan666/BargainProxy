@@ -43,12 +43,27 @@ import (
 
 // IDE client identity constants (must match the official IDE handshake).
 const (
-	ideVersion     = "0.1.52"
-	ideVersionCode = "20260811"
+	// BP-229 (misakano traework 40ebfbaf/eb98b1b1, 2026-10-30 agent-mode
+	// captures of Trae CN 1.107.1): ideVersion is product.json's appVersion
+	// 3.4.11 and BOTH version codes are 20260924. The old 0.1.52 / 20260811
+	// pair predates the identity bump — 20260811 and 20260924 select the
+	// same model table, but the number itself is a fingerprint.
+	ideVersion     = "3.4.11"
+	ideVersionCode = "20260924"
 	appID          = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
 	deviceBrand    = "83DG"
 	osVersion      = "Windows 11 Pro"
 	functionSOLO   = "solo_work_lite"
+
+	// uaBaseVersion is product.json's vscodeVersion (1.107.1 on both realms)
+	// — the number in the client UA's brand segment. NOT appVersion.
+	uaBaseVersion = "1.107.1"
+
+	// soloUserAgent is the FULL Chromium-family string the client sends
+	// (BP-229 captures): brand TraeCN on the CN build, then the Electron
+	// Chrome pair. The old "Trae/<ver>" is a shape no real client produces.
+	soloUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TraeCN/" +
+		uaBaseVersion + " Chrome/142.0.7444.235 Electron/39.2.7 Safari/537.36"
 
 	// traeToolInputCeiling is the measured input ceiling of the tool-bearing
 	// surface (llm_utils_chat). Field evidence 2026-10-23: binary search shows
@@ -138,22 +153,22 @@ func (d *Driver) agentBase() string { return strings.TrimRight(d.cfg.AgentHost, 
 func (d *Driver) ugBase() string    { return strings.TrimRight(d.cfg.UgHost, "/") }
 
 // soloHeaders sets the mandatory SOLO header set.
+//
+// BP-229 (misakano traework 40ebfbaf, 2026-10-30 real client captures): the
+// chat chain does NOT carry X-Cloudide-Token or X-Uid (nothing consumes
+// them; each is one extra automation tell), Accept is */* on both paths (the
+// stream is decided by body.stream=true, not content negotiation), the UA is
+// the full Chromium-family string, and X-App-Version carries the CN build's
+// version instead of the literal "default" (that is the international form).
 func soloHeaders(req *http.Request, c *Creds, stream bool) {
+	_ = stream // stream no longer changes any header
 	req.Header.Set("Content-Type", "application/json")
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
-	} else {
-		req.Header.Set("Accept", "application/json")
-	}
-	req.Header.Set("User-Agent", "Trae/"+ideVersion)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("User-Agent", soloUserAgent)
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+c.AccessToken)
-	req.Header.Set("X-Cloudide-Token", c.AccessToken)
 	req.Header.Set("X-Ide-Token", c.AccessToken)
-	if c.UID != "" {
-		req.Header.Set("X-Uid", c.UID)
-	}
 	req.Header.Set("X-App-Id", appID)
-	req.Header.Set("X-App-Version", "default")
+	req.Header.Set("X-App-Version", ideVersion)
 	req.Header.Set("X-Ide-Version", ideVersion)
 	req.Header.Set("X-Ide-Version-Code", ideVersionCode)
 	req.Header.Set("X-App-Version-Code", ideVersionCode)
@@ -181,6 +196,15 @@ func ugHeaders(req *http.Request, c *Creds) {
 	req.Header.Set("User-Agent", ugUserAgent)
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+c.AccessToken)
 	req.Header.Set("X-User-Region", "CN")
+	// BP-229 (misakano traework 40ebfbaf/eb98b1b1, CN real captures): the CN
+	// UG family rides package-type stable_cn, the lscbd pair, X-SS-DP and the
+	// client's app version. CN keeps region/lscbd — dropping those is the
+	// INTERNATIONAL form.
+	req.Header.Set("Package-Type", "stable_cn")
+	req.Header.Set("X-Lscbd-Aid", "787976")
+	req.Header.Set("X-Lscbd-Platform", "windows")
+	req.Header.Set("X-SS-DP", "787976")
+	req.Header.Set("App-Version", ideVersion)
 	if id := ugDeviceID(c.DeviceID, c.UID); id != "" {
 		req.Header.Set("X-Device-Id", id)
 	}
@@ -673,6 +697,11 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				}
 			}
 			if ch.FinishReason != "" {
+				// BP-222: finish_reason "error" is the vendor's word for a
+				// failed turn — fail the attempt, never report it as a success.
+				if ir.FinishReasonFailed(ch.FinishReason) {
+					return uperr.NewFailedFinishTurn("trae")
+				}
 				terminated = true
 				stop = mapFinish(ch.FinishReason)
 			}
@@ -821,6 +850,11 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				return nil
 			}
 			if d.FinishReason != "" {
+				// BP-222: the SOLO done event carries the same "failed turn"
+				// word — fail the attempt instead of a success-shaped stop.
+				if ir.FinishReasonFailed(d.FinishReason) {
+					return uperr.NewFailedFinishTurn("trae")
+				}
 				stop = mapFinish(d.FinishReason)
 			}
 			return nil

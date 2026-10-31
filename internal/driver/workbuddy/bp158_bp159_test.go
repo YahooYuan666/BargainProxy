@@ -12,17 +12,23 @@ import (
 	"bargainproxy/internal/protocol/openai"
 )
 
-// BP-158/BP-197: the fingerprint must match the CURRENT desktop builds —
-// 2026-10-28: CN 5.9.3 with CLI 2.165.0, international 5.8.4 with CLI
-// 2.161.0; 2026-10-29 (BP-197, magpie 17114b5 + plugins b08a6c1) the
-// international feed moved to the same 5.9.3 / CLI 2.165.0 pair, so the two
-// realms now ship the same versions.
+// BP-158/BP-197/BP-225: the fingerprint must match the CURRENT desktop
+// builds — CN 5.9.3 with CLI 2.165.0; the international feed moved to 5.9.4
+// (misakano 847deb10, 2026-10-30: package unpacked, /v2/update reports
+// version=5.9.4) with the same CLI 2.165.0.
 func TestBP158Fingerprints(t *testing.T) {
 	if !strings.Contains(desktopUA, "WorkBuddy/5.9.3 WorkBuddy/5.9.3 CLI/2.165.0") {
 		t.Fatalf("CN UA = %q, want the 5.9.3 / CLI 2.165.0 build", desktopUA)
 	}
-	if !strings.Contains(desktopUAGlobal, "WorkBuddy/5.9.3 workbuddy-ai/5.9.3 CLI/2.165.0") {
-		t.Fatalf("global UA = %q, want the 5.9.3 / CLI 2.165.0 build (BP-197)", desktopUAGlobal)
+	if !strings.Contains(desktopUAGlobal, "WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0") {
+		t.Fatalf("global UA = %q, want the 5.9.4 build (BP-225, misakano 847deb10)", desktopUAGlobal)
+	}
+	// BP-225: the REST family wears a different UA on both realms.
+	if desktopUARestCN != "WorkBuddy/5.9.3 CLI/2.165.0" {
+		t.Fatalf("CN REST UA = %q, want the two-segment form", desktopUARestCN)
+	}
+	if desktopUARestGlobal != "workbuddy-ai/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0" {
+		t.Fatalf("global REST UA = %q, want the slug-first form", desktopUARestGlobal)
 	}
 }
 

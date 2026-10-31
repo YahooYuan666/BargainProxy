@@ -72,11 +72,18 @@ func TestChatSendsOfficialClientFingerprint(t *testing.T) {
 
 	// Headers the desktop client never sends on chat. Extra headers are a
 	// fingerprint too, and these came from the CodeBuddy CLI's conventions.
+	// (BP-225: X-Requested-With left the list — the 2026-10-30 captures show
+	// the chat SDK chain carries it, asserted below.)
 	for _, k := range []string{"Origin", "Referer", "Accept-Language",
-		"X-Machine-ID", "X-Session-ID", "X-No-Enterprise-Id", "X-Requested-With"} {
+		"X-Machine-ID", "X-Session-ID", "X-No-Enterprise-Id"} {
 		if v := got.Get(k); v != "" {
 			t.Fatalf("%s = %q; the official client omits it on chat", k, v)
 		}
+	}
+	// BP-225 (misakano 847deb10 golden): the chat chain carries
+	// X-Requested-With — it is the REST family that never does.
+	if got.Get("X-Requested-With") != "XMLHttpRequest" {
+		t.Fatalf("X-Requested-With = %q, want XMLHttpRequest (BP-225)", got.Get("X-Requested-With"))
 	}
 
 	// The SDK segment the client's openai-node runtime adds.
@@ -102,6 +109,12 @@ func TestChatSendsOfficialClientFingerprint(t *testing.T) {
 	}
 	if acp := got.Get("acp-connection-id"); !uuidV4Re.MatchString(acp) || acp == conv || acp == convReq {
 		t.Fatalf("acp-connection-id = %q, want its own UUID v4", acp)
+	}
+	// BP-225: baggage is exactly the four members in this order, the two
+	// buddy keys empty (misakano 847deb10 TestGLBaggageExactMembers).
+	wantBaggage := "buddyId=,buddyName=,codebuddy.session_id=" + conv + ",codebuddy.conversation_request_id=" + convReq
+	if got.Get("Baggage") != wantBaggage {
+		t.Fatalf("baggage = %q, want %q", got.Get("Baggage"), wantBaggage)
 	}
 	msg := got.Get("X-Request-ID")
 	if !hex32Re.MatchString(msg) || !msPrefixRe.MatchString(msg) {

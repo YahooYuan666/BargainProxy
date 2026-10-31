@@ -46,11 +46,23 @@ const (
 	// versions). 5.9 is also when the desktop started sending
 	// X-Agent-Runtime, on BOTH realms (BP-197). The older 2.176.0 figure
 	// came from misakano 244d4e6 and predates these builds.
+	// BP-225 (misakano 847deb10, 2026-10-30): the international distribution
+	// has moved to 5.9.4 (package unpacked; /v2/update reports
+	// version=5.9.4, ideVersion 5.9.4, commit fa0a0901…) while CN stays
+	// 5.9.3 — the realms diverge again.
 	clientVersionCN       = "5.9.3"
-	clientVersionGlobal   = "5.9.3"
+	clientVersionGlobal   = "5.9.4"
 	cliVersionCN          = "2.165.0"
 	cliVersionGlobal      = "2.165.0"
 	cliVersion            = cliVersionCN // legacy alias used by the growth/billing paths
+	// BP-225 (misakano 847deb10): the REST/RPC family (node fetch — /v2/report,
+	// /v3/config, growth/claim) wears a DIFFERENT UA from the chat SDK chain:
+	// CN drops the repeated brand segment (two-segment, 26+ real captures),
+	// global leads with the distribution slug. The old code sent the chat UA
+	// everywhere, so every growth call from a global account wore a CN camel
+	// segment no real international client produces.
+	desktopUARestCN     = "WorkBuddy/" + clientVersionCN + " CLI/" + cliVersionCN
+	desktopUARestGlobal = "workbuddy-ai/" + clientVersionGlobal + " workbuddy-ai/" + clientVersionGlobal + " CLI/" + cliVersionGlobal
 	stainlessSDKVersion   = "6.25.0"
 	stainlessNodeVersion  = "v22.21.1"
 	reportPath            = "/v2/report"
@@ -91,6 +103,20 @@ func workBuddyClientVersion(global bool) string {
 	}
 	return clientVersionCN
 }
+
+// workBuddyRestUA is the RPC/REST family UA (node fetch): CN two-segment,
+// global slug-first (BP-225, misakano 847deb10 real captures). Exported via
+// RestUA for the panel's device-flow login, whose three endpoints belong to
+// the same family.
+func workBuddyRestUA(global bool) string {
+	if global {
+		return desktopUARestGlobal
+	}
+	return desktopUARestCN
+}
+
+// RestUA exposes the REST-family UA for other packages (panel login chain).
+func RestUA(global bool) string { return workBuddyRestUA(global) }
 
 // webBase resolves the web-domain base (configurable; defaults to the
 // official CN web host).
@@ -164,7 +190,9 @@ func (d *Driver) growthCallOnce(ctx context.Context, creds *Creds, method, path 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
-	req.Header.Set("User-Agent", desktopUA)
+	// BP-225: the growth path is the REST family — its UA differs from the
+	// chat chain on both realms.
+	req.Header.Set("User-Agent", workBuddyRestUA(creds.RealmOrDefault() == "global"))
 	// BP-175: X-Domain is the naked host (no scheme), and every growth
 	// request carries a random 32-hex X-Request-ID.
 	req.Header.Set("X-Domain", nakedHost(base))
@@ -322,7 +350,8 @@ func (d *Driver) reportDesktopEvents(ctx context.Context, creds *Creds, events [
 		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 		req.Header.Set("Accept", "application/json, text/plain, */*")
 		req.Header.Set("Content-Type", "application/json;charset=UTF-8")
-		req.Header.Set("User-Agent", desktopUA)
+		// BP-225: REST-family UA per realm.
+		req.Header.Set("User-Agent", workBuddyRestUA(creds.RealmOrDefault() == "global"))
 		req.Header.Set("X-Domain", base)
 		req.Header.Set("X-Product", "SaaS")
 		req.Header.Set("X-Request-ID", deriveID(creds.UID, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
@@ -844,7 +873,8 @@ func (d *Driver) GrowthClaim(ctx context.Context, acc *model.Account, taskCode s
 	req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", desktopUA)
+	// BP-225: REST-family UA per realm.
+	req.Header.Set("User-Agent", workBuddyRestUA(creds.RealmOrDefault() == "global"))
 	req.Header.Set("Referer", base+"/profile/growth-center")
 	if creds.UID != "" {
 		req.Header.Set("X-User-Id", creds.UID)
@@ -1062,7 +1092,8 @@ func (d *Driver) ReportChatActivity(ctx context.Context, acc *model.Account, con
 		}
 		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", desktopUA)
+		// BP-225: REST-family UA per realm.
+		req.Header.Set("User-Agent", workBuddyRestUA(creds.RealmOrDefault() == "global"))
 		req.Header.Set("X-Domain", base)
 		req.Header.Set("X-Product", "SaaS")
 		if creds.UID != "" {
@@ -1105,29 +1136,77 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 		results = append(results, growthStepResult{Step: step, OK: err == nil, Note: note})
 	}
 
-	// 1. Chat activity (lights chat_5 progress + growth streak).
-	for i := 0; i < 5; i++ {
-		cid := randomUUIDV4()
-		err := d.ReportChatActivity(ctx, acc, cid, "", "", "")
-		if err != nil {
-			record("chat_5", err, "")
+	// BP-228 (misakano 96a33f13/046b1fdf): the upstream growth center REMOVED
+	// Model_chat_GLM5.2, Buddy_App_QQ and create_canvas (black_cat was gated
+	// in the tasks center since BP-74). Reporting dead codes earns nothing
+	// and reads as automation. The account's live task list gates the steps —
+	// but only when its vocabulary matches our step names (≥1 overlap): a
+	// renamed or empty list must not silently disable the pipeline. The three
+	// confirmed removals stay gated even when the fetch fails.
+	liveCodes := map[string]bool{}
+	liveOK := false
+	if ts, ferr := d.GrowthTasks(ctx, acc); ferr == nil && len(ts) > 0 {
+		liveOK = true
+		for _, t := range ts {
+			liveCodes[t.TaskCode] = true
+		}
+	}
+	removedTask := map[string]bool{"Model_chat_GLM5.2": true, "Buddy_App_QQ": true, "create_canvas": true}
+	vocabMatch := false
+	for _, n := range []string{"chat_5", "Model_chat_GLM5.2", "first_buddy", "RichMeow_Chat", "Buddy_App",
+		"automation_1", "Library_read", "template_5", "playbook_prompt", "create_canvas", "expert_5",
+		"Expert_team_use_3", "Expert_lighthouse", "Hp_Appearance", "buddy_travel"} {
+		if liveCodes[n] {
+			vocabMatch = true
 			break
 		}
-		if i == 4 {
-			record("chat_5", nil, "5 activity reports sent")
+	}
+	growSkip := func(codes ...string) bool {
+		for _, c := range codes {
+			if removedTask[c] {
+				return true
+			}
+			if liveOK && vocabMatch && !liveCodes[c] {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 1. Chat activity (lights chat_5 progress + growth streak).
+	if growSkip("chat_5") {
+		record("chat_5", nil, "skipped: not in the account's task list")
+	} else {
+		for i := 0; i < 5; i++ {
+			cid := randomUUIDV4()
+			err := d.ReportChatActivity(ctx, acc, cid, "", "", "")
+			if err != nil {
+				record("chat_5", err, "")
+				break
+			}
+			if i == 4 {
+				record("chat_5", nil, "5 activity reports sent")
+			}
 		}
 	}
 
-	// 2. Real chat on glm-5.2 (Model_chat_GLM5.2).
-	glmCid := randomUUIDV4()
-	if err := d.ReportChatActivity(ctx, acc, glmCid, "", "glm-5.2", "glm-5.2"); err == nil {
-		record("Model_chat_GLM5.2", nil, "glm-5.2 activity reported")
+	// 2. Real chat on glm-5.2 (Model_chat_GLM5.2) — REMOVED upstream
+	// (BP-228): hard-gated even without a live list.
+	if growSkip("Model_chat_GLM5.2") {
+		record("Model_chat_GLM5.2", nil, "skipped: task removed upstream / not in the account's list")
 	} else {
-		record("Model_chat_GLM5.2", err, "")
+		glmCid := randomUUIDV4()
+		if err := d.ReportChatActivity(ctx, acc, glmCid, "", "glm-5.2", "glm-5.2"); err == nil {
+			record("Model_chat_GLM5.2", nil, "glm-5.2 activity reported")
+		} else {
+			record("Model_chat_GLM5.2", err, "")
+		}
 	}
 
 	// 3. Buddy adoption (first_buddy; +300c when unlocked).
-	if adopted, note, err := d.BuddyAdopt(ctx, acc); err == nil {
+	if growSkip("first_buddy") {
+		record("first_buddy", nil, "skipped: not in the account's task list")
+	} else if adopted, note, err := d.BuddyAdopt(ctx, acc); err == nil {
 		record("first_buddy", nil, note)
 		_ = adopted
 	} else {
@@ -1135,64 +1214,92 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 4. Desktop chat chain (RichMeow_Chat).
-	conv := randomUUIDV4()
-	reqID := uuidToken()
-	if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopChatSequence(conv, reqID, "msg-rich", "fast-model", "fast-model")); err == nil {
-		record("RichMeow_Chat", nil, "desktop chat chain sent")
+	if growSkip("RichMeow_Chat") {
+		record("RichMeow_Chat", nil, "skipped: not in the account's task list")
 	} else {
-		record("RichMeow_Chat", err, "")
+		conv := randomUUIDV4()
+		reqID := uuidToken()
+		if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopChatSequence(conv, reqID, "msg-rich", "fast-model", "fast-model")); err == nil {
+			record("RichMeow_Chat", nil, "desktop chat chain sent")
+		} else {
+			record("RichMeow_Chat", err, "")
+		}
 	}
 
-	// 5. Buddy app enter chain (Buddy_App + Buddy_App_QQ).
-	if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopBuddyAppSequence(BuddyAppBuddyID, BuddyAppBuddyName)); err == nil {
-		record("Buddy_App", nil, "buddy app chain sent")
-		results = append(results, growthStepResult{Step: "Buddy_App_QQ", OK: true, Note: "shared chain"})
+	// 5. Buddy app enter chain (Buddy_App + Buddy_App_QQ) — Buddy_App_QQ was
+	// REMOVED upstream (BP-228); the shared chain only runs while BOTH codes
+	// still list.
+	if growSkip("Buddy_App", "Buddy_App_QQ") {
+		record("Buddy_App", nil, "skipped: Buddy_App_QQ removed upstream / not in the account's list")
 	} else {
-		record("Buddy_App", err, "")
+		if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopBuddyAppSequence(BuddyAppBuddyID, BuddyAppBuddyName)); err == nil {
+			record("Buddy_App", nil, "buddy app chain sent")
+			results = append(results, growthStepResult{Step: "Buddy_App_QQ", OK: true, Note: "shared chain"})
+		} else {
+			record("Buddy_App", err, "")
+		}
 	}
 
 	// 6. Automation create event (automation_1).
-	if err := d.reportDesktopEvents(ctx, mustCreds(acc), []desktopEvent{DesktopAutomationCreateEvent(randomUUIDV4())}); err == nil {
+	if growSkip("automation_1") {
+		record("automation_1", nil, "skipped: not in the account's task list")
+	} else if err := d.reportDesktopEvents(ctx, mustCreds(acc), []desktopEvent{DesktopAutomationCreateEvent(randomUUIDV4())}); err == nil {
 		record("automation_1", nil, "automation event sent")
 	} else {
 		record("automation_1", err, "")
 	}
 
 	// 7. Library read (web event, Library_read).
-	if err := d.reportWebEvent(ctx, mustCreds(acc), "library_doc_intro_click", d.webBase()+"/library", "library-doc-intro", "资料库介绍"); err == nil {
+	if growSkip("Library_read") {
+		record("Library_read", nil, "skipped: not in the account's task list")
+	} else if err := d.reportWebEvent(ctx, mustCreds(acc), "library_doc_intro_click", d.webBase()+"/library", "library-doc-intro", "资料库介绍"); err == nil {
 		record("Library_read", nil, "library click sent")
 	} else {
 		record("Library_read", err, "")
 	}
 
 	// 8. Template use ×5 (template_5).
-	templates := []struct{ id, name string }{
-		{"tpl-web-app", "网页应用"}, {"tpl-doc-summary", "文档总结"}, {"tpl-code-review", "代码审查"},
-		{"tpl-data-chart", "数据图表"}, {"tpl-api-debug", "接口调试"},
-	}
-	allTemplates := true
-	for _, tpl := range templates {
-		conv := randomUUIDV4()
-		reqID := uuidToken()
-		if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopTemplateUseSequence(conv, reqID, tpl.id, tpl.name)); err != nil {
-			allTemplates = false
+	if growSkip("template_5") {
+		record("template_5", nil, "skipped: not in the account's task list")
+	} else {
+		templates := []struct{ id, name string }{
+			{"tpl-web-app", "网页应用"}, {"tpl-doc-summary", "文档总结"}, {"tpl-code-review", "代码审查"},
+			{"tpl-data-chart", "数据图表"}, {"tpl-api-debug", "接口调试"},
 		}
+		allTemplates := true
+		for _, tpl := range templates {
+			conv := randomUUIDV4()
+			reqID := uuidToken()
+			if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopTemplateUseSequence(conv, reqID, tpl.id, tpl.name)); err != nil {
+				allTemplates = false
+			}
+		}
+		record("template_5", errFromBool(allTemplates), "5 template chains sent")
 	}
-	record("template_5", errFromBool(allTemplates), "5 template chains sent")
 
 	// 9. Playbook prompt (playbook_prompt).
-	pbConv := randomUUIDV4()
-	pbReq := uuidToken()
-	record("playbook_prompt", d.reportDesktopEvents(ctx, mustCreds(acc), DesktopPlaybookPromptSequence(pbConv, pbReq, "case-bp-1", "灵感案例")), "playbook chain sent")
+	if growSkip("playbook_prompt") {
+		record("playbook_prompt", nil, "skipped: not in the account's task list")
+	} else {
+		pbConv := randomUUIDV4()
+		pbReq := uuidToken()
+		record("playbook_prompt", d.reportDesktopEvents(ctx, mustCreds(acc), DesktopPlaybookPromptSequence(pbConv, pbReq, "case-bp-1", "灵感案例")), "playbook chain sent")
+	}
 
-	// 10. Design canvas (create_canvas).
-	cvConv := randomUUIDV4()
-	cvReq := uuidToken()
-	record("create_canvas", d.reportDesktopEvents(ctx, mustCreds(acc), DesktopDesignCanvasSequence(cvConv, cvReq)), "canvas chain sent")
+	// 10. Design canvas (create_canvas) — REMOVED upstream (BP-228).
+	if growSkip("create_canvas") {
+		record("create_canvas", nil, "skipped: task removed upstream / not in the account's list")
+	} else {
+		cvConv := randomUUIDV4()
+		cvReq := uuidToken()
+		record("create_canvas", d.reportDesktopEvents(ctx, mustCreds(acc), DesktopDesignCanvasSequence(cvConv, cvReq)), "canvas chain sent")
+	}
 
 	// 11. Expert summon + actual use ×3 (expert_5 needs 5; team ×3).
 	experts, err := d.marketExpertList(ctx, mustCreds(acc), "agent")
-	if err != nil || len(experts) == 0 {
+	if growSkip("expert_5") {
+		record("expert_5", nil, "skipped: not in the account's task list")
+	} else if err != nil || len(experts) == 0 {
 		record("expert_5", errFromBool(false), "expert market unavailable")
 	} else {
 		needed := 5
@@ -1209,39 +1316,51 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 12. Expert team use ×3.
-	teams, err := d.marketExpertList(ctx, mustCreds(acc), "team")
-	if err == nil && len(teams) > 0 {
-		needed := 3
-		if len(teams) < needed {
-			needed = len(teams)
-		}
-		ok := 0
-		for i := 0; i < needed; i++ {
-			if d.runExpertUse(ctx, acc, teams[i], false) {
-				ok++
+	if growSkip("Expert_team_use_3") {
+		record("Expert_team_use_3", nil, "skipped: not in the account's task list")
+	} else {
+		teams, err := d.marketExpertList(ctx, mustCreds(acc), "team")
+		if err == nil && len(teams) > 0 {
+			needed := 3
+			if len(teams) < needed {
+				needed = len(teams)
 			}
-		}
-		if len(teams) < 3 && ok > 0 {
-			// Fall back to agent experts to reach 3 uses.
-			for i := 0; i < 3-ok && i < len(experts); i++ {
-				if d.runExpertUse(ctx, acc, experts[i], false) {
+			ok := 0
+			for i := 0; i < needed; i++ {
+				if d.runExpertUse(ctx, acc, teams[i], false) {
 					ok++
 				}
 			}
+			if len(teams) < 3 && ok > 0 {
+				// Fall back to agent experts to reach 3 uses.
+				for i := 0; i < 3-ok && i < len(experts); i++ {
+					if d.runExpertUse(ctx, acc, experts[i], false) {
+						ok++
+					}
+				}
+			}
+			record("Expert_team_use_3", errFromBool(ok >= 3), fmt.Sprintf("%d/3 team uses completed", ok))
 		}
-		record("Expert_team_use_3", errFromBool(ok >= 3), fmt.Sprintf("%d/3 team uses completed", ok))
 	}
 
 	// 13. Expert lighthouse (single expert, LOCAL mode).
-	if len(experts) > 0 {
+	if growSkip("Expert_lighthouse") {
+		record("Expert_lighthouse", nil, "skipped: not in the account's task list")
+	} else if len(experts) > 0 {
 		record("Expert_lighthouse", errFromBool(d.runExpertUse(ctx, acc, experts[0], true)), "lighthouse expert use")
 	}
 
 	// 14. Theme appearance (Hp_Appearance best effort).
-	record("Hp_Appearance", d.SetAppearanceTheme(ctx, acc, "theme-tkmwj"), "theme applied")
+	if growSkip("Hp_Appearance") {
+		record("Hp_Appearance", nil, "skipped: not in the account's task list")
+	} else {
+		record("Hp_Appearance", d.SetAppearanceTheme(ctx, acc, "theme-tkmwj"), "theme applied")
+	}
 
 	// 15. Travel butler.
-	if note, err := d.TravelButler(ctx, acc); err == nil {
+	if growSkip("buddy_travel") {
+		record("buddy_travel", nil, "skipped: not in the account's task list")
+	} else if note, err := d.TravelButler(ctx, acc); err == nil {
 		record("buddy_travel", nil, note)
 	} else {
 		record("buddy_travel", err, "")

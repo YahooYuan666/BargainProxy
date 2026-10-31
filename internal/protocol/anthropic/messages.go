@@ -148,6 +148,18 @@ func SessionKeyFrom(metadata map[string]any) string {
 	return ""
 }
 
+// imageMIMEAllowed is BP-235's whitelist over the client-controlled
+// media_type: the four raster types every real client sends. Anything else
+// (svg+xml, text/html, application/pdf…) either 400s at the upstream or
+// injects a data:-URL prefix — the block is dropped.
+func imageMIMEAllowed(mime string) bool {
+	switch strings.ToLower(strings.TrimSpace(mime)) {
+	case "image/png", "image/jpeg", "image/webp", "image/gif":
+		return true
+	}
+	return false
+}
+
 // CacheControlKey scans content blocks in document order (system first, then
 // messages) for the first cache_control-marked text block and returns its
 // digest. The first client-placed cache breakpoint is the conversation's
@@ -259,6 +271,14 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 				if srcType, _ := src["type"].(string); srcType == "base64" {
 					mime, _ := src["media_type"].(string)
 					data, _ := src["data"].(string)
+					// BP-235: media_type is a client-controlled string that
+					// rides into every downstream data: URL — an oddball MIME
+					// is either an upstream 400 or a data:-URL injection
+					// (TraeWorkAssistant dfa6e028's fix). Whitelist the four
+					// raster types the real clients send and drop the block.
+					if !imageMIMEAllowed(mime) {
+						continue
+					}
 					main.Content = append(main.Content, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: data})
 				} else if srcType == "url" {
 					u, _ := src["url"].(string)
@@ -289,31 +309,41 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 						if t, _ := sub["text"].(string); t != "" {
 							resultParts = append(resultParts, ir.ContentPart{Kind: "text", Text: t})
 						}
-					case "image":
-						if src, ok := sub["source"].(map[string]any); ok {
-							switch srcType, _ := src["type"].(string); srcType {
-							case "base64":
-								mime, _ := src["media_type"].(string)
-								data, _ := src["data"].(string)
-								if data != "" {
-									resultParts = append(resultParts, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: data})
-								}
-							case "url":
-								if u, _ := src["url"].(string); u != "" {
-									resultParts = append(resultParts, ir.ContentPart{Kind: "image_url_unsupported", Text: u})
-								}
+				case "image":
+					if src, ok := sub["source"].(map[string]any); ok {
+						switch srcType, _ := src["type"].(string); srcType {
+						case "base64":
+							mime, _ := src["media_type"].(string)
+							data, _ := src["data"].(string)
+							// BP-235: same whitelist as the message-level image.
+							if !imageMIMEAllowed(mime) {
+								continue
+							}
+							if data != "" {
+								resultParts = append(resultParts, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: data})
+							}
+						case "url":
+							if u, _ := src["url"].(string); u != "" {
+								resultParts = append(resultParts, ir.ContentPart{Kind: "image_url_unsupported", Text: u})
 							}
 						}
+					}
 					}
 				}
 			}
 			if len(resultParts) == 0 {
 				resultParts = []ir.ContentPart{{Kind: "text", Text: ""}}
 			}
+			// BP-224: is_error is strict bool — string/number values mean
+			// success (CLIProxyAPI 068fe153 tests). The flag rides the IR so
+			// the Gemini-family egress can turn it into functionResponse's
+			// response.error; the OpenAI wire has no slot for it.
+			isErr, _ := b["is_error"].(bool)
 			toolMsgs = append(toolMsgs, ir.Message{
 				Role:       ir.RoleTool,
 				ToolCallID: id,
 				Content:    resultParts,
+				IsError:    isErr,
 			})
 		}
 	}

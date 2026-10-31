@@ -18,6 +18,7 @@ import (
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/workbuddy"
 	"bargainproxy/internal/gateway"
 	"bargainproxy/internal/model"
 	"bargainproxy/internal/panel"
@@ -693,18 +694,47 @@ func TestGoogleOAuthCallbackStateMismatch(t *testing.T) {
 
 // wbDeviceServer mocks the Tencent device-flow endpoints: the first token
 // poll reports "login pending" (business code), the second returns tokens.
+// BP-225 (misakano 96b816da): the three endpoints are plain node-fetch calls
+// — no Origin/Referer/X-Requested-With — with per-endpoint x-domain /
+// x-custom-channel-id / x-no-* sentinels ("true", not "1").
 func wbDeviceServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	tokenPolls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Origin"); got != "https://www.codebuddy.cn" {
-			t.Errorf("origin = %q", got)
+		for _, k := range []string{"Origin", "Referer", "X-Requested-With"} {
+			if got := r.Header.Get(k); got != "" {
+				t.Errorf("%s = %q; the login endpoints are node-fetch, no browser headers", k, got)
+			}
+		}
+		if got := r.Header.Get("User-Agent"); got != workbuddy.RestUA(false) {
+			t.Errorf("UA = %q, want the REST-family CN form", got)
+		}
+		if got := r.Header.Get("X-No-User-Id"); got != "true" {
+			t.Errorf("X-No-User-Id = %q, want true", got)
 		}
 		switch r.URL.Path {
 		case "/v2/plugin/auth/state":
-			fmt.Fprintf(w, `{"code":0,"msg":"","data":{"state":"st-1","authUrl":%q}}`, "https://www.codebuddy.cn/login?state=st-1")
+			if got := r.URL.Query().Get("platform"); got != "workbuddy" {
+				t.Errorf("platform = %q, want workbuddy (product.json authentication.attributes.platform)", got)
+			}
+			if got := r.Header.Get("X-Domain"); got != "www.workbuddy.cn" {
+				t.Errorf("auth/state X-Domain = %q, want www.workbuddy.cn (front host, not API base)", got)
+			}
+			if got := r.Header.Get("X-Custom-Channel-Id"); got != "unknown" {
+				t.Errorf("X-Custom-Channel-Id = %q, want unknown", got)
+			}
+			if got := r.Header.Get("X-No-Authorization"); got != "true" {
+				t.Errorf("auth/state X-No-Authorization = %q, want true", got)
+			}
+			fmt.Fprintf(w, `{"code":0,"msg":"","data":{"state":"st-1","authUrl":%q}}`, "https://www.workbuddy.cn/login?state=st-1")
 		case "/v2/plugin/auth/token":
 			tokenPolls++
+			if got := r.Header.Get("X-Domain"); got != "" {
+				t.Errorf("auth/token X-Domain = %q; the token endpoint is the one endpoint without it", got)
+			}
+			if got := r.Header.Get("X-No-Authorization"); got != "true" {
+				t.Errorf("auth/token X-No-Authorization = %q, want true", got)
+			}
 			if tokenPolls == 1 {
 				fmt.Fprint(w, `{"code":12001,"msg":"login ing","data":{}}`)
 				return
@@ -712,6 +742,12 @@ func wbDeviceServer(t *testing.T) *httptest.Server {
 			fmt.Fprintf(w, `{"code":0,"msg":"","data":{"accessToken":%q,"refreshToken":%q,"expiresIn":5184000,"domain":"codebuddy.cn"}}`,
 				testToken("wb-at"), testToken("wb-rt"))
 		case "/v2/plugin/login/account":
+			if got := r.Header.Get("X-Domain"); got != "www.workbuddy.cn" {
+				t.Errorf("login/account X-Domain = %q, want www.workbuddy.cn", got)
+			}
+			if got := r.Header.Get("X-No-Authorization"); got != "" {
+				t.Errorf("login/account X-No-Authorization = %q; it has Bearer, only three sentinels", got)
+			}
 			if !strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 				t.Errorf("account call missing bearer")
 			}
@@ -743,7 +779,7 @@ func TestWorkBuddyDeviceFlow(t *testing.T) {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&start)
 	resp.Body.Close()
-	if start.State != "st-1" || start.Realm != "cn" || !strings.Contains(start.AuthURL, "codebuddy.cn/login") {
+	if start.State != "st-1" || start.Realm != "cn" || !strings.Contains(start.AuthURL, "workbuddy.cn/login") {
 		t.Fatalf("start = %+v", start)
 	}
 

@@ -15,8 +15,10 @@ package panel
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -29,6 +31,7 @@ import (
 	"time"
 
 	"bargainproxy/internal/config"
+	"bargainproxy/internal/driver/workbuddy"
 	"bargainproxy/internal/model"
 )
 
@@ -39,9 +42,26 @@ const (
 	googleAuthEndpoint = "https://accounts.google.com/o/oauth2/v2/auth"
 	// googleOAuthScope matches the Cloud Code Assist client scopes.
 	googleOAuthScope = "https://www.googleapis.com/auth/cloud-platform https://www.googleapis.com/auth/userinfo.email"
-	// wbClientUA is the official CLI identity used by the device flow.
-	wbClientUA = "CLI/2.63.2 CodeBuddy/2.63.2"
 )
+
+// wbRealmOf derives the realm from the front-host origin (workbuddy.ai is
+// the only global front).
+func wbRealmOf(origin string) string {
+	if strings.Contains(origin, "workbuddy.ai") {
+		return "global"
+	}
+	return "cn"
+}
+
+// wbRandomHex32 is the login endpoints' X-Request-ID: pure-random 32 hex with
+// no millisecond prefix (BP-225, misakano 96b816da).
+func wbRandomHex32() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%016x%016x", time.Now().UnixNano(), time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // builtinGoogleClientID/builtinGoogleClientSecret now come from
 // internal/config (shared with the antigravity driver's refresh path);
@@ -433,7 +453,35 @@ func wbRealmOrigin(realm string) string {
 	if realm == "global" {
 		return "https://www.workbuddy.ai"
 	}
-	return "https://www.codebuddy.cn"
+	// BP-225 (misakano 47f1ed61/96b816da): the CN front host is
+	// www.workbuddy.cn — codebuddy.cn is the pre-rebrand origin no real
+	// request uses. The value rides X-Domain on the login endpoints (the
+	// API base may be copilot.tencent.com; the header declares which FRONT
+	// is calling, not which machine).
+	return "https://www.workbuddy.cn"
+}
+
+// wbLoginUA is the device-flow UA: the REST/RPC family, per realm (BP-225,
+// misakano 96b816da — the old "CLI/2.63.2 CodeBuddy/2.63.2" was a CodeBuddy
+// CLI leftover no current client sends).
+func wbLoginUA(realm string) string {
+	return workbuddy.RestUA(realm == "global")
+}
+
+// wbNoSentinels are the x-no-* sentinels the login endpoints carry. The real
+// value is the string "true", not "1" (BP-225, misakano 96b816da); the
+// unauthorized endpoints send all four, login/account only three (it already
+// has Bearer — the missing one is exactly "no account stored yet").
+func wbNoSentinels(noAuth bool) map[string]string {
+	out := map[string]string{
+		"X-No-User-Id":         "true",
+		"X-No-Enterprise-Id":   "true",
+		"X-No-Department-Info": "true",
+	}
+	if noAuth {
+		out["X-No-Authorization"] = "true"
+	}
+	return out
 }
 
 func (p *Panel) handleWBStart(w http.ResponseWriter, r *http.Request) {
@@ -462,7 +510,19 @@ func (p *Panel) handleWBStart(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
-	data, err := p.wbCall(ctx, http.MethodPost, base+"/v2/plugin/auth/state?platform=CLI", wbRealmOrigin(realm), []byte("{}"), "")
+	// BP-225 (misakano 96b816da): the platform query comes from each
+	// distribution's product.json authentication.attributes.platform — CN
+	// "workbuddy", international "workbuddy-ai". The old "CLI" read the
+	// TOP-LEVEL platform field, which no real client sends. The endpoint
+	// also carries x-domain + x-custom-channel-id + the four x-no-*.
+	platform := "workbuddy"
+	if realm == "global" {
+		platform = "workbuddy-ai"
+	}
+	stateExtra := wbNoSentinels(true)
+	stateExtra["X-Domain"] = strings.TrimPrefix(wbRealmOrigin(realm), "https://")
+	stateExtra["X-Custom-Channel-Id"] = "unknown"
+	data, err := p.wbCall(ctx, http.MethodPost, base+"/v2/plugin/auth/state?platform="+platform, wbRealmOrigin(realm), []byte("{}"), "", stateExtra)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": "auth state: " + err.Error()})
 		return
@@ -519,7 +579,7 @@ func (p *Panel) wbAdvance(key string, f authFlow) {
 	defer cancel()
 	base := p.wbRealmBase(f.realm)
 	origin := wbRealmOrigin(f.realm)
-	data, err := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(f.wbState), origin, nil, "")
+	data, err := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(f.wbState), origin, nil, "", wbNoSentinels(true))
 	if err != nil {
 		return // pending or transient; the next round retries
 	}
@@ -591,7 +651,7 @@ func (p *Panel) handleWBPoll(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	base := p.wbRealmBase(f.realm)
 	origin := wbRealmOrigin(f.realm)
-	data, err := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(req.State), origin, nil, "")
+	data, err := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/auth/token?state="+url.QueryEscape(req.State), origin, nil, "", wbNoSentinels(true))
 	if err != nil {
 		var biz *wbBizError
 		if isBizError(err, &biz) {
@@ -642,7 +702,12 @@ func (p *Panel) finishWBAuth(w http.ResponseWriter, key string, f authFlow, tok 
 	base := p.wbRealmBase(f.realm)
 	origin := wbRealmOrigin(f.realm)
 	var acct wbAccountInfo
-	if acctData, aerr := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/login/account?state="+url.QueryEscape(f.wbState), origin, nil, tok.access); aerr == nil {
+	// BP-225 (misakano 96b816da): login/account carries x-domain + Bearer +
+	// three x-no-* — no x-no-authorization (it has Bearer), and it is the
+	// endpoint where "uid not stored yet" is the point.
+	acctExtra := wbNoSentinels(false)
+	acctExtra["X-Domain"] = strings.TrimPrefix(origin, "https://")
+	if acctData, aerr := p.wbCall(ctx, http.MethodGet, base+"/v2/plugin/login/account?state="+url.QueryEscape(f.wbState), origin, nil, tok.access, acctExtra); aerr == nil {
 		acct = parseWBAccount(acctData)
 	}
 	if acct.UID == "" {
@@ -693,7 +758,15 @@ func isBizError(err error, out **wbBizError) bool {
 
 // wbCall performs one device-flow request and unwraps the {code,msg,data}
 // envelope. Non-zero codes come back as *wbBizError.
-func (p *Panel) wbCall(ctx context.Context, method, fullURL, origin string, body []byte, bearer string) (json.RawMessage, error) {
+//
+// BP-225 (misakano 96b816da, 2026-10-30 dual-realm captures): the three
+// device-flow endpoints are plain node-fetch calls — they carry NO Origin,
+// NO Referer and NO X-Requested-With (those belong to the browser opening the
+// authorization page, a different step). Content-Type exists only on the one
+// POST (auth/state); the GETs are bodyless and the real client sends no
+// content type. The per-endpoint differences (x-domain, x-custom-channel-id,
+// x-no-* sentinels) arrive via extra.
+func (p *Panel) wbCall(ctx context.Context, method, fullURL, origin string, body []byte, bearer string, extra map[string]string) (json.RawMessage, error) {
 	var rd io.Reader
 	if body != nil {
 		rd = strings.NewReader(string(body))
@@ -702,14 +775,18 @@ func (p *Panel) wbCall(ctx context.Context, method, fullURL, origin string, body
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Origin", origin)
-	req.Header.Set("Referer", origin+"/")
-	req.Header.Set("User-Agent", wbClientUA)
+	req.Header.Set("User-Agent", wbLoginUA(wbRealmOf(origin)))
+	req.Header.Set("X-Product", "SaaS")
+	req.Header.Set("X-Request-ID", wbRandomHex32())
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	for k, v := range extra {
+		req.Header.Set(k, v)
 	}
 	resp, err := p.hc.Do(req)
 	if err != nil {

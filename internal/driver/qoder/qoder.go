@@ -45,6 +45,12 @@ import (
 const (
 	busyCode = "10605"
 
+	// callCountCode is the nested subCode of Qoder's tool-call-quota wall
+	// (BP-223; Zhengyuuuui/qoder2api 8d49aa6e): queued answers join the 10605
+	// wait-and-repoll family, spent answers are a per-model hold — never the
+	// credential verdict the 403 fallthrough used to produce.
+	callCountCode = "CALL_COUNT_LIMIT"
+
 	// Queue-wait contract (2026-10-21, qoder2api-hub #38/#57 parity): a 403 +
 	// {"code":"10605","isQueued":true,"retryAfterSeconds":N} answer is the
 	// upstream's QUEUEING PROTOCOL, not a rate limit — the official client
@@ -244,7 +250,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 			if d.forceRefresh(ctx, rt) == nil {
 				continue
 			}
-		case ue.Class == uperr.ClassSoftRate && strings.Contains(ue.Message, busyCode):
+		case qoderQueueRetryable(ue.Class, ue.Message):
 			wait := queueWaitSeconds(ue.Message)
 			if wait <= 0 {
 				return nil, err
@@ -469,6 +475,11 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	if !sawDone && ctx.Err() == nil {
 		return nil, emitted, uperr.New(uperr.ClassTransport, 0, "qoder: stream ended without [DONE] marker (connection truncated?)")
 	}
+	// BP-222: the accumulator saw finish_reason "error" — a failed turn, not a
+	// finished one. Fail the attempt before building a success-shaped response.
+	if acc.failedFinish {
+		return nil, emitted, uperr.NewFailedFinishTurn("qoder")
+	}
 	acc.flush()
 	if emitErr != nil {
 		return nil, emitted, emitErr
@@ -585,6 +596,16 @@ func billedWarnOnce(requested, billed string) bool {
 	}
 	billedWarnMemo.Store(key, time.Now().Add(time.Hour))
 	return true
+}
+
+// qoderQueueRetryable reports whether a soft-rate answer should engage the
+// wait-and-repoll machinery: the classic 10605 marker, or BP-223's
+// CALL_COUNT_LIMIT queue wall.
+func qoderQueueRetryable(class, msg string) bool {
+	if class != uperr.ClassSoftRate {
+		return false
+	}
+	return strings.Contains(msg, busyCode) || strings.Contains(msg, callCountCode)
 }
 
 // queueWaitSeconds parses the upstream queue answer's retryAfterSeconds.
@@ -1906,25 +1927,21 @@ func qoderBodyCode(body string) string {
 	return ""
 }
 
-// qoderNestedPermission reports Qoder's nested RESOURCE_LIMIT refusal: the
-// HTTP 403's message field is itself a JSON document (Zhengyuuuui/qoder2api
-// internal/bridge/errors.go), and when the inner doc says the account is NOT
-// queued, has NO retryAfterSeconds, and carries subCode RESOURCE_LIMIT, the
-// account simply has no entitlement for this model. The old path matched the
-// "10605" substring first (ClassSoftRate, account-wide) or fell to 403→Auth
-// (token refresh + account rest) — both wrong for a per-model permission wall.
-func qoderNestedPermission(body string) bool {
+// qoderNestedDoc unwraps the 403 envelope's nested message JSON (a raw object
+// or a JSON-escaped string) and returns the fields both nested-refusal
+// classifiers read. Shared by qoderNestedPermission and qoderNestedCallCount.
+func qoderNestedDoc(body string) (subCode string, isQueued, serviceAvailable bool, retryAfter any, ok bool) {
 	var env struct {
 		Message json.RawMessage `json:"message"`
 	}
 	if json.Unmarshal([]byte(body), &env) != nil || len(env.Message) == 0 {
-		return false
+		return "", false, false, nil, false
 	}
 	inner := env.Message
 	if len(inner) > 0 && inner[0] == '"' {
 		var s string
 		if json.Unmarshal(inner, &s) != nil {
-			return false
+			return "", false, false, nil, false
 		}
 		inner = []byte(s)
 	}
@@ -1935,12 +1952,24 @@ func qoderNestedPermission(body string) bool {
 		SubCode           string `json:"subCode"`
 	}
 	if json.Unmarshal(inner, &doc) != nil {
+		return "", false, false, nil, false
+	}
+	return doc.SubCode, doc.IsQueued, doc.ServiceAvailable, doc.RetryAfterSeconds, true
+}
+
+// qoderNestedPermission reports Qoder's nested RESOURCE_LIMIT refusal: the
+// HTTP 403's message field is itself a JSON document (Zhengyuuuui/qoder2api
+// internal/bridge/errors.go), and when the inner doc says the account is NOT
+// queued, has NO retryAfterSeconds, and carries subCode RESOURCE_LIMIT, the
+// account simply has no entitlement for this model. The old path matched the
+// "10605" substring first (ClassSoftRate, account-wide) or fell to 403→Auth
+// (token refresh + account rest) — both wrong for a per-model permission wall.
+func qoderNestedPermission(body string) bool {
+	subCode, isQueued, serviceAvailable, retryAfter, ok := qoderNestedDoc(body)
+	if !ok || subCode != "RESOURCE_LIMIT" || isQueued || serviceAvailable {
 		return false
 	}
-	if doc.SubCode != "RESOURCE_LIMIT" || doc.IsQueued || doc.ServiceAvailable {
-		return false
-	}
-	switch n := doc.RetryAfterSeconds.(type) {
+	switch n := retryAfter.(type) {
 	case nil:
 	case float64:
 		if n > 0 {
@@ -1952,6 +1981,31 @@ func qoderNestedPermission(body string) bool {
 		}
 	}
 	return true
+}
+
+// qoderNestedCallCount reports Qoder's nested CALL_COUNT_LIMIT refusal — the
+// tool-call-quota wall on the same nested envelope as RESOURCE_LIMIT
+// (BP-223; Zhengyuuuui/qoder2api 8d49aa6e: their escaped-quote match missed
+// it and the verdict fell to a credential kill; our JSON parse reads the doc,
+// the gap was the classification). Queued or carrying a positive
+// retryAfterSeconds it is a wait-and-repoll signal; otherwise the quota is
+// spent for the window — a per-model hold, never ClassAuth.
+func qoderNestedCallCount(body string) (queued bool, ok bool) {
+	subCode, isQueued, _, retryAfter, hasDoc := qoderNestedDoc(body)
+	if !hasDoc || subCode != callCountCode {
+		return false, false
+	}
+	switch n := retryAfter.(type) {
+	case float64:
+		if n > 0 {
+			return true, true
+		}
+	case string:
+		if v, err := strconv.ParseFloat(n, 64); err == nil && v > 0 {
+			return true, true
+		}
+	}
+	return isQueued, true
 }
 
 // qoderQuotaFallback recovers the quota codes 110/112 when the body hides
@@ -1987,6 +2041,18 @@ func classifyQoder(status int, body string) *uperr.Error {
 		// request's model), leave the account live for everything else, and
 		// re-probe in an hour.
 		e := uperr.New(uperr.ClassModelRate, 403, "qoder: model not available on this account (RESOURCE_LIMIT): %s", text)
+		e.ResetAt = time.Now().Add(time.Hour)
+		return e
+	}
+	if queued, ok := qoderNestedCallCount(body); ok {
+		// BP-223: the tool-call-quota wall. Queued → the wait-and-repoll
+		// family of 10605 (the message carries the marker so the Stream loop
+		// engages the queue machinery); spent → a per-model hold like
+		// RESOURCE_LIMIT. Never the credential verdict.
+		if queued {
+			return uperr.New(uperr.ClassSoftRate, 403, "qoder: tool call quota queued (CALL_COUNT_LIMIT): %s", text)
+		}
+		e := uperr.New(uperr.ClassModelRate, 403, "qoder: tool call quota exhausted (CALL_COUNT_LIMIT): %s", text)
 		e.ResetAt = time.Now().Add(time.Hour)
 		return e
 	}

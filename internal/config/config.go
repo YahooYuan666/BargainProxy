@@ -178,6 +178,17 @@ type ZCodeSettings struct {
 	Enabled     bool   `json:"enabled"`
 	BaseURL     string `json:"base_url"` // default https://zcode.z.ai (tests override)
 	MaxInFlight int    `json:"max_in_flight"`
+
+	// Proxy routes the WHOLE zcode channel's outbound (chat, billing, gift
+	// claims, probes) through an explicit HTTP proxy, e.g.
+	// "http://127.0.0.1:7897". BP-231a: on a Clash TUN/fake-ip setup the
+	// gateway PROCESS's own DNS resolution for zcode.z.ai was observed
+	// hanging for minutes while every short-lived process resolved
+	// instantly — sending the hop to the local Clash port hands name
+	// resolution to Clash and sidesteps the gateway's resolver entirely
+	// (measured: explicit-proxy GET answers in ~60ms where the in-process
+	// GET hung until the client gave up). Empty = direct.
+	Proxy string `json:"proxy,omitempty"`
 }
 
 // AutoClawSettings configures the Zhipu AutoClaw cloud-sandbox channel.

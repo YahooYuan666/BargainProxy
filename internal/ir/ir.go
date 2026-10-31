@@ -78,6 +78,13 @@ type Message struct {
 	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`   // assistant messages
 	ToolCallID string        `json:"tool_call_id,omitempty"` // tool messages
 	ToolName   string        `json:"tool_name,omitempty"`    // tool messages
+	// IsError marks a tool message that reports its tool FAILED (Anthropic
+	// tool_result.is_error, strict bool — non-bool values mean success,
+	// CLIProxyAPI 068fe153 #6838). Only the Gemini-family egress can express
+	// it: the functionResponse rides response.error instead of the success
+	// payload, so the model sees the failure instead of planning on a result
+	// that never happened (BP-224).
+	IsError bool `json:"is_error,omitempty"`
 	// Reasoning is an earlier assistant turn's thinking text as OpenAI-family
 	// clients carry it back (reasoning_content / reasoning / details). The
 	// ingress must keep it: WorkBuddy's own converter replays it as the
@@ -215,9 +222,15 @@ type ChatRequest struct {
 	// TopK is Anthropic/Gemini-only sampling; OpenAI-shaped drivers ignore it.
 	TopK      *int
 	MaxTokens int
-	Stop      []string
-	Stream    bool
-	Thinking  *ThinkingConfig
+	// MaxCompletionTokens is BP-233's retry flag: when a Chat Completions
+	// refusal names max_completion_tokens as the field it wants, the gateway
+	// retries once with the same budget under that name (OpenAI's new models
+	// reject max_tokens; domestic endpoints only know max_tokens). Only
+	// openaicompat consumes it; transient, never serialized.
+	MaxCompletionTokens bool `json:"-"`
+	Stop                []string
+	Stream              bool
+	Thinking            *ThinkingConfig
 
 	// RequestedEffort mirrors OpenAI reasoning_effort when supplied.
 	RequestedEffort string
