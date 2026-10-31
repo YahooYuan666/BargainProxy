@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>BargainProxy 控制台</title>
+<title>😭 穷鬼自建中转</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>😭</text></svg>">
 <style>
 /* Layout language follows the MIT-licensed agentpoints panel (NOTICE):
    left nav + topbar + KPI cards + health-colored account table. */
@@ -286,7 +287,7 @@ tr:last-child td{border-bottom:none}
               <label class="chk">成长任务执行时点（小时）<input id="tpGrowth" type="text" placeholder="9" style="max-width:120px"></label>
               <label class="chk">活跃上报时点（小时）<input id="tpActivity" type="text" placeholder="10" style="max-width:120px"></label>
               <label class="chk">猫猫旅行时点（小时，逗号分隔）<input id="tpTravel" type="text" placeholder="9,21" style="max-width:120px"></label>
-              <label class="chk">夜猫子时点（小时，默认 23）<input id="tpBlackcat" type="text" placeholder="23" style="max-width:120px"></label>
+              <label class="chk" style="display:none">夜猫子时点（小时，默认 23）<input id="tpBlackcat" type="text" placeholder="23" style="max-width:120px"></label>
               <label class="chk">额度刷新间隔（分钟）<input id="tpProbe" type="number" min="1" placeholder="5" style="max-width:100px"></label>
               <label class="chk">Google 额度刷新间隔（分钟）<input id="tpGoogle" type="number" min="1" placeholder="15" style="max-width:100px"></label>
               <label class="chk">Token 预刷新间隔（分钟）<input id="tpRefresh" type="number" min="1" placeholder="60" style="max-width:100px"></label>
@@ -372,7 +373,7 @@ tr:last-child td{border-bottom:none}
           <div class="small"><b>严禁用于营业性商业目的</b>：本项目只用于管理<b>你自己的</b>账号，把个人账号额度接到自己的客户端上。
             不提供、也禁止任何形式的对外售卖、代充、批量注册、共享号池运营或二次转卖 API。用它做生意导致的上游封号、
             欠费与法律风险由使用者自行承担。</div>
-          <div class="small"><b>每个号池建议最多绑 3 个账号</b>：同一个上游（WorkBuddy / Trae / ZCode / AutoClaw / Qoder / Google）
+          <div class="small"><b>每个号池建议最多绑 3 个账号</b>：同一个上游（WorkBuddy / Trae / ZCode / AutoClaw / Qoder / Lobster / Google）
             塞太多账号并不会更快，反而更容易触发同 IP 风控与关联封禁；超过 3 个后收益极小，风险成倍上升。
             先用 1~2 个跑顺，需要更多并发再逐个加。</div>
           <div class="small"><b>本项目由纯 AI 制作，主要集成两个开源项目</b>：核心思路与大量实现来自
@@ -390,7 +391,7 @@ tr:last-child td{border-bottom:none}
           <div>
             <div class="hint" style="margin-bottom:4px">① OpenAI 兼容客户端（Cline / Cherry Studio / Cursor / NextChat / 任意 SDK）</div>
             <div class="url" style="margin:0">Base URL:  http://127.0.0.1:13140/v1<br>API Key:  随意填非空（本地网关默认不鉴权）</div>
-            <div class="hint" style="margin-top:6px">模型（常用，全部可调）：<span class="mono">glm-5.3 · deepseek-v4-pro · deepseek-v4-flash · kimi-k3 · claude-sonnet-4-6 · gemini-3-pro · gemini-3.8-flash-high</span>——完整清单与上下文/档位见「模型与档位」页。</div>
+            <div class="hint" style="margin-top:6px">模型（常用，全部可调）：<span class="mono">glm-5.3 · deepseek-v4-pro · deepseek-v4.1-flash · kimi-k3.1-pro · gemini-claude-sonnet-4-6 · gemini-claude-opus-4-6-thinking · gemini-3.8-flash-high</span>——完整清单与上下文/档位见「模型与档位」页。</div>
           </div>
           <div>
             <div class="hint" style="margin-bottom:4px">② Claude Code（Anthropic 协议）</div>
@@ -412,6 +413,7 @@ tr:last-child td{border-bottom:none}
           <div class="small"><b>ZCode（Z.AI）</b>：「添加账号 → ZCode」→ z.ai 授权 → Coding Plan JWT 自动入池。</div>
           <div class="small"><b>AutoClaw（智谱）</b>：「添加账号 → AutoClaw」输手机号收短信验证码登录；也可用「导入 JSON」粘贴凭据文件。登录/签到/钱包接口需要在 config.json 的 <span class="mono">channels.autoclaw.app_secret</span> 填入客户端签名常量（源码不随附）。</div>
           <div class="small"><b>Qoder（阿里）</b>：「添加账号 → Qoder」粘贴个人访问令牌（<span class="mono">pt-</span> 开头，来自 Qoder 个人设置 → 服务集成 → 个人访问令牌），校验通过即入池。</div>
+          <div class="small"><b>Lobster（有道龙虾）</b>：「添加账号 → Lobster」扫码登录或填入 Cookie，自动换取 Token 入池。</div>
           <div class="hint">账号身份规则：主键取上游稳定身份（uid/邮箱/JWT sub），改备注名/换 token 都不会产生重复账号。</div>
           <div class="hint">加号建议：<b>每个号池最多 3 个账号</b>。同 IP 下账号越多，关联风控与封号概率越高；先 1~2 个跑顺，再按并发需要逐个加。</div>
         </div>
@@ -422,7 +424,7 @@ tr:last-child td{border-bottom:none}
           <div class="small"><b>启动/停止</b>：<span class="mono">scripts\start-all.cmd</span> / <span class="mono">scripts\stop-all.cmd</span>；开机自启在「设置 → 服务管理」。</div>
           <div class="small"><b>签到与任务</b>：任务中心自动跑签到（默认 9/21 点）+ 成长任务 + 额度刷新 + Token 预刷新；时点与间隔在任务中心页可改、保存即生效，也可手动「立即运行」。</div>
           <div class="small"><b>调度逻辑（自动）</b>：Google 号按配额窗口贪婪打分；积分号按实测免费优先 → 快过期加权 → 余额比例加权；同一对话粘住同一账号；全部账号忙时排队不漂移。</div>
-          <div class="small"><b>省钱要点</b>：客户端默认模型选 flash 级（deepseek-v4-flash / glm-5.3-flash），复杂任务再手动切旗舰；用量统计页可核对每模型实际消耗。</div>
+          <div class="small"><b>省钱要点</b>：客户端默认模型选 flash 级（deepseek-v4.1-flash / glm-5.3-flash），复杂任务再手动切旗舰；用量统计页可核对每模型实际消耗。</div>
           <div class="small"><b>遇到问题</b>：请求日志页看每次调用的渠道/账号/错误分类；账号行的「刷新额度」可手动探测上游余额。</div>
         </div>
       </div>
@@ -439,7 +441,7 @@ tr:last-child td{border-bottom:none}
           <span class="grow"></span>
           <button class="xs" onclick="copyNetGuide()">复制文档地址</button></header>
         <div style="padding:14px 16px;display:grid;gap:10px">
-          <div class="small">国模（WorkBuddy / Trae / ZCode / AutoClaw / Qoder）走国内直连；只有
+          <div class="small">国模（WorkBuddy / Trae / ZCode / AutoClaw / Qoder / Lobster）走国内直连；只有
             <b>Google（Antigravity）</b> 与 <b>OpenCode 免费模型</b> 需要出境。若这两条链路的第一字耗时异常大
             （比如 >30s），而国模正常，问题几乎都在你自己的代理出口，不在网关。</div>
           <div class="small"><b>最常见的根因</b>：Windows 默认 TCP 拥塞控制是 Cubic，在 150~300ms 的跨国链路上，
@@ -510,7 +512,7 @@ tr:last-child td{border-bottom:none}
     <section class="view" id="view-packages" hidden>
       <div class="box">
         <header>
-          <h3>各渠道额度总览 <span class="hint">实时探测五个国模渠道：WorkBuddy 积分包 / Trae 分 / ZCode 计划额度 / AutoClaw 点 / Qoder credits；分与 credits 是不同货币，不能相加</span></h3>
+          <h3>各渠道额度总览 <span class="hint">实时探测六个国模渠道：WorkBuddy 积分包 / Trae 分 / ZCode 计划额度 / AutoClaw 点 / Qoder credits / Lobster credits；分与 credits 是不同货币，不能相加</span></h3>
           <span class="grow"></span>
           <span class="note" id="pkOverviewNote"></span>
           <button class="xs" onclick="loadPackages()">刷新</button>
@@ -596,7 +598,7 @@ tr:last-child td{border-bottom:none}
           </div>
           <div class="row">
             <label class="chk">首字窗口基准（秒）<input id="setFirstByteWindow" type="number" min="1" max="3600" style="max-width:100px"></label>
-            <span class="hint">所有号池通用：等待上游吐出第一个字的时间。BP-138 起此值为动态公式的基准：实际窗口 = 本值 + 每 2k 估算 token 加 1 秒（按上下文长度自动增长），封顶 60 秒（个别渠道可用 channel_first_byte_windows 单独覆盖）。小请求就是本值；大请求按 prefill 实测速率自动放宽，不再被固定值掐断。默认 60。</span>
+            <span class="hint">所有号池通用：等待上游吐出第一个字的时间。此值为动态公式的基准：实际窗口 = 本值 + 每 2k 估算 token 加 1 秒（按上下文长度自动增长），封顶 300 秒（对齐 HeaderTimeout，个别渠道可用 channel_first_byte_windows 单独覆盖）。小请求就是本值；大上下文按 prefill 速率自动放宽，避免首字被提前掐断。默认 60。</span>
           </div>
           <div class="row">
             <label class="chk">每渠道单号并发 <input id="setMaxInflight" type="text" style="max-width:260px" placeholder='{"workbuddy":3,"zcode":2}'></label>
@@ -1741,12 +1743,11 @@ function accState(a){
 // otherwise read as "the model forgot my tools".
 const chanNotices = {
   trae: {
-    title: 'Trae 的两条通道（能力不同，2026-10-24 实测）',
+    title: 'Trae 的两条通道（能力与上限，2026-11-01 复测定案）',
     lines: [
-      '普通对话 / 带工具的请求 → <b>llm_utils_chat</b>：支持你传入的全部工具（MCP 工具可正常往返），但上下文上限只有 <b>262,144 token</b>，超了上游直接报 code 4026。',
-      '超长对话（> 262,144）→ <b>chat_sessions</b>：上下文能到 <b>1,000,000 token</b>（实测 30 万 / 60 万 / 90 万均通过），但这条路上游跑的是 Trae 自己的 agent，<b>不接受请求里传的 tools</b>；它的工具靠账号级 MCP 注册，不跟随单次请求。',
-      '因此本网关的做法：超长请求若<b>不带工具</b>，自动走 chat_sessions 拿到 1M；若<b>带工具</b>，直接判定本渠道装不下并交给下一个渠道，不再白等 4 秒的必然失败。',
-      '<span style="color:#e0a03a">待解决：</span>把请求里的 tools 动态注册成 MCP server，让 1M 通道也能带工具（Trae 的工具入口是账号级 MCP 注册，不是请求里的 tools 字段）。',
+      '普通对话 / 带工具的请求 → <b>llm_utils_chat</b>：支持你传入的全部工具（MCP 工具可正常往返）。旧版认定的 256K 上限已证伪，<b>带工具实测可达 1,024,000 token（~1.02M，needle 探针实测通过）</b>；超过该上限上游报 <code>code 4022</code>。',
+      '超长无工具对话 → <b>chat_sessions</b>：上下文同样支持 <b>1,000,000 token</b>，但该通道跑的是 Trae 自身 agent，不接受请求中单次声明的 tools。',
+      '因此本网关的做法：≤1.02M 的请求（无论是否带工具）<b>均走标准 SOLO 阶梯正常派发</b>；仅当带工具且超过 1.02M 时，网关在派发前判定本渠道装不下并转交下一渠道，不再白等超时。',
     ],
   },
 };
@@ -1928,12 +1929,14 @@ function renderModels(models){
 }
 
 /* ── 任务中心 ── */
-const taskLabels = {checkin_workbuddy:'WorkBuddy 签到+连登', checkin_trae:'Trae 签到', checkin_autoclaw:'AutoClaw 签到', checkin_qoder:'Qoder 签到', checkin_zcode:'ZCode 礼包领取', probe_all:'全量额度刷新', refresh_tokens:'Token 预刷新', growth_workbuddy:'成长任务一键完成', activity_report_workbuddy:'WorkBuddy 活跃上报', travel_workbuddy:'猫猫旅行巡检', blackcat_workbuddy:'夜猫子夜间对话'};
+const taskLabels = {checkin_workbuddy:'WorkBuddy 签到+连登', checkin_trae:'Trae 签到', checkin_autoclaw:'AutoClaw 签到', checkin_qoder:'Qoder 签到', checkin_lobster:'Lobster 龙虾签到', checkin_zcode:'ZCode 礼包领取', probe_all:'全量额度刷新', refresh_tokens:'Token 预刷新', growth_workbuddy:'成长任务一键完成', activity_report_workbuddy:'WorkBuddy 活跃上报', travel_workbuddy:'猫猫旅行巡检', blackcat_workbuddy:'夜猫子夜间对话'};
+const hiddenTasks = new Set(['blackcat_workbuddy']);
 async function loadTasks(){
   try {
     const data = await api('tasks');
     const sw = document.getElementById('taskSwitches'); sw.innerHTML='';
     (data.types||[]).forEach(t => {
+      if (hiddenTasks.has(t)) return;
       const en = (data.enabled||{})[t] !== false;
       const lab = document.createElement('label');
       lab.className = 'chk'; lab.style.margin = '0 14px 0 0';
@@ -1946,6 +1949,7 @@ async function loadTasks(){
     });
     const btns = document.getElementById('taskButtons'); btns.innerHTML='';
     (data.types||[]).forEach(t => {
+      if (hiddenTasks.has(t)) return;
       const b = document.createElement('button');
       b.className = 'xs'; b.textContent = '立即运行：' + (taskLabels[t]||t);
       b.onclick = () => runTask(t);
@@ -1953,6 +1957,7 @@ async function loadTasks(){
     });
     const tb = document.querySelector('#tasks tbody'); tb.innerHTML='';
     (data.tasks||[]).forEach(t => {
+      if (hiddenTasks.has(t.task_type)) return;
       const tr = document.createElement('tr');
       const cls = t.status === 'ok' ? 'ok' : (t.status === 'failed' ? 'bad' : 'muted');
       tr.innerHTML = `<td class="mono">${esc(fmtTime(t.started_at))}</td><td>${esc(t.account_id)}</td>
@@ -2089,7 +2094,7 @@ function pkSortPacks(packs){
   return sorted;
 }
 
-// 各渠道额度总览：五个国模池同屏，分/credits 不混算。
+// 各渠道额度总览：六个国模池同屏，分/credits 不混算。
 function renderOverview(d){
   const tb = document.querySelector('#pkOverview tbody');
   if (!tb) return;

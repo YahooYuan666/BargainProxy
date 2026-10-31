@@ -152,7 +152,7 @@ const maxAccountAttempts = 3
 // cascade tries the next binding (applies when more bindings exist after the
 // current one). Prevents a serial channel (Trae, concurrency=1) from making
 // every request wait the full queue timeout while a sibling channel is idle.
-const fallbackWait = 8 * time.Second
+const fallbackWait = 60 * time.Second
 
 // Execute runs one request end to end. emit receives stream events (may be
 // nil for non-streaming callers — the response is still aggregated).
@@ -563,8 +563,8 @@ func estimatePromptTokens(req *ir.ChatRequest) int {
 // 0s, the lobster byte gate in 18ms), so only the legs that can actually
 // serve the request ever spend their window.
 const (
-	fbWindowCeiling     = 60 * time.Second
-	fbWindowCeilingHard = 120 * time.Second
+	fbWindowCeiling     = 300 * time.Second
+	fbWindowCeilingHard = 300 * time.Second
 )
 
 // fbCeiling returns the first-byte window CEILING for one channel, most

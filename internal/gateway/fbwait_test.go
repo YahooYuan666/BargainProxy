@@ -26,37 +26,47 @@ func TestFBWaitFor(t *testing.T) {
 	if got := fbWaitFor(8*time.Second, reqWithText(6), fbWindowCeiling); got != 8*time.Second {
 		t.Fatalf("small prompt: got %s, want 8s", got)
 	}
-	// 240k chars ≈ 120k estimated tokens → 8s + 60s = 68s, capped at the
-	// global 60s ceiling (BP-118). The cap still binds — it is what keeps a
-	// five-leg cascade bounded — it is just no longer below the prefill time
-	// of the conversations this gateway actually serves.
-	if got := fbWaitFor(8*time.Second, reqWithText(240000), fbWindowCeiling); got != 60*time.Second {
-		t.Fatalf("120k tokens: got %s, want the 60s ceiling", got)
+	// Default base=60s: small prompt keeps 60s.
+	if got := fbWaitFor(60*time.Second, reqWithText(6), fbWindowCeiling); got != 60*time.Second {
+		t.Fatalf("small prompt with 60s base: got %s, want 60s", got)
 	}
-	// Extreme contexts cap at the global ceiling (BP-118 raised it 30s → 60s:
-	// a 33万-token prefill measured 31.9s, so the 30s cap was cancelling
-	// requests that would have answered).
-	if got := fbWaitFor(8*time.Second, reqWithText(10_000_000), fbWindowCeiling); got != 60*time.Second {
-		t.Fatalf("huge prompt: got %s, want 60s", got)
+	// 240k chars ≈ 120k estimated tokens → 8s + 60s = 68s under 300s ceiling.
+	if got := fbWaitFor(8*time.Second, reqWithText(240000), fbWindowCeiling); got != 68*time.Second {
+		t.Fatalf("120k tokens with 8s base: got %s, want 68s", got)
 	}
-	// A channel with its own ceiling (AutoClaw's relay needs minutes) is not
-	// capped by the global one.
+	// Under default base=60s, 120k tokens gets 60s + 60s = 120s.
+	if got := fbWaitFor(60*time.Second, reqWithText(240000), fbWindowCeiling); got != 120*time.Second {
+		t.Fatalf("120k tokens with 60s base: got %s, want 120s", got)
+	}
+	// 400k chars ≈ 200k estimated tokens → 60s + 100s = 160s.
+	if got := fbWaitFor(60*time.Second, reqWithText(400000), fbWindowCeiling); got != 160*time.Second {
+		t.Fatalf("200k tokens with 60s base: got %s, want 160s", got)
+	}
+	// 600k chars ≈ 300k estimated tokens → 60s + 150s = 210s.
+	if got := fbWaitFor(60*time.Second, reqWithText(600000), fbWindowCeiling); got != 210*time.Second {
+		t.Fatalf("300k tokens with 60s base: got %s, want 210s", got)
+	}
+	// Extreme contexts cap at the global 300s hard ceiling.
+	if got := fbWaitFor(60*time.Second, reqWithText(10_000_000), fbWindowCeiling); got != 300*time.Second {
+		t.Fatalf("huge prompt: got %s, want 300s ceiling", got)
+	}
+	// A channel with its own ceiling is still honoured when explicit.
 	if got := fbWaitFor(8*time.Second, reqWithText(10_000_000), 90*time.Second); got != 90*time.Second {
 		t.Fatalf("per-channel ceiling: got %s, want 90s", got)
 	}
-	// Zero base falls back to the built-in 8s.
+	// Zero base falls back to the built-in fallbackWait (8s).
 	if got := fbWaitFor(0, reqWithText(6), fbWindowCeiling); got != fallbackWait {
 		t.Fatalf("zero base: got %s, want %s", got, fallbackWait)
 	}
-	// Zero ceiling falls back to the global cap too.
-	if got := fbWaitFor(8*time.Second, reqWithText(10_000_000), 0); got != 60*time.Second {
-		t.Fatalf("zero ceiling: got %s, want 60s", got)
+	// Zero ceiling falls back to the global cap (300s).
+	if got := fbWaitFor(8*time.Second, reqWithText(10_000_000), 0); got != 300*time.Second {
+		t.Fatalf("zero ceiling: got %s, want 300s", got)
 	}
-	// A raised per-channel ceiling lets long contexts keep waiting...
+	// A custom per-channel ceiling lets long contexts wait up to that ceiling.
 	if got := fbWaitFor(8*time.Second, reqWithText(10_000_000), 180*time.Second); got != 180*time.Second {
 		t.Fatalf("raised ceiling: got %s, want 180s", got)
 	}
-	// ...but the formula still applies: 120k estimated tokens earn 68s.
+	// ...but the formula still applies: 120k estimated tokens earn 68s under 180s ceiling.
 	if got := fbWaitFor(8*time.Second, reqWithText(240000), 180*time.Second); got != 68*time.Second {
 		t.Fatalf("small under raised ceiling: got %s, want 68s", got)
 	}

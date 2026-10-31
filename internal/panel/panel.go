@@ -148,6 +148,8 @@ func (p *Panel) wbGlobalEnabled() bool {
 
 // Mount registers the panel routes.
 func (p *Panel) Mount(mux *http.ServeMux) {
+	mux.HandleFunc("GET /favicon.ico", handleFavicon)
+	mux.HandleFunc("GET /panel/favicon.ico", handleFavicon)
 	mux.HandleFunc("GET /panel/", p.handleIndex)
 	mux.HandleFunc("GET /panel", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/panel/", http.StatusFound)
@@ -218,9 +220,17 @@ func (p *Panel) handleIndex(w http.ResponseWriter, r *http.Request) {
 	// — the 2026-10-16 "强制刷新密码框又回来了" report had a script-failure
 	// root cause, but stale HTML is the same class of trap and costs nothing
 	// to close.
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(b)
-}
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(b)
+	}
+
+	const cryingFaviconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">😭</text></svg>`
+
+	func handleFavicon(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		_, _ = w.Write([]byte(cryingFaviconSVG))
+	}
 
 // --- auth ---
 

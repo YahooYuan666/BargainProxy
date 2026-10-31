@@ -434,7 +434,7 @@ func Default() *Config {
 			},
 		},
 		MaxQueueWait: Duration(120 * time.Second),
-		FallbackWait: Duration(8 * time.Second),
+			FallbackWait: Duration(60 * time.Second),
 		// BP-115: 90s → 30s. The window is spent per binding, so a five-pool
 		// cascade could hold a client for 7.5 minutes before the first byte.
 		// 30s bounded that at 2.5 min, but it also cancelled requests that
