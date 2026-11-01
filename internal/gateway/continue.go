@@ -98,17 +98,29 @@ func (l *streamLedger) record(ev ir.StreamEvent) {
 	}
 }
 
-// addUsage folds one segment's usage into the running total. Input tokens are
-// summed too: each segment is a separate billed call, and the panel's cost
-// columns must show what was actually paid.
+// addUsage folds one segment's usage into the running total.
+// BP-261: Output/cost tokens (OutputTokens, ReasoningTokens, Credit) are
+// summed across segments because each segment actually produced and billed
+// them. Prompt tokens (InputTokens, CachedInputTokens), however, take the
+// LAST segment's values: the continuation prompt naturally contains the entire
+// conversation context, so summing them across N segments would inflate the
+// context size by N times, prematurely triggering client-side context
+// compaction or context overflow errors (upstream misakano 4d7d1e67 #134).
 func (l *streamLedger) addUsage(u ir.Usage) {
-	l.usage.InputTokens += u.InputTokens
+	// Prompt side: overwrite with latest segment
+	l.usage.InputTokens = u.InputTokens
+	l.usage.CachedInputTokens = u.CachedInputTokens
+	if u.CacheKnown || !l.usageSet {
+		l.usage.CacheKnown = u.CacheKnown
+	}
+
+	// Output / cost side: accumulate
 	l.usage.OutputTokens += u.OutputTokens
-	l.usage.CachedInputTokens += u.CachedInputTokens
 	l.usage.ReasoningTokens += u.ReasoningTokens
 	l.usage.Credit += u.Credit
-	l.usage.CacheKnown = l.usage.CacheKnown || u.CacheKnown
+	l.usage.CreditOriginal += u.CreditOriginal
 	l.usage.CreditKnown = l.usage.CreditKnown || u.CreditKnown
+	l.usage.CreditOriginalKnown = l.usage.CreditOriginalKnown || u.CreditOriginalKnown
 	l.usageSet = true
 }
 

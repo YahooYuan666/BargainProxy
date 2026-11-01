@@ -224,6 +224,19 @@ func (a *toolCallAccumulator) append(deltaCalls []map[string]interface{}) {
 	}
 }
 
+func (a *toolCallAccumulator) hasValidCalls() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, c := range a.calls {
+		if fn, ok := c["function"].(map[string]interface{}); ok {
+			if name, _ := fn["name"].(string); strings.TrimSpace(name) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *toolCallAccumulator) isEmpty() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -348,12 +361,19 @@ func (a *streamAccumulator) accept(delta *bridgeDelta) {
 	if delta.ReasoningContent != "" {
 		a.emit("", delta.ReasoningContent, nil)
 	}
-	if len(delta.ToolCalls) > 0 {
-		a.discardBufferedToolCallText()
-		a.toolCalls.append(delta.ToolCalls)
-		a.emit("", "", withToolCallIndices(delta.ToolCalls))
-		return
-	}
+		if len(delta.ToolCalls) > 0 {
+			a.discardBufferedToolCallText()
+			a.toolCalls.append(delta.ToolCalls)
+			// BP-262 (qoder2api #124): preserve content delta on the same frame
+			// instead of dropping it on early return.
+			contentToSend := ""
+			if delta.Content != "" {
+				a.streamingText = true
+				contentToSend = delta.Content
+			}
+			a.emit(contentToSend, "", withToolCallIndices(delta.ToolCalls))
+			return
+		}
 	if delta.Content == "" {
 		return
 	}
@@ -392,8 +412,14 @@ func (a *streamAccumulator) flush() {
 }
 
 func (a *streamAccumulator) finalFinishReason() string {
+	// BP-262 (qoder2api #124): a finish_reason of "tool_calls" when all recorded
+	// calls have no function name is a nameless truncation — downgrade to "stop"
+	// so client loops do not hang waiting for missing tool executions.
 	if !a.toolCalls.isEmpty() {
-		return "tool_calls"
+		if a.toolCalls.hasValidCalls() {
+			return "tool_calls"
+		}
+		return "stop"
 	}
 	if a.finishReason != "" {
 		return a.finishReason
@@ -504,13 +530,14 @@ func aggregateNonStream(chunks []string, reqID string, created int64, model stri
 	if len(fullReasoning) > 0 {
 		msg["reasoning_content"] = strings.Join(fullReasoning, "")
 	}
-	if !toolCalls.isEmpty() {
-		msg["tool_calls"] = toolCalls.snapshot()
-	}
-	finishReason := "stop"
-	if !toolCalls.isEmpty() || fallbackToolCalls != nil {
-		finishReason = "tool_calls"
-	}
+		hasCalls := toolCalls.hasValidCalls()
+		if hasCalls {
+			msg["tool_calls"] = toolCalls.snapshot()
+		}
+		finishReason := "stop"
+		if hasCalls || fallbackToolCalls != nil {
+			finishReason = "tool_calls"
+		}
 	resp := map[string]interface{}{
 		"id":      reqID,
 		"object":  "chat.completion",

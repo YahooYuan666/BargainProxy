@@ -109,3 +109,39 @@ func pinDraw(t *testing.T, v float64) {
 	randFloat64 = func() float64 { return v }
 	t.Cleanup(func() { randFloat64 = prev })
 }
+
+// Antigravity window pools must NOT be sliced by leastHeld: burn-rate greed
+// takes precedence so accounts near reset are exhausted before they expire,
+// even if they already hold a live session.
+func TestBP234AntigravityExemptFromLeastHeld(t *testing.T) {
+	now := time.Date(2026, 11, 1, 19, 0, 0, 0, time.UTC)
+	p := New(Params{Now: fixedNow(now)}, map[string]int{model.ChannelAntigravity: 3}, nil)
+
+	urgent := mkAccount("ag-urgent", model.ChannelAntigravity)
+	urgent.Windows = map[string]model.Window{
+		"weekly":    {RemainingFraction: 0.83, ResetAt: now.Add(4 * time.Hour), UpdatedAt: now},
+		"five_hour": {RemainingFraction: 0.85, ResetAt: now.Add(4 * time.Hour), UpdatedAt: now},
+	}
+	fresh := mkAccount("ag-fresh", model.ChannelAntigravity)
+	fresh.Windows = map[string]model.Window{
+		"weekly":    {RemainingFraction: 0.95, ResetAt: now.Add(4 * 24 * time.Hour), UpdatedAt: now},
+		"five_hour": {RemainingFraction: 0.92, ResetAt: now.Add(4 * time.Hour), UpdatedAt: now},
+	}
+	p.Upsert(urgent)
+	p.Upsert(fresh)
+
+	// urgent account already holds one live session
+	p.sessions["antigravity|sess-1"] = sessionBinding{accountID: "ag-urgent", lastUsed: now}
+
+	// A new session (sess-2) arrives: leastHeld would have sliced away urgent
+	// and picked fresh. But Antigravity must stay greedy and pick urgent.
+	lease, err := p.Acquire(context.Background(), model.ChannelAntigravity, "gemini-3.8-flash-high", "sess-2")
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer lease.Release()
+	if lease.Account.ID != "ag-urgent" {
+		t.Fatalf("Antigravity must exempt from leastHeld and pick greedy ag-urgent, got %s", lease.Account.ID)
+	}
+}
+

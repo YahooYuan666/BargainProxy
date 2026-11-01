@@ -304,10 +304,10 @@ type OpenAICompatSettings struct {
 // OpenCodeZenSettings configures the OpenCode Zen anonymous free-model
 // channel (BP-54). Enabled flips the whole feature: driver registration,
 // directory sync and the panel page read this switch.
-type OpenCodeZenSettings struct {
-	Enabled bool   `json:"enabled"`
-	BaseURL string `json:"base_url"` // default https://opencode.ai/inference/v1 (tests override)
-}
+	type OpenCodeZenSettings struct {
+		Enabled bool   `json:"enabled"`
+		BaseURL string `json:"base_url"` // default https://opencode.ai/inference/openai/v1 (tests override, BP-264)
+	}
 
 // LobsterSettings configures the NetEase Youdao LobsterAI (有道龙虾) channel
 // (BP-98). It is an unofficial channel: the endpoints below belong to the
@@ -417,10 +417,10 @@ func Default() *Config {
 				OpenBase:    "https://openapi.qoder.com.cn",
 				MaxInFlight: 1,
 			},
-			OpenCodeZen: OpenCodeZenSettings{
-				Enabled: true,
-				BaseURL: "https://opencode.ai/inference/v1",
-			},
+				OpenCodeZen: OpenCodeZenSettings{
+					Enabled: true,
+					BaseURL: "https://opencode.ai/inference/openai/v1",
+				},
 			Lobster: LobsterSettings{
 				// Enabled by default so the panel offers the login flow; the
 				// channel takes no traffic until a model binding is added, so

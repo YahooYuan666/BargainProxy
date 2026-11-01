@@ -474,9 +474,9 @@ func TestContinuationErrorClassificationIsUnchangedWhenBudgetExhausted(t *testin
 	}
 }
 
-// TestContinuationMergesUsage: each segment is a separately billed upstream
-// call, so the aggregate must sum them or the cost columns under-report what
-// the turn actually spent.
+// TestContinuationMergesUsage: Output and cost are summed, but input tokens
+// take the last segment's value (BP-261) to prevent client-side context
+// compaction from firing prematurely.
 func TestContinuationMergesUsage(t *testing.T) {
 	drv := &scriptedDriver{segs: []func(driver.ChatCall, driver.Emit) (*ir.ChatResponse, error){
 		func(_ driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
@@ -504,8 +504,9 @@ func TestContinuationMergesUsage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if got, want := res.Response.Usage.InputTokens, 2100; got != want {
-		t.Fatalf("input tokens = %d, want %d (both segments were billed)", got, want)
+	// BP-261: InputTokens must reflect the final continuation segment (1100), not the sum (2100).
+	if got, want := res.Response.Usage.InputTokens, 1100; got != want {
+		t.Fatalf("input tokens = %d, want %d (last segment context size)", got, want)
 	}
 	if got, want := res.Response.Usage.OutputTokens, 100; got != want {
 		t.Fatalf("output tokens = %d, want %d", got, want)

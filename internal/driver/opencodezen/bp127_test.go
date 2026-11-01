@@ -143,18 +143,18 @@ func TestGateToolSchemas(t *testing.T) {
 	}
 }
 
-// Stale configs still naming the pre-BP-127 /zen base route to the inference
-// API, which is where the free lane answers since mid-October 2026.
+// Stale configs still naming pre-BP-127 /zen or pre-BP-264 /inference/v1 base route
+// to the official OpenCode 2.2.5 /inference/openai/v1 API.
 func TestLegacyBaseRoutesToInference(t *testing.T) {
-	for _, old := range []string{"https://opencode.ai/zen", "https://opencode.ai/zen/", "https://opencode.ai/zen/v1"} {
+	for _, old := range []string{"https://opencode.ai/zen", "https://opencode.ai/zen/", "https://opencode.ai/zen/v1", "https://opencode.ai/inference/v1"} {
 		d := New(configForBase(old), nil)
 		if got := d.base(); got != zenUpstreamBase {
 			t.Fatalf("base(%q) = %q, want %q", old, got, zenUpstreamBase)
 		}
 	}
-	d := New(configForBase("https://opencode.ai/inference/v1"), nil)
-	if got := d.base(); got != "https://opencode.ai/inference/v1" {
-		t.Fatalf("explicit base = %q, want it kept", got)
+	d := New(configForBase("http://127.0.0.1:8080/custom/v1"), nil)
+	if got := d.base(); got != "http://127.0.0.1:8080/custom/v1" {
+		t.Fatalf("custom base = %q, want it kept", got)
 	}
 	empty := New(configForBase(""), nil)
 	if got := empty.base(); got != zenUpstreamBase {

@@ -28,14 +28,10 @@ import (
 	"bargainproxy/internal/uperr"
 )
 
-// zenUpstreamBase is the anonymous free-lane base. Overridable for tests.
-// zenUpstreamBase is the inference API the free lane answers on. Before
-// BP-127 this was https://opencode.ai/zen (→ /zen/v1 on the wire): since
-// mid-October 2026 the free models answer 403 FreeTierError there and 200 on
-// the inference API — the same request, byte for byte (magpie zen-free,
-// which moved with it). The /v1 the old code appended per path is part of
-// the base now.
-const zenUpstreamBase = "https://opencode.ai/inference/v1"
+// zenUpstreamBase is the anonymous free-lane base for OpenAI-compatible protocols
+// (chat/completions and responses). Aligned with OpenCode 2.2.5 official routing
+// and models.dev v2 catalog: /inference/openai/v1 (BP-264; magpie zen-free 0.1.20).
+const zenUpstreamBase = "https://opencode.ai/inference/openai/v1"
 
 // Driver implements driver.Driver for the opencodezen channel.
 type Driver struct {
@@ -110,9 +106,11 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 
 func (d *Driver) base() string {
 	if b := strings.TrimRight(d.cfg.BaseURL, "/"); b != "" {
-		// Stale configs still name the pre-BP-127 default; the free lane
-		// stopped answering there, so route the old default to the new base.
-		if strings.HasSuffix(b, "opencode.ai/zen") || strings.HasSuffix(b, "opencode.ai/zen/v1") {
+		// Stale configs still name pre-BP-127 or pre-BP-264 defaults; route them
+		// to the official OpenCode 2.2.5 base (/inference/openai/v1).
+		if strings.HasSuffix(b, "opencode.ai/zen") ||
+			strings.HasSuffix(b, "opencode.ai/zen/v1") ||
+			strings.HasSuffix(b, "opencode.ai/inference/v1") {
 			return zenUpstreamBase
 		}
 		return b

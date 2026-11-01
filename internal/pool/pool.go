@@ -834,7 +834,12 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 	// breaks hotspots instead of overriding the economics. The sticky path
 	// above already returned for bound conversations; anything reaching here
 	// with a session key is a new session.
-	if sessionKey != "" {
+	//
+	// Exclude window-quota pools (ChannelAntigravity): Antigravity uses
+	// burn-rate greed (WeeklyGreed) to exhaust quota before it expires.
+	// Slicing out a near-expiry account just because it holds a live session
+	// forces new sessions onto accounts with days to spare, causing quota waste.
+	if sessionKey != "" && channel != model.ChannelAntigravity {
 		candidates = p.leastHeldLocked(channel, candidates, now)
 	}
 

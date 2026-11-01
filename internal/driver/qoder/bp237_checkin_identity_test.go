@@ -367,9 +367,10 @@ func TestCheckinClaimsCampaignByCampaignID(t *testing.T) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/daily-check-in/status"):
 			fmt.Fprint(w, `{"status":"DISABLED"}`)
-		case strings.HasSuffix(r.URL.Path, "/campaigns") && r.Method == http.MethodGet:
-			// The LIVE shape: campaignId, no id.
-			fmt.Fprint(w, `{"claimable":true,"campaigns":[{"campaignId":"01a17b4c-004f-78b7-b635-caca344d4237","campaignKey":"act-20261027-644","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"kind":"CREDITS","amount":100},"startAt":1793412000,"endAt":1793498340}]}`)
+			case strings.HasSuffix(r.URL.Path, "/campaigns") && r.Method == http.MethodGet:
+				// The LIVE shape: campaignId, no id.
+				nowUnix := time.Now().Unix()
+				fmt.Fprintf(w, `{"claimable":true,"campaigns":[{"campaignId":"01a17b4c-004f-78b7-b635-caca344d4237","campaignKey":"act-20261027-644","actionType":"CLAIM_BENEFIT","claimStatus":"CLAIMABLE","benefit":{"kind":"CREDITS","amount":100},"startAt":%d,"endAt":%d}]}`, nowUnix-60, nowUnix+86400)
 		case strings.Contains(r.URL.Path, "/claim"):
 			claimedPath = r.URL.Path
 			fmt.Fprint(w, `{"status":"CLAIMED","benefit":{"kind":"CREDITS","amount":100}}`)

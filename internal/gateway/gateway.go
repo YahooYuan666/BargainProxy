@@ -476,13 +476,10 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 			switch ue.Class {
 			case uperr.ClassUpstreamTimeout, uperr.ClassCanceled, uperr.ClassNotFound,
 				uperr.ClassContentBlocked, uperr.ClassSentinel, uperr.ClassBadRequest,
-				uperr.ClassAccountRestricted:
-				// BP-146: a restricted account means "this ACCOUNT is banned
-				// upstream", not "the request is bad". Never retry another
-				// account of the same channel (each attempt leaves a risk
-				// record and the next account gets banned too — Coding2API
-				// f428e33), but a different channel is a different upstream
-				// and may well serve the turn.
+				uperr.ClassAccountRestricted, uperr.ClassUpstreamBusy:
+				// BP-146/BP-263: a restricted account or deep upstream queue (e.g. WorkBuddy
+				// 6020 retry_after=40s) means THIS account/channel cannot serve the request right now,
+				// but a different channel is a different upstream and may well serve the turn.
 				if !(req.Stream && firstEvent) {
 					continue
 				}
@@ -887,11 +884,13 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		if streamErr != nil && !emitted() {
 			if ue, ok := uperr.As(streamErr); ok && ue.Class == uperr.ClassUpstreamBusy && ctx.Err() == nil {
 				for r := 0; r < 2; r++ {
-					if !ue.ResetAt.IsZero() {
-						if wait := time.Until(ue.ResetAt); wait > 5*time.Second {
-							break // deep queue: hand the wait to the client
+						if !ue.ResetAt.IsZero() {
+							if wait := time.Until(ue.ResetAt); wait > 5*time.Second {
+								log.Printf("gateway: %s queue busy with deep wait (%s > 5s) — skipping retries to cascade immediately (BP-263)",
+									binding.Channel, wait.Round(time.Second))
+								break // deep queue: hand the wait to the cascade / client
+							}
 						}
-					}
 					backoff := 500 * time.Millisecond << r
 					select {
 					case <-actx.Done():
