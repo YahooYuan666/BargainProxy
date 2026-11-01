@@ -263,6 +263,9 @@ func (c *Catalog) Sync(ctx context.Context) error {
 		live = c.liveList // unchanged: keep the last known live list
 	case err != nil:
 		firstErr = err
+		if len(c.liveList) > 0 {
+			live = c.liveList // keep candidate set intact on transient live fetch error
+		}
 	default:
 		c.liveList = live
 		c.etagLive = etag
@@ -302,6 +305,9 @@ func (c *Catalog) Sync(ctx context.Context) error {
 	snap := Snapshot{UpdatedAt: time.Now(), Models: []ModelEntry{}}
 	if live != nil {
 		snap.LiveCount = len(live)
+	}
+	if firstErr != nil {
+		snap.LastSyncError = firstErr.Error()
 	}
 	// Metadata freshness: a 304 keeps the previous age, and so does a real
 	// failure (staleness is then visible through MetadataError instead).
@@ -440,7 +446,7 @@ func (c *Catalog) Wire(id string) string {
 // fetchLive pulls the Zen live list with ETag caching. Returns nil models on
 // 304/failure (caller keeps the previous state).
 func (c *Catalog) fetchLive(ctx context.Context, etag string) ([]string, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+zenModelsPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL(c.base), nil)
 	if err != nil {
 		return nil, "", err
 	}

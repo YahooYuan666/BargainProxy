@@ -169,9 +169,6 @@ tr:last-child td{border-bottom:none}
       <li><a href="#tiers" data-view="tiers">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 12.5h12M2 8h12M2 3.5h12"/><path d="M5 6v2.5M9 10.5V13"/></svg>
         模型与档位</a></li>
-      <li><a href="#zen" data-view="zen">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="5.5"/><path d="M8 2.5v11M4 5.5c2.5 1.5 5.5 1.5 8 0M4 10.5c2.5-1.5 5.5-1.5 8 0"/></svg>
-        opencode免费模型</a></li>
       <li><a href="#tasks" data-view="tasks">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.5" y="2.5" width="11" height="11" rx="2.4"/><path d="M5.5 8l1.8 1.8 3.4-3.6"/></svg>
         任务中心</a></li>
@@ -244,31 +241,6 @@ tr:last-child td{border-bottom:none}
           <table id="mlTable"><thead><tr>
             <th>模型</th><th>状态</th><th>可选 / 总数</th><th>锁定账号</th><th>最早解锁</th><th>全池解锁</th>
           </tr></thead><tbody id="mlBody"></tbody></table>
-        </div>
-      </div>
-    </section>
-
-    <!-- ══ opencode 免费模型 ══ -->
-    <section class="view" id="view-zen" hidden>
-      <div class="box">
-        <header><h3>opencode 免费模型</h3><span class="grow"></span>
-          <span class="note" id="zenStatus"></span>
-          <button class="xs" onclick="zenSync()">立即同步</button>
-          <button class="xs" onclick="zenProbe()">探测可用性</button></header>
-        <div style="padding:14px 16px;display:grid;gap:12px">
-          <div class="row">
-            <label class="chk">自动同步目录 <input id="zenAuto" type="checkbox" onchange="zenSaveSettings()"></label>
-            <label class="chk">目录同步间隔（分钟）<input id="zenMinutes" type="number" min="5" max="1440" style="max-width:90px" onchange="zenSaveSettings()"></label>
-          </div>
-          <div class="row">
-            <label class="chk">加入网关路由 <input id="zenGateway" type="checkbox" onchange="zenSaveSettings()" title="勾选后这些模型出现在 /v1/models，任何客户端可用；下架/确定性失败自动停用"></label>
-          </div>
-          <div class="hint">免费通道是匿名直连 opencode.ai/zen：须流式 + 携带 bash/read 门禁工具 + CLI 伪装头（网关自动处理）。探测=真实发起一次最小对话，只在<b>启动时自动跑一次</b>，之后靠上面的「探测可用性」手动触发（每次都会消耗免费额度）。限流（429/超时）不算失败，模型留在路由里；只有确定性失败（403 门禁变化、400 协议不支持、404 下架）才停用。</div>
-        </div>
-        <div class="tbl-wrap">
-          <table id="zenModels"><thead><tr>
-            <th>模型 ID</th><th>可用</th><th>判定</th><th>上下文</th><th>最大输出</th><th>输入模态</th><th>推理档位</th><th>上次探测</th>
-          </tr></thead><tbody></tbody></table>
         </div>
       </div>
     </section>
@@ -437,19 +409,18 @@ tr:last-child td{border-bottom:none}
         </div>
       </div>
       <div class="box">
-        <header><h3>出境链路：Google / OpenCode 慢怎么办</h3>
+        <header><h3>出境链路：Google 慢怎么办</h3>
           <span class="grow"></span>
           <button class="xs" onclick="copyNetGuide()">复制文档地址</button></header>
         <div style="padding:14px 16px;display:grid;gap:10px">
           <div class="small">国模（WorkBuddy / Trae / ZCode / AutoClaw / Qoder / Lobster）走国内直连；只有
-            <b>Google（Antigravity）</b> 与 <b>OpenCode 免费模型</b> 需要出境。若这两条链路的第一字耗时异常大
+            <b>Google（Antigravity）</b> 需要出境。若这条链路的第一字耗时异常大
             （比如 >30s），而国模正常，问题几乎都在你自己的代理出口，不在网关。</div>
           <div class="small"><b>最常见的根因</b>：Windows 默认 TCP 拥塞控制是 Cubic，在 150~300ms 的跨国链路上，
             AI 那一两 MB 的上下文上传会被压到 0.5~1 Mbps（几十秒才发完），看起来像模型卡死。</div>
           <div class="small"><b>三步处理</b>：① 管理员终端执行
             <span class="mono">netsh int tcp set supplemental template=internet congestionprovider=bbr2</span>
-            （实测 2MB 上行 18s → 3s）；② 代理分流只让 <span class="mono">googleapis.com</span> /
-            <span class="mono">opencode.ai</span> / <span class="mono">models.dev</span> 出境，国模域名与
+            （实测 2MB 上行 18s → 3s）；② 代理分流只让 <span class="mono">googleapis.com</span> 出境，国模域名与
             <span class="mono">GEOIP,CN</span> 直连；③ 关掉浏览器安全 DNS（DoH）与实验性 QUIC。</div>
           <div class="hint">完整命令、回滚方式、分流规则与验证流程见项目内文档
             <span class="mono">docs/跨国外网出口与BBR2调优.md</span>（面板不内置代理配置，避免把凭据带进仓库）。</div>
@@ -927,9 +898,9 @@ function toggleTheme(){ document.body.classList.toggle('light', document.getElem
 /* ── 视图切换 ── */
 // Channel hashes (#google/#workbuddy/#trae/#zcode) map onto the accounts
 // view; #google is the default landing view.
-const titles = {accounts:'账号池', google:'账号池', workbuddy:'账号池', trae:'账号池', zcode:'账号池', autoclaw:'账号池', qoder:'账号池', lobster:'账号池', tasks:'任务中心', usage:'用量统计', tiers:'模型与档位', zen:'opencode免费模型', packages:'国模积分情况', logs:'请求日志', guide:'使用指南', settings:'设置'};
+const titles = {accounts:'账号池', google:'账号池', workbuddy:'账号池', trae:'账号池', zcode:'账号池', autoclaw:'账号池', qoder:'账号池', lobster:'账号池', tasks:'任务中心', usage:'用量统计', tiers:'模型与档位', packages:'国模积分情况', logs:'请求日志', guide:'使用指南', settings:'设置'};
 const chanHashes = {google:'antigravity', workbuddy:'workbuddy', trae:'trae', zcode:'zcode', autoclaw:'autoclaw', qoder:'qoder', lobster:'lobster'};
-const chanNames = {antigravity:'Google（Antigravity）', workbuddy:'WorkBuddy', trae:'Trae CN', zcode:'ZCode', autoclaw:'AutoClaw', qoder:'Qoder', lobster:'LobsterAI（有道龙虾）', openaicompat:'OpenAI 兼容兜底', opencodezen:'OpenCode 免费通道'};
+const chanNames = {antigravity:'Google（Antigravity）', workbuddy:'WorkBuddy', trae:'Trae CN', zcode:'ZCode', autoclaw:'AutoClaw', qoder:'Qoder', lobster:'LobsterAI（有道龙虾）', openaicompat:'OpenAI 兼容兜底'};
 function switchView(hash){
   const [view, chan] = hash.replace('#','').split('/');
   if (!titles[view]) return;
@@ -946,7 +917,6 @@ function switchView(hash){
   // stay empty until the next manual 刷新 (fixed after user report).
   if (target === 'accounts'){ renderKpis(); renderAccounts(); renderModelLocks(); }
   if (target === 'usage') loadUsage();
-  if (target === 'zen') loadZen();
   if (target === 'tiers') loadTiers();
   if (target === 'packages') loadPackages();
   if (target === 'logs') loadLogs();
@@ -1089,92 +1059,6 @@ async function setUpdateAuto(enabled){
 }
 
 /* ── 模型与档位 ── */
-/* ── opencode 免费模型（BP-55） ── */
-let zenData = null;
-/* 探测失败的上游报错 → 一句人话（原始报错保留在 title 里） */
-function zenFailReason(err){
-  const e = err || '';
-  if (/429|Endpoint is unavailable|rate limit/i.test(e)) return '429 端点忙（临时，恢复后自动回来）';
-  if (/ModelProtocolUnsupported/i.test(e)) return '协议不支持（该模型不走这条道）';
-  if (/context deadline exceeded|timeout/i.test(e)) return '探测超时（端点太慢或未就绪）';
-  if (/free tier|403/i.test(e)) return '403 门禁变化（伪装契约可能变了）';
-  if (/401/.test(e)) return '401 未授权';
-  return e.slice(0, 60);
-}
-async function loadZen(){
-  try {
-    zenData = await api('opencodezen');
-    const snap = zenData.snapshot || {models:[]};
-    const all = snap.models || [];
-    const cands = all.filter(m => m.candidate);
-    const hidden = all.length - cands.length;
-    const okN = zenData.probe_ok || 0;
-    const limitedN = zenData.probe_limited || 0;
-    document.getElementById('zenStatus').textContent =
-      '清单 ' + (snap.live_count || 0) + ' · 候选 ' + cands.length + ' · 可用 ' + okN +
-      (limitedN ? ' · 限流 ' + limitedN : '') +
-      (hidden ? ' · 已隐藏 ' + hidden + ' 个非候选' : '') +
-      (snap.updated_at ? ' · 目录 ' + fmtTime(snap.updated_at) : ' · 未同步') +
-      (snap.metadata_error ? ' · ⚠ 元数据异常：' + snap.metadata_error : '');
-    document.getElementById('zenAuto').checked = !!zenData.auto_sync;
-    document.getElementById('zenMinutes').value = zenData.sync_minutes || 60;
-    document.getElementById('zenGateway').checked = !!zenData.add_to_gateway;
-    const tb = document.querySelector('#zenModels tbody'); tb.innerHTML='';
-    // 只列候选：付费/已下架/无元数据的模型不上这个页面（口径与网关路由一致）
-    cands.forEach(m => {
-      const tr = document.createElement('tr');
-      let dot, dotTxt;
-      if (m.probe_status === 'ok') { dot = 'ok'; dotTxt = '可用'; }
-      else if (m.probe_status === 'limited') { dot = 'warn'; dotTxt = '限流中'; }
-      else if (m.probe_status === 'fail') { dot = 'bad'; dotTxt = '失败'; }
-      else { dot = 'muted'; dotTxt = '未探测'; }
-      const verdict = m.probe_status === 'fail' ? zenFailReason(m.probe_error)
-        : (m.probe_status === 'limited' ? '临时限流（路由保留）'
-        : (m.probe_status === 'ok' ? '免费候选' : '免费候选（未探测）'));
-      const probeTitle = esc(m.probe_error || (m.probe_ms ? m.probe_ms + 'ms' : ''));
-      /* 从未探测过的行 probed_at 是零值时间（0001-01-01），不能当成真实时间渲染 */
-      const probedAt = (m.probed_at && !String(m.probed_at).startsWith('0001-')) ? fmtTime(m.probed_at) : '';
-      tr.innerHTML = `<td class="mono">${esc(m.id)}${m.in_live_list ? '' : ' <span class="muted small">(不在实时清单)</span>'}</td>` +
-        `<td><span class="dot ${dot}"></span>${esc(dotTxt)}</td>` +
-        `<td class="small" title="${probeTitle}">${esc(verdict)}</td>` +
-        `<td class="mono">${m.context_window ? fmtTok(m.context_window) : '—'}</td>` +
-        `<td class="mono">${m.max_output_tokens ? fmtTok(m.max_output_tokens) : '—'}</td>` +
-        `<td>${m.input_image ? '图像' : '文本'}</td>` +
-        `<td class="mono small">${esc((m.reasoning_vals||[]).join('/')) || '—'}</td>` +
-        `<td class="mono small" title="${probeTitle}">${probedAt ? probedAt + (m.probe_ms ? ' · ' + m.probe_ms + 'ms' : '') : '—'}</td>`;
-      tb.appendChild(tr);
-    });
-    if (!cands.length) tb.innerHTML = '<tr><td colspan="8" class="muted">没有候选模型：点「立即同步」拉取目录</td></tr>';
-  } catch(e){ toast('opencodezen 加载失败：' + e.message, true); }
-}
-async function zenSaveSettings(){
-  try {
-    await api('opencodezen', {method:'POST', body: JSON.stringify({
-      action:'settings',
-      auto_sync: document.getElementById('zenAuto').checked,
-      sync_minutes: parseInt(document.getElementById('zenMinutes').value,10)||60,
-      add_to_gateway: document.getElementById('zenGateway').checked,
-    })});
-    toast('已保存，正在应用…');
-    const r = await api('opencodezen', {method:'POST', body: JSON.stringify({action:'sync'})});
-    toast(r.detail || '已同步');
-    loadZen();
-  } catch(e){ toast('保存失败：' + e.message, true); }
-}
-async function zenSync(){
-  try {
-    const r = await api('opencodezen', {method:'POST', body: JSON.stringify({action:'sync'})});
-    toast(r.detail || '已同步');
-    loadZen();
-  } catch(e){ toast('同步失败：' + e.message, true); }
-}
-async function zenProbe(){
-  try {
-    const r = await api('opencodezen', {method:'POST', body: JSON.stringify({action:'probe'})});
-    toast(r.detail || '探测已开始');
-    setTimeout(loadZen, 3000);
-  } catch(e){ toast('探测失败：' + e.message, true); }
-}
 
 function tiersHideRetired(){ return localStorage.getItem('tiersHideRetired') !== 'false'; }
 function saveTiersFilter(){
@@ -2009,7 +1893,7 @@ async function loadLogs(){
     const limit = document.getElementById('logLimit').value || 100;
     const data = await api('logs?limit=' + encodeURIComponent(limit));
     logRows = data.logs || [];
-    // 渠道筛选：选项来自当前窗口，覆盖 AutoClaw/Qoder/OpenCode 等新池。
+    // 渠道筛选：选项来自当前窗口，覆盖 AutoClaw/Qoder 等新池。
     const sel = document.getElementById('logChannel');
     const cur = sel.value;
     const chans = [...new Set(logRows.map(l => l.channel).filter(Boolean))].sort();

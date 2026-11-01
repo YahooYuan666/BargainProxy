@@ -3,9 +3,8 @@
  * BargainProxy → ZCode 供应商同步（独立插件，零依赖，纯 HTTP）
  *
  * 做什么：从本机运行的 BargainProxy 网关读取两批模型，在 ZCode 的个人
- * Provider 配置里维护 **9 个供应商**（3 个模型族 × 3 条协议线）：
+ * Provider 配置里维护 **6 个供应商**（2 个模型族 × 3 条协议线）：
  *
- *   BargainProxy OpenCode  Chat/Response/Anthropic  ← /panel/api/opencodezen 的可用免费模型
  *   BargainProxy 国模      Chat/Response/Anthropic  ← /v1/models 中非 antigravity 的模型
  *   BargainProxy Gemini    Chat/Response/Anthropic  ← /v1/models 中 antigravity 的模型（gemini/claude）
  *
@@ -48,17 +47,8 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 
-// ── 固定身份（3 个模型族 × 3 条协议线）─────────────────────────────────────
+// ── 固定身份（2 个模型族 × 3 条协议线；OpenCode 免费通道已下线）─────────
 const FAMILIES = [
-  {
-    key: "opencode",
-    label: "OpenCode 免费",
-    providers: [
-      { id: "bargainproxy-opencode-chat", name: "BargainProxy OpenCode Chat", apiType: "openai-chat-completions", v1: true },
-      { id: "bargainproxy-opencode-responses", name: "BargainProxy OpenCode Response", apiType: "openai-responses", v1: true },
-      { id: "bargainproxy-opencode-anthropic", name: "BargainProxy OpenCode Anthropic", apiType: "anthropic-messages", v1: false },
-    ],
-  },
   {
     key: "cn",
     label: "国模",
@@ -83,7 +73,6 @@ const OUR_IDS = PROVIDERS.map((p) => p.id);
 
 const DEFAULT_GATEWAY = "http://127.0.0.1:13140";
 const DEFAULT_API_KEY = "bp-public"; // 网关开放模式时任意值；设了网关 api_key 时用 --api-key 覆盖
-const STATE_PATH = "/panel/api/opencodezen";
 const MODELS_DEV_URL = "https://models.dev/api.json";
 
 // 元数据不可得时的中性默认（不编造确定值）
@@ -199,24 +188,7 @@ async function getJson(url, timeoutMs = HTTP_TIMEOUT_MS, apiKey = "") {
   }
 }
 
-// ── 来源 1：OpenCode 免费模型（面板同口径：候选里没被判定失败的；全失败给全候选）
-// probe_status：ok 可用 / limited 临时限流（429、超时，路由保留）/ fail 确定性失败。
-// 限流不是"模型坏了"，所以和 ok 一起写进 ZCode；只有 fail 才排除。
-function usableModels(state) {
-  const models = state?.snapshot?.models;
-  if (!Array.isArray(models)) return null;
-  const usable = [];
-  const all = [];
-  for (const m of models) {
-    if (!m || m.candidate !== true || typeof m.id !== "string" || !m.id) continue;
-    all.push(m.id);
-    if (m.probe_status !== "fail") usable.push(m.id);
-  }
-  if (usable.length > 0) return usable;
-  return all;
-}
-
-// ── 来源 2：网关 /v1/models → 国模 / Gemini 两类 ─────────────────────────────
+// ── 来源：网关 /v1/models → 国模 / Gemini 两类 ─────────────────────────────
 async function gatewayFamilies(gateway, apiKey) {
   const doc = await getJson(`${gateway}/v1/models`, HTTP_TIMEOUT_MS, apiKey);
   if (!doc || !Array.isArray(doc.data)) return null;
@@ -684,23 +656,17 @@ async function main(argv) {
   const installed = asArray(existing?.config?.providerConfigRules?.providerRules).filter(ours);
   const prevState = readState(file);
 
-  // 两个来源
-  const [zenState, gw] = await Promise.all([
-    getJson(`${gatewayArg}${STATE_PATH}`, HTTP_TIMEOUT_MS),
-    gatewayFamilies(gatewayArg, apiKey),
-  ]);
-  const zenIds = zenState ? usableModels(zenState) : null;
+  // 来源：网关 /v1/models（国模 / Gemini 两类）
+  const gw = await gatewayFamilies(gatewayArg, apiKey);
   const plan = FAMILIES.map((f) => {
-    let ids = null;
-    if (f.key === "opencode") ids = zenIds;
-    else if (gw) ids = gw[f.key] ?? null;
+    const ids = gw ? (gw[f.key] ?? null) : null;
     return { ...f, ids };
   });
 
   // ── --status ──
   if (args.mode === "status") {
     console.log(`配置文件: ${file}`);
-    console.log(`网关: ${gatewayArg} ${zenState || gw ? "可达" : "不可达"}`);
+    console.log(`网关: ${gatewayArg} ${gw ? "可达" : "不可达"}`);
     for (const fam of plan) {
       console.log(`  ${fam.label}: ${fam.ids === null ? "未知（来源不可达）" : fam.ids.length + " 个" + (fam.ids.length ? "：" + fam.ids.join(", ") : "")}`);
     }
@@ -743,7 +709,7 @@ async function main(argv) {
     note("没有可同步的模型（两个来源都不可达/为空），未改动", true);
     return 0;
   }
-  const base = (typeof zenState?.gateway_base === "string" && zenState.gateway_base) || gatewayArg;
+  const base = gatewayArg;
 
   // 元数据：已存在的模型声明整条复用；只有新模型才查 models.dev
   const existingKeys = new Set(

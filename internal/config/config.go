@@ -417,10 +417,10 @@ func Default() *Config {
 				OpenBase:    "https://openapi.qoder.com.cn",
 				MaxInFlight: 1,
 			},
-				OpenCodeZen: OpenCodeZenSettings{
-					Enabled: true,
-					BaseURL: "https://opencode.ai/inference/openai/v1",
-				},
+					OpenCodeZen: OpenCodeZenSettings{
+						Enabled: false,
+						BaseURL: "https://opencode.ai/inference/openai/v1",
+					},
 			Lobster: LobsterSettings{
 				// Enabled by default so the panel offers the login flow; the
 				// channel takes no traffic until a model binding is added, so

@@ -138,8 +138,8 @@ func TestGateToolSchemas(t *testing.T) {
 			t.Fatalf("responses definition missing/mismamed for %q", name)
 		}
 	}
-	if _, ok := chat["bash"]; ok {
-		t.Fatal("2.2.x has no bash tool; the 1.x name must not come back")
+	if _, ok := chat["bash"]; !ok {
+		t.Fatal("BP-267 requires bash definition for cloud free-tier gate")
 	}
 }
 
@@ -218,15 +218,15 @@ func TestBuildChatWireCarriesEnvBlock(t *testing.T) {
 	t.Fatal("buildWire output carries no env block in any system message")
 }
 
-// The gate set is the desktop's five-tool core (2.2.x: shell, not bash).
+// The gate set is the desktop's core plus cloud gate required tools (BP-267).
 func TestGateToolNamesAreTheFiveCore(t *testing.T) {
-	want := map[string]bool{"shell": true, "edit": true, "glob": true, "grep": true, "read": true}
+	want := map[string]bool{"bash": true, "shell": true, "edit": true, "glob": true, "grep": true, "read": true}
 	got := map[string]bool{}
 	for _, n := range gateToolNames {
 		got[n] = true
 	}
-	if len(got) != 5 {
-		t.Fatalf("gateToolNames = %v, want the five-tool core set", got)
+	if len(got) != 6 {
+		t.Fatalf("gateToolNames = %v, want the core set with bash", got)
 	}
 	for n := range want {
 		if !got[n] {

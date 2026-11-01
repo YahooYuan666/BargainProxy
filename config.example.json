@@ -53,7 +53,7 @@
       "models": []
     },
     "opencodezen": {
-      "enabled": true,
+      "enabled": false,
       "base_url": "https://opencode.ai/zen"
     },
     "lobster": {
@@ -66,18 +66,6 @@
     }
   },
   "models": [
-    {
-      "canonical": "beam-free",
-      "channel": "opencodezen",
-      "upstream_model": "beam-free",
-      "priority": 5
-    },
-    {
-      "canonical": "big-pickle",
-      "channel": "opencodezen",
-      "upstream_model": "big-pickle",
-      "priority": 5
-    },
     {
       "canonical": "deepseek-v4-pro",
       "channel": "workbuddy",
@@ -119,18 +107,6 @@
       "channel": "lobster",
       "upstream_model": "deepseek-flash",
       "priority": 9
-    },
-    {
-      "canonical": "deepseek-v4.1-flash-free",
-      "channel": "opencodezen",
-      "upstream_model": "deepseek-v4.1-flash-free",
-      "priority": 5
-    },
-    {
-      "canonical": "flint-40b-free",
-      "channel": "opencodezen",
-      "upstream_model": "flint-40b-free",
-      "priority": 5
     },
     {
       "canonical": "gemini-3.8-flash-high",
@@ -217,12 +193,6 @@
       "priority": 9
     },
     {
-      "canonical": "glm-5.3-flash-free",
-      "channel": "opencodezen",
-      "upstream_model": "glm-5.3-flash-free",
-      "priority": 5
-    },
-    {
       "canonical": "glm-5.3-flashx",
       "channel": "trae",
       "upstream_model": "glm-5.3-flashx",
@@ -251,24 +221,6 @@
       "channel": "lobster",
       "upstream_model": "kimi-k3.1-pro",
       "priority": 9
-    },
-    {
-      "canonical": "mimo-v2.6-flash-free",
-      "channel": "opencodezen",
-      "upstream_model": "mimo-v2.6-flash-free",
-      "priority": 5
-    },
-    {
-      "canonical": "nemotron-3.5-lightning-free",
-      "channel": "opencodezen",
-      "upstream_model": "nemotron-3.5-lightning-free",
-      "priority": 5
-    },
-    {
-      "canonical": "nemotron-3.5-super-vl-free",
-      "channel": "opencodezen",
-      "upstream_model": "nemotron-3.5-super-vl-free",
-      "priority": 5
     },
     {
       "canonical": "open-design-byok/deepseek-v4.1-flash",

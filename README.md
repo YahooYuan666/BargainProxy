@@ -4,7 +4,7 @@
 
 把廉价/免费的高质量模型上游聚合成一个统一 API 的自托管网关（个人自用）。
 
-**输入渠道**：Google Pro（Antigravity → Gemini）、腾讯 CodeBuddy/WorkBuddy（积分制中国模型，含 Trae CN 与 Z.AI ZCode）、AutoClaw、Qoder、OpenCode 免费模型、任意 OpenAI 兼容中转站（兜底）。
+**输入渠道**：Google Pro（Antigravity → Gemini）、腾讯 CodeBuddy/WorkBuddy（积分制中国模型，含 Trae CN 与 Z.AI ZCode）、AutoClaw、Qoder、任意 OpenAI 兼容中转站（兜底）。
 **输出协议**：同一端口同时兼容 **OpenAI Chat Completions**、**OpenAI Responses**、**Anthropic Messages**、**Gemini v1beta** 四种请求形态，流式与非流式俱全。
 **附带能力**：Web 管理面板、账号池自动调度（配额窗口贪婪 / 积分成本分层）、每日签到与成长任务自动化、跨渠道 fallback、凭据加密落库。
 
@@ -76,7 +76,7 @@
 ## ZCode 插件（可选）
 
 仓库自带 [`plugins/bargainproxy-opencode`](plugins/bargainproxy-opencode/README.md)：把本机网关的模型
-自动同步成 ZCode 的 **9 个个人供应商**（OpenCode 免费 / 国模 / Gemini-Claude × Chat / Responses / Anthropic），
+自动同步成 ZCode 的 **6 个个人供应商**（国模 / Gemini-Claude × Chat / Responses / Anthropic），
 ZCode 启动时自动刷新；你在 ZCode 里隐藏或关闭的供应商/模型会被保留，不会被重新打开。
 安装方式见插件自己的 README；它与网关无代码耦合，只通过 HTTP 读取模型清单。
 
@@ -212,9 +212,9 @@ internal/cryptox      AES-256-GCM 凭据信封
 
 ## 文档
 
-- [跨国外网出口与 BBR2 调优](docs/跨国外网出口与BBR2调优.md)：Google / OpenCode 两条出境链路慢的根因与三步调优（BBR2、分流规则、DoH/QUIC），含回滚与验证流程。国模走国内直连，不要放进代理。
+- [跨国外网出口与 BBR2 调优](docs/跨国外网出口与BBR2调优.md)：Google 出境链路慢的根因与三步调优（BBR2、分流规则、DoH/QUIC），含回滚与验证流程。国模走国内直连，不要放进代理。
 - [Trae 通道模型路由修复](docs/Trae通道模型路由修复.md)：Trae 按 `config_name` 路由；缺这个字段时所有模型都由同一个火山引擎端点代答（返回 200 但模型是错的）。含自查方法（读响应的 `timing_cost.provider_model_name`）与"别用模型自述身份判断路由"的排查教训。
-- [ZCode 同步插件](plugins/bargainproxy-opencode/README.md)：把网关模型同步进 ZCode 的 9 个个人供应商。
+- [ZCode 同步插件](plugins/bargainproxy-opencode/README.md)：把网关模型同步进 ZCode 的 6 个个人供应商。
 
 ## 换电脑 / 重装时怎么把调好的设置带过去
 

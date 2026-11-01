@@ -1,11 +1,10 @@
 # BargainProxy 模型（ZCode 插件）
 
 独立插件：把**本机 BargainProxy 网关的模型**同步进 ZCode 的个人 Provider 配置，
-生成 **9 个供应商 = 3 个模型族 × 3 条协议线**，ZCode 启动时自动刷新：
+生成 **6 个供应商 = 2 个模型族 × 3 条协议线**，ZCode 启动时自动刷新：
 
 | 模型族 | 来源 | 内容 |
 | --- | --- | --- |
-| OpenCode 免费 | `/panel/api/opencodezen` | 面板同口径的免费模型（候选里没被判定失败；429/超时等临时限流仍保留） |
 | 国模 | `/v1/models` 中 `owned_by != antigravity` | GLM / DeepSeek / Qwen / Kimi 等 |
 | Gemini/Claude | `/v1/models` 中 `owned_by == antigravity` | gemini-3.8-flash 系与 claude 系 |
 
@@ -22,7 +21,7 @@
 | `bargainproxy-<族>-responses` | `openai-responses` | `http://127.0.0.1:13140/v1` | `/responses` |
 | `bargainproxy-<族>-anthropic` | `anthropic-messages` | `http://127.0.0.1:13140` | `/v1/messages` |
 
-（`<族>` = `opencode` / `cn` / `gemini`）
+（`<族>` = `cn` / `gemini`）
 
 三条线的 baseUrl 拼接口径是实测钉死的（anthropic 线**不带** `/v1`，另外两条**带**）。
 模型元数据（上下文 / 最大输出 / 图像 / 推理档位）优先取自 models.dev 的官方 provider 条目；
@@ -46,10 +45,10 @@
 
 1. ZCode → **插件市场 → 添加 → 添加插件市场**，粘贴目录：
    `D:\Projects\BargainProxy\plugins`
-2. 在 **Personal → bargainproxy-local → BargainProxy OpenCode 免费模型 → 安装**
+2. 在 **Personal → bargainproxy-local → BargainProxy 模型同步 → 安装**
 3. 新开一个会话（或重启 ZCode）即触发一次同步；之后每次启动都会自动刷新。
 
-前提：BargainProxy 网关在运行；面板里「加入网关路由」保持勾选（清单从这里来）。
+前提：BargainProxy 网关在运行。
 
 ## 手动命令（排查用）
 

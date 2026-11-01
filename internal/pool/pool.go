@@ -1222,14 +1222,11 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 			// with this account's history, and letting a stale breaker stretch
 			// the wait turns the base window into 40 minutes for a wall the
 			// account cannot influence.
-			// BP-221: fixed 60s, not the base backoff — the base defaults to
-			// 10 minutes, and 2026-10-31 field data shows the shared wall is
-			// EPISODIC (the same shape 200 eight times at a 10s pace right
-			// after one 429), so a 10-minute rest throws away a lane that
-			// works again within the minute. The gateway's BP-221 hold-and-
-			// resend rides the first refusal inside the turn; this short rest
-			// only paces the FOLLOW-UP requests.
-			until = now.Add(60 * time.Second)
+			// BP-221 / BP-268: paced to 10s so episodic rate spikes do not lock
+			// users out of a channel for a whole minute while upstream has already
+			// recovered (field 2026-11-02: a 60s rest made ZCode report "all
+			// accounts exhausted" long after the upstream had answered 200 again).
+			until = now.Add(10 * time.Second)
 			p.restAccount(a, until, "shared quota", "fixed", now)
 			upstreamErr.HoldUntil = until
 			p.sinkLocked(a, now)

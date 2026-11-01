@@ -17,7 +17,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"testing"
 	"time"
 
 	"bargainproxy/internal/config"
@@ -42,50 +41,44 @@ type Driver struct {
 	// ever opens a paid lane; today every request goes through the gate.
 	gateEnabled atomic.Bool
 	// wireFor resolves a model id to its upstream lane ("chat" / "responses";
-	// "" = not servable). Wired from the catalog in main; nil means chat.
-	wireFor func(string) string
-	// sidecar carries the final HTTP hop through Bun's fetch when a Bun
-	// runtime exists (BP-220): the free lane's TLS gate refuses Go's
-	// handshake. Started in New; the lane falls back to direct until/unless
-	// it is up.
-	sidecar zenSidecar
-}
-
-// SetWireResolver wires the catalog's lane decision into the driver.
-func (d *Driver) SetWireResolver(f func(string) string) { d.wireFor = f }
-
-// New builds the driver.
-func New(cfg config.OpenCodeZenSettings, httpClient *http.Client) *Driver {
-	if httpClient == nil {
-		httpClient = httpx.ChatClient()
+		// "" = not servable). Wired from the catalog in main; nil means chat.
+		wireFor func(string) string
 	}
-	d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
-	d.gateEnabled.Store(true)
-	// The TLS gate is bypassed by the Bun sidecar; without Bun the driver
-	// logs once and serves over Go's transport (the gate then refuses). Off
-	// under `go test` — tests must not spawn runtimes.
-	if testing.Testing() {
-		if os.Getenv("BP_ZEN_SIDECAR") != "off" {
-			// allow an explicit opt-in for a sidecar e2e test later
-			if os.Getenv("BP_ZEN_SIDECAR") != "on" {
-				return d
-			}
+
+	// SetWireResolver wires the catalog's lane decision into the driver.
+	func (d *Driver) SetWireResolver(f func(string) string) { d.wireFor = f }
+
+	// New builds the driver.
+	func New(cfg config.OpenCodeZenSettings, httpClient *http.Client) *Driver {
+		if httpClient == nil {
+			httpClient = httpx.ChatClient()
 		}
-		go startZenSidecar(d)
+		d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
+		d.gateEnabled.Store(true)
 		return d
 	}
-	if os.Getenv("BP_ZEN_SIDECAR") != "off" {
-		go startZenSidecar(d)
-	}
-	return d
-}
 
 // Channel reports the channel id.
 func (d *Driver) Channel() string { return model.ChannelOpenCodeZen }
 
+// modelsURL returns the model catalogue endpoint for the given base.
+// OpenCode upstream hosts its global model list at /inference/v1/models;
+// /inference/openai/v1 only serves protocol endpoints (/chat/completions, /responses)
+// and returns 404 for /models (BP-266).
+func modelsURL(baseURL string) string {
+	b := strings.TrimRight(baseURL, "/")
+	if strings.HasSuffix(b, "/openai/v1") {
+		return strings.TrimSuffix(b, "/openai/v1") + "/v1/models"
+	}
+	if strings.Contains(b, "opencode.ai") {
+		return "https://opencode.ai/inference/v1/models"
+	}
+	return b + "/models"
+}
+
 // Probe is a lightweight liveness check against the model list endpoint.
 func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeResult, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(d.base(), "/")+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL(d.base()), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +114,7 @@ func (d *Driver) base() string {
 // Models lists the upstream model catalog (best-effort; used by the
 // directory sync task — BP-54).
 func (d *Driver) Models(ctx context.Context) ([]string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(d.base(), "/")+"/models", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, modelsURL(d.base()), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -468,9 +461,6 @@ func (d *Driver) buildWire(call driver.ChatCall) ([]byte, error) {
 // dumpWireOnFailure writes the exact upstream wire of a refused request when
 // BP_ZEN_DEBUG_WIRE is set (BP-219 field debugging; the file lands in logs/).
 func (d *Driver) dumpWireOnFailure(wire []byte, status int) {
-	if os.Getenv("BP_ZEN_DEBUG_WIRE") == "" {
-		return
-	}
 	path := filepath.Join("logs", "zen_wire_debug.json")
 	hdr := fmt.Appendf(nil, "status=%d\n", status)
 	if err := os.WriteFile(path, append(hdr, wire...), 0o644); err != nil {
@@ -490,10 +480,10 @@ func (d *Driver) chatOnce(ctx context.Context, wire []byte, emit driver.Emit) (*
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	for _, h := range disguiseHeaders(ids, "chat") {
-		req.Header.Set(h[0], h[1])
-	}
-	resp, err := d.zenRoundTrip(d.http, req)
+		for _, h := range disguiseHeaders(ids, "chat") {
+			req.Header.Set(h[0], h[1])
+		}
+		resp, err := d.http.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "opencodezen: %v", err)
 	}
@@ -877,10 +867,10 @@ func (d *Driver) responsesOnce(ctx context.Context, wire []byte, emit driver.Emi
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	for _, h := range disguiseHeaders(ids, "responses") {
-		req.Header.Set(h[0], h[1])
-	}
-	resp, err := d.zenRoundTrip(d.http, req)
+		for _, h := range disguiseHeaders(ids, "responses") {
+			req.Header.Set(h[0], h[1])
+		}
+		resp, err := d.http.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "opencodezen: %v", err)
 	}

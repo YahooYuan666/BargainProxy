@@ -84,8 +84,8 @@ type Trace struct {
 // turn may ride the lease while the shared bucket is closed. Overridable in
 // tests (sharedRateHold is shortened there).
 var (
-	sharedRateHold       = 50 * time.Second
-	sharedRateMaxResends = 4
+	sharedRateHold       = 2 * time.Second
+	sharedRateMaxResends = 3
 )
 
 // effortRejected reports whether a 400 body names the effort gear as the

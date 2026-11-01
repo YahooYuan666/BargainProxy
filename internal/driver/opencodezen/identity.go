@@ -47,13 +47,12 @@ const AnonymousKey = "public"
 // succeed (BP-219 capture, 2026-10-30); its UA is
 // `opencode/latest/2.2.2/desktop` and its client header is `desktop`
 // (packages/desktop/src/main/lifecycle/environment.ts sets OPENCODE_CLIENT).
-const openCodeClientVersion = "2.2.2"
+const openCodeClientVersion = "2.2.5"
 
 // gateToolNames are the function tools the free lane requires on every
-// request. OpenCode 2.2.x renamed its shell tool (BP-219 capture: the desktop
-// offers shell/edit/glob/grep/read with REAL parameter schemas — the earlier
-// one-property stand-ins and the 1.x "bash" name belong to 1.19-era gates).
-var gateToolNames = []string{"shell", "edit", "glob", "grep", "read"}
+// request. Upstream 2.2.5 accepts bash/shell/edit/glob/grep/read; bash, glob,
+// grep and read are required by the core free-tier gate.
+var gateToolNames = []string{"bash", "shell", "edit", "glob", "grep", "read"}
 
 // acceptedEfforts are the reasoning_effort values the upstream actually
 // accepts; anything else (off/none/unknown) must be omitted, not passed
@@ -572,7 +571,7 @@ func disguiseHeaders(ids requestIDs, protocol string) [][2]string {
 		{"x-opencode-session-id", ids.session},
 		{"x-session-affinity", ids.session},
 		{"x-session-id", ids.session},
-		{"x-opencode-project", ids.project},
+		{"x-opencode-project", "global"},
 		{"authorization", "Bearer " + AnonymousKey},
 	}
 }

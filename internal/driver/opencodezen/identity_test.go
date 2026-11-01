@@ -74,13 +74,13 @@ func TestUserAgentMatchesOfficialShape(t *testing.T) {
 			t.Fatalf("UA(%s) = %q, want %q", protocol, got, want)
 		}
 	}
-	if openCodeClientVersion != "2.2.2" {
-		t.Fatalf("client version = %q, want the captured 2.2.2", openCodeClientVersion)
+	if openCodeClientVersion != "2.2.5" {
+		t.Fatalf("client version = %q, want the captured 2.2.5", openCodeClientVersion)
 	}
 }
 
 func TestEnsureGateToolsChat(t *testing.T) {
-	// No tools at all: all five injected + tool_choice none.
+	// No tools at all: all six injected + tool_choice none.
 	body := map[string]any{"model": "x"}
 	if n := ensureGateTools(body, false); n != len(gateToolNames) {
 		t.Fatalf("injected = %d, want %d", n, len(gateToolNames))
@@ -90,17 +90,15 @@ func TestEnsureGateToolsChat(t *testing.T) {
 	for _, tl := range tools {
 		names[toolNameOf(tl.(map[string]any))] = true
 	}
-	// BP-219: 2.2.x renamed the shell tool; the injected set is the desktop's.
-	if !names["shell"] || !names["read"] {
+	// BP-267: 2.2.5 accepts bash/shell/edit/glob/grep/read; bash, glob, grep and read
+	// are mandatory for the upstream free-tier gate.
+	if !names["bash"] || !names["shell"] || !names["read"] {
 		t.Fatalf("gate tools missing: %v", names)
-	}
-	if names["bash"] {
-		t.Fatal("bash is the 1.x name; the desktop offers shell")
 	}
 	if body["tool_choice"] != "none" {
 		t.Fatalf("tool-less chat lane must pin tool_choice=none: %v", body["tool_choice"])
 	}
-	// Client brought shell: the remaining four injected; tool_choice untouched.
+	// Client brought shell: the remaining five injected; tool_choice untouched.
 	body2 := map[string]any{"tools": []any{gateToolChat("shell")}, "tool_choice": "auto"}
 	if n := ensureGateTools(body2, false); n != len(gateToolNames)-1 {
 		t.Fatalf("second injection = %d, want %d (everything but shell)", n, len(gateToolNames)-1)
@@ -119,10 +117,11 @@ func TestEnsureGateToolsResponses(t *testing.T) {
 		t.Fatalf("responses lane must never carry tool_choice none: %v", body["tool_choice"])
 	}
 	tools := body["tools"].([]any)
-	if toolNameOf(tools[0].(map[string]any)) != "shell" {
+	firstToolName := toolNameOf(tools[0].(map[string]any))
+	if firstToolName != "bash" && firstToolName != "shell" {
 		t.Fatalf("responses tools must be flat-shaped: %v", tools[0])
 	}
-	// BP-219: even the flat shape carries the real parameters.
+	// BP-219 / BP-267: even the flat shape carries the real parameters.
 	params, _ := tools[0].(map[string]any)["parameters"].(map[string]any)
 	props, _ := params["properties"].(map[string]any)
 	if len(props) == 0 {
