@@ -39,6 +39,75 @@ type Part struct {
 	FunctionResp *FunctionResult `json:"functionResponse,omitempty"`
 }
 
+// UnmarshalJSON accepts both spellings of the function part keys
+// (functionCall/function_call, functionResponse/function_response): some
+// clients emit snake_case, and encoding/json's case-folding does not cover
+// the underscore (BP-271, CLIProxyAPI #7186/#7187). Scope is exactly these
+// two keys — inlineData keeps its single camelCase form.
+func (p *Part) UnmarshalJSON(data []byte) error {
+	type partAlias Part
+	var a partAlias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*p = Part(a)
+	if p.FunctionCall != nil && p.FunctionResp != nil {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil // not an object; the alias pass above already errored if it mattered
+	}
+	if p.FunctionCall == nil {
+		if v, ok := raw["function_call"]; ok {
+			var fc FunctionCall
+			if err := json.Unmarshal(v, &fc); err == nil {
+				p.FunctionCall = &fc
+			}
+		}
+	}
+	if p.FunctionResp == nil {
+		if v, ok := raw["function_response"]; ok {
+			var fr FunctionResult
+			if err := json.Unmarshal(v, &fr); err == nil {
+				p.FunctionResp = &fr
+			}
+		}
+	}
+	return nil
+}
+
+// normalizeGeminiRole maps a Gemini content role onto the IR's user/assistant
+// split (BP-271, CLIProxyAPI #7186): explicit roles win — "model"/"assistant"
+// is the model, "user"/"function"/"tool" is the user side, exactly the old
+// mapping. An omitted or unrecognized role is inferred from the parts (a
+// functionCall turn is the model asking for a tool, a functionResponse turn
+// is the answer coming back) and otherwise alternates from the previous
+// turn — the shape the Gemini API requires anyway, so a plain unlabeled
+// exchange reads user/assistant instead of user/user.
+func normalizeGeminiRole(raw string, parts []Part, prev ir.Role) ir.Role {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "model", "assistant":
+		return ir.RoleAssistant
+	case "user", "function", "tool":
+		return ir.RoleUser
+	}
+	for _, p := range parts {
+		if p.FunctionCall != nil {
+			return ir.RoleAssistant
+		}
+	}
+	for _, p := range parts {
+		if p.FunctionResp != nil {
+			return ir.RoleUser
+		}
+	}
+	if prev == ir.RoleUser {
+		return ir.RoleAssistant
+	}
+	return ir.RoleUser
+}
+
 // Blob is inline binary data.
 type Blob struct {
 	MIMEType string `json:"mimeType"`
@@ -110,12 +179,15 @@ func ParseRequest(body []byte, sessionKey string) (*ir.ChatRequest, error) {
 		used     bool
 	}
 	var pending []pendingCall
+	prevRole := ir.Role("")
 	for ci, c := range w.Contents {
 		var msg ir.Message
-		if c.Role == "model" {
+		if role := normalizeGeminiRole(c.Role, c.Parts, prevRole); role == ir.RoleAssistant {
 			msg.Role = ir.RoleAssistant
+			prevRole = role
 		} else {
 			msg.Role = ir.RoleUser
+			prevRole = role
 		}
 		var results []ir.Message
 		for pi, p := range c.Parts {

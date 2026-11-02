@@ -91,6 +91,8 @@ tr:last-child td{border-bottom:none}
 .rate-limit{display:flex;align-items:baseline;gap:6px;border:1px solid var(--line);border-left:3px solid var(--warn);border-radius:6px;background:var(--surface-2);padding:4px 8px;max-width:430px}
 .rate-limit b{font-size:11.5px;font-weight:600;white-space:nowrap}
 .rate-limit span{font-size:11px;color:var(--ink-3)}
+/* BP-270：限流/锁池行的「已路由至」标注 —— 锁了但请求已改道，不是服务中断。 */
+.fb-route{font-size:11px;color:var(--ok,#2e9e5b);white-space:nowrap}
 /* 请求日志长表（BP-50）：单元格不折行（模型名/效率串完整显示），超宽交给 .tbl-wrap 横向滚动。 */
 #logs th,#logs td{white-space:nowrap}
 /* Token 时序图（BP-52，agentpoints renderUsageChart 排版）。类名用 usbar 而不是 bar：
@@ -1468,7 +1470,11 @@ function modelCoolHtml(list){
       until ? '网关最早重试：'+fmtTime(row.until) : '',
       row.message || '',
     ].filter(Boolean).join('\n');
-    return '<div class="rate-limit" title="'+esc(title)+'"><b>'+esc(row.model)+'</b><span>'+esc(detail)+'</span></div>';
+    // BP-270: a limited model with another route binding is degraded, not
+    // down — the request cascades. Say where it goes, so a lock is not
+    // misread as an outage.
+    const fb = row.fallback ? '<div class="fb-route" title="请求已自动改道到备用模型，服务未中断">⤳ 已路由至 '+esc(row.fallback)+'</div>' : '';
+    return '<div class="rate-limit" title="'+esc(title)+'"><b>'+esc(row.model)+'</b><span>'+esc(detail)+'</span>'+fb+'</div>';
   }).join('') + '</div>';
 }
 
@@ -1559,7 +1565,9 @@ function renderModelLocks(){
     const full = r.locked >= r.total;
     const tag = full ? '<span class="dot bad"></span>整池不可用' : '<span class="dot warn"></span>部分限流';
     const t = iso => iso && iso !== '0001-01-01T00:00:00Z' ? fmtTime(iso) : '—';
-    return '<tr><td class="mono">'+esc(r.model)+'</td>'+
+    // BP-270: same annotation as the cooldown box — locked here, served there.
+    const fbCell = r.fallback ? '<div class="fb-route" title="该模型在本渠道不可用时，请求已自动改道，服务未中断">⤳ 已路由至 '+esc(r.fallback)+'</div>' : '';
+    return '<tr><td class="mono">'+esc(r.model)+fbCell+'</td>'+
       '<td>'+tag+'</td>'+
       '<td class="mono">'+Math.max(0, r.total - r.locked)+' / '+r.total+'</td>'+
       '<td class="mono">'+r.locked+'</td>'+

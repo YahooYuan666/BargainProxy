@@ -78,13 +78,16 @@ type accountView struct {
 // modelCoolView is one unexpired (account, model) rate-limit hold for the
 // panel: until = the gateway's routing barrier (earliest retry), reset_at =
 // the upstream-stated unlock, reason/message = the short label and upstream
-// text (BP-49, agentpoints rate_limited_models parity).
+// text (BP-49, agentpoints rate_limited_models parity). Fallback (BP-270)
+// names the sibling binding the request cascades to, "" when the model has
+// no other route.
 type modelCoolView struct {
-	Model   string `json:"model"`
-	Until   string `json:"until"`
-	ResetAt string `json:"reset_at,omitempty"`
-	Reason  string `json:"reason,omitempty"`
-	Message string `json:"message,omitempty"`
+	Model    string `json:"model"`
+	Until    string `json:"until"`
+	ResetAt  string `json:"reset_at,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Fallback string `json:"fallback,omitempty"`
 }
 
 // windowView is one quota window (5h/weekly × gemini/claude ledgers).
@@ -147,6 +150,25 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 	}
 	pl.Unlock()
 
+	// BP-270 (misakano PR #137): annotate the cooldown rows and the lock
+	// table with the sibling binding the request cascades to — a limited
+	// model with another route is degraded, not down. Computed after
+	// pl.Unlock: currentRouteRows may reach the gateway's own pool lock.
+	fb := routeFallbackTargets(p.currentRouteRows())
+	if len(fb) > 0 {
+		for i := range views {
+			for j := range views[i].ModelCool {
+				views[i].ModelCool[j].Fallback = fb[routeKey{views[i].Channel, views[i].ModelCool[j].Model}]
+			}
+		}
+	}
+	lockRows := pl.ModelLockRows()
+	if len(fb) > 0 {
+		for i := range lockRows {
+			lockRows[i].Fallback = fb[routeKey{lockRows[i].Channel, lockRows[i].Model}]
+		}
+	}
+
 	models := p.gw.ListModels()
 	out := map[string]any{
 		"accounts":         views,
@@ -161,7 +183,7 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 		// model_locks: (channel, model) lockout rows for the panel's
 		// model-lock view — which models are cooling, on how many accounts,
 		// and when they unlock (ticket 33, agentpoints b3f92dd).
-		"model_locks": pl.ModelLockRows(),
+		"model_locks": lockRows,
 	}
 	// Open mode: hand the per-process CSRF token to same-origin JS so
 	// mutations work without any login.

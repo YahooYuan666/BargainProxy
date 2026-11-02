@@ -1653,6 +1653,10 @@ type ModelLockRow struct {
 	Locked        int       `json:"locked"`
 	UnlockAt      time.Time `json:"unlock_at"`
 	FullyUnlockAt time.Time `json:"fully_unlock_at"`
+	// Fallback (BP-270) is filled by the panel, not here: it names the
+	// sibling route binding the request cascades to, and the pool does not
+	// know the route table. "" = no other route serves this model.
+	Fallback string `json:"fallback,omitempty"`
 }
 
 // lockKeySep separates channel and model in the ModelLockRows aggregation key.

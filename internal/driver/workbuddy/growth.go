@@ -50,19 +50,19 @@ const (
 	// has moved to 5.9.4 (package unpacked; /v2/update reports
 	// version=5.9.4, ideVersion 5.9.4, commit fa0a0901…) while CN stays
 	// 5.9.3 — the realms diverge again.
-	clientVersionCN       = "5.9.3"
-	clientVersionGlobal   = "5.9.4"
-	cliVersionCN          = "2.165.0"
-	cliVersionGlobal      = "2.165.0"
-	cliVersion            = cliVersionCN // legacy alias used by the growth/billing paths
+	clientVersionCN     = "5.9.3"
+	clientVersionGlobal = "5.9.4"
+	cliVersionCN        = "2.165.0"
+	cliVersionGlobal    = "2.165.0"
+	cliVersion          = cliVersionCN // legacy alias used by the growth/billing paths
 	// BP-225 (misakano 847deb10): the REST/RPC family (node fetch — /v2/report,
 	// /v3/config, growth/claim) wears a DIFFERENT UA from the chat SDK chain:
 	// CN drops the repeated brand segment (two-segment, 26+ real captures),
 	// global leads with the distribution slug. The old code sent the chat UA
 	// everywhere, so every growth call from a global account wore a CN camel
 	// segment no real international client produces.
-	desktopUARestCN     = "WorkBuddy/" + clientVersionCN + " CLI/" + cliVersionCN
-	desktopUARestGlobal = "workbuddy-ai/" + clientVersionGlobal + " workbuddy-ai/" + clientVersionGlobal + " CLI/" + cliVersionGlobal
+	desktopUARestCN       = "WorkBuddy/" + clientVersionCN + " CLI/" + cliVersionCN
+	desktopUARestGlobal   = "workbuddy-ai/" + clientVersionGlobal + " workbuddy-ai/" + clientVersionGlobal + " CLI/" + cliVersionGlobal
 	stainlessSDKVersion   = "6.25.0"
 	stainlessNodeVersion  = "v22.21.1"
 	reportPath            = "/v2/report"
@@ -84,6 +84,12 @@ const (
 	buddyTaskIncomplete   = "first_buddy task not completed yet"
 	desktopWebEventOrigin = "/C:/Program%20Files/WorkBuddy/resources/app.asar/renderer/index.html"
 )
+
+// growthStepGap spaces consecutive RunGrowthPipeline steps (BP-269, misakano
+// #149): report chains used to fire back-to-back — chat_5's five reports, the
+// template chains, the expert uses — the same burst shape that earned the
+// upstream panel's auto-runner its 429. A var so tests can zero it.
+var growthStepGap = 400 * time.Millisecond
 
 // workBuddyUA is the desktop client's User-Agent for a realm. The first
 // segment stays the camel-case product name on both packages; only the second
@@ -1130,6 +1136,17 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	var results []growthStepResult
 	var firstErr error
 	record := func(step string, err error, note string) {
+		// BP-269: one gap before every recorded step spaces the pipeline's
+		// upstream calls uniformly — skips included, so a burst of skips
+		// cannot run a step's calls right against the previous step's.
+		// record runs after a step's own calls, so the pause lands between
+		// consecutive steps' traffic, which is where the burst was.
+		if growthStepGap > 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(growthStepGap):
+			}
+		}
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -1144,11 +1161,18 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	// renamed or empty list must not silently disable the pipeline. The three
 	// confirmed removals stay gated even when the fetch fails.
 	liveCodes := map[string]bool{}
+	doneCodes := map[string]bool{}
 	liveOK := false
 	if ts, ferr := d.GrowthTasks(ctx, acc); ferr == nil && len(ts) > 0 {
 		liveOK = true
 		for _, t := range ts {
 			liveCodes[t.TaskCode] = true
+			// BP-269: claimed rewards are the snapshot's second gate. Done
+			// but unclaimed is deliberately NOT skipped — the tail claim
+			// pass collects those, and the actions still run as before.
+			if t.Claimed() {
+				doneCodes[t.TaskCode] = true
+			}
 		}
 	}
 	removedTask := map[string]bool{"Model_chat_GLM5.2": true, "Buddy_App_QQ": true, "create_canvas": true}
@@ -1161,21 +1185,30 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 			break
 		}
 	}
-	growSkip := func(codes ...string) bool {
+	// growSkip returns the skip reason for a step, "" = run it. Three
+	// gates, in the order they were earned: removed upstream (BP-228,
+	// hard-gated without a list), absent from the account's live list
+	// (BP-228), already claimed per the snapshot (BP-269, misakano #149 —
+	// the report chains earn nothing once the reward is collected, and a
+	// fully-claimed account used to fire ~30 dead upstream calls a day).
+	growSkip := func(codes ...string) string {
 		for _, c := range codes {
 			if removedTask[c] {
-				return true
+				return "skipped: task removed upstream / not in the account's list"
+			}
+			if doneCodes[c] {
+				return "skipped: reward already claimed (snapshot)"
 			}
 			if liveOK && vocabMatch && !liveCodes[c] {
-				return true
+				return "skipped: not in the account's task list"
 			}
 		}
-		return false
+		return ""
 	}
 
 	// 1. Chat activity (lights chat_5 progress + growth streak).
-	if growSkip("chat_5") {
-		record("chat_5", nil, "skipped: not in the account's task list")
+	if skip := growSkip("chat_5"); skip != "" {
+		record("chat_5", nil, skip)
 	} else {
 		for i := 0; i < 5; i++ {
 			cid := randomUUIDV4()
@@ -1192,8 +1225,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 
 	// 2. Real chat on glm-5.2 (Model_chat_GLM5.2) — REMOVED upstream
 	// (BP-228): hard-gated even without a live list.
-	if growSkip("Model_chat_GLM5.2") {
-		record("Model_chat_GLM5.2", nil, "skipped: task removed upstream / not in the account's list")
+	if skip := growSkip("Model_chat_GLM5.2"); skip != "" {
+		record("Model_chat_GLM5.2", nil, skip)
 	} else {
 		glmCid := randomUUIDV4()
 		if err := d.ReportChatActivity(ctx, acc, glmCid, "", "glm-5.2", "glm-5.2"); err == nil {
@@ -1204,8 +1237,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 3. Buddy adoption (first_buddy; +300c when unlocked).
-	if growSkip("first_buddy") {
-		record("first_buddy", nil, "skipped: not in the account's task list")
+	if skip := growSkip("first_buddy"); skip != "" {
+		record("first_buddy", nil, skip)
 	} else if adopted, note, err := d.BuddyAdopt(ctx, acc); err == nil {
 		record("first_buddy", nil, note)
 		_ = adopted
@@ -1214,8 +1247,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 4. Desktop chat chain (RichMeow_Chat).
-	if growSkip("RichMeow_Chat") {
-		record("RichMeow_Chat", nil, "skipped: not in the account's task list")
+	if skip := growSkip("RichMeow_Chat"); skip != "" {
+		record("RichMeow_Chat", nil, skip)
 	} else {
 		conv := randomUUIDV4()
 		reqID := uuidToken()
@@ -1229,8 +1262,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	// 5. Buddy app enter chain (Buddy_App + Buddy_App_QQ) — Buddy_App_QQ was
 	// REMOVED upstream (BP-228); the shared chain only runs while BOTH codes
 	// still list.
-	if growSkip("Buddy_App", "Buddy_App_QQ") {
-		record("Buddy_App", nil, "skipped: Buddy_App_QQ removed upstream / not in the account's list")
+	if skip := growSkip("Buddy_App", "Buddy_App_QQ"); skip != "" {
+		record("Buddy_App", nil, skip)
 	} else {
 		if err := d.reportDesktopEvents(ctx, mustCreds(acc), DesktopBuddyAppSequence(BuddyAppBuddyID, BuddyAppBuddyName)); err == nil {
 			record("Buddy_App", nil, "buddy app chain sent")
@@ -1241,8 +1274,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 6. Automation create event (automation_1).
-	if growSkip("automation_1") {
-		record("automation_1", nil, "skipped: not in the account's task list")
+	if skip := growSkip("automation_1"); skip != "" {
+		record("automation_1", nil, skip)
 	} else if err := d.reportDesktopEvents(ctx, mustCreds(acc), []desktopEvent{DesktopAutomationCreateEvent(randomUUIDV4())}); err == nil {
 		record("automation_1", nil, "automation event sent")
 	} else {
@@ -1250,8 +1283,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 7. Library read (web event, Library_read).
-	if growSkip("Library_read") {
-		record("Library_read", nil, "skipped: not in the account's task list")
+	if skip := growSkip("Library_read"); skip != "" {
+		record("Library_read", nil, skip)
 	} else if err := d.reportWebEvent(ctx, mustCreds(acc), "library_doc_intro_click", d.webBase()+"/library", "library-doc-intro", "资料库介绍"); err == nil {
 		record("Library_read", nil, "library click sent")
 	} else {
@@ -1259,8 +1292,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 8. Template use ×5 (template_5).
-	if growSkip("template_5") {
-		record("template_5", nil, "skipped: not in the account's task list")
+	if skip := growSkip("template_5"); skip != "" {
+		record("template_5", nil, skip)
 	} else {
 		templates := []struct{ id, name string }{
 			{"tpl-web-app", "网页应用"}, {"tpl-doc-summary", "文档总结"}, {"tpl-code-review", "代码审查"},
@@ -1278,8 +1311,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 9. Playbook prompt (playbook_prompt).
-	if growSkip("playbook_prompt") {
-		record("playbook_prompt", nil, "skipped: not in the account's task list")
+	if skip := growSkip("playbook_prompt"); skip != "" {
+		record("playbook_prompt", nil, skip)
 	} else {
 		pbConv := randomUUIDV4()
 		pbReq := uuidToken()
@@ -1287,8 +1320,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 10. Design canvas (create_canvas) — REMOVED upstream (BP-228).
-	if growSkip("create_canvas") {
-		record("create_canvas", nil, "skipped: task removed upstream / not in the account's list")
+	if skip := growSkip("create_canvas"); skip != "" {
+		record("create_canvas", nil, skip)
 	} else {
 		cvConv := randomUUIDV4()
 		cvReq := uuidToken()
@@ -1296,10 +1329,17 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 11. Expert summon + actual use ×3 (expert_5 needs 5; team ×3).
-	experts, err := d.marketExpertList(ctx, mustCreds(acc), "agent")
-	if growSkip("expert_5") {
-		record("expert_5", nil, "skipped: not in the account's task list")
-	} else if err != nil || len(experts) == 0 {
+	// BP-269: the agent-market fetch is shared by steps 11/13 — only make it
+	// when at least one of them will actually run.
+	expertWanted := growSkip("expert_5") == "" || growSkip("Expert_lighthouse") == ""
+	var experts []MarketExpert
+	var expertErr error
+	if expertWanted {
+		experts, expertErr = d.marketExpertList(ctx, mustCreds(acc), "agent")
+	}
+	if skip := growSkip("expert_5"); skip != "" {
+		record("expert_5", nil, skip)
+	} else if expertErr != nil || len(experts) == 0 {
 		record("expert_5", errFromBool(false), "expert market unavailable")
 	} else {
 		needed := 5
@@ -1316,8 +1356,8 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 12. Expert team use ×3.
-	if growSkip("Expert_team_use_3") {
-		record("Expert_team_use_3", nil, "skipped: not in the account's task list")
+	if skip := growSkip("Expert_team_use_3"); skip != "" {
+		record("Expert_team_use_3", nil, skip)
 	} else {
 		teams, err := d.marketExpertList(ctx, mustCreds(acc), "team")
 		if err == nil && len(teams) > 0 {
@@ -1344,22 +1384,22 @@ func (d *Driver) RunGrowthPipeline(ctx context.Context, acc *model.Account) ([]g
 	}
 
 	// 13. Expert lighthouse (single expert, LOCAL mode).
-	if growSkip("Expert_lighthouse") {
-		record("Expert_lighthouse", nil, "skipped: not in the account's task list")
+	if skip := growSkip("Expert_lighthouse"); skip != "" {
+		record("Expert_lighthouse", nil, skip)
 	} else if len(experts) > 0 {
 		record("Expert_lighthouse", errFromBool(d.runExpertUse(ctx, acc, experts[0], true)), "lighthouse expert use")
 	}
 
 	// 14. Theme appearance (Hp_Appearance best effort).
-	if growSkip("Hp_Appearance") {
-		record("Hp_Appearance", nil, "skipped: not in the account's task list")
+	if skip := growSkip("Hp_Appearance"); skip != "" {
+		record("Hp_Appearance", nil, skip)
 	} else {
 		record("Hp_Appearance", d.SetAppearanceTheme(ctx, acc, "theme-tkmwj"), "theme applied")
 	}
 
 	// 15. Travel butler.
-	if growSkip("buddy_travel") {
-		record("buddy_travel", nil, "skipped: not in the account's task list")
+	if skip := growSkip("buddy_travel"); skip != "" {
+		record("buddy_travel", nil, skip)
 	} else if note, err := d.TravelButler(ctx, acc); err == nil {
 		record("buddy_travel", nil, note)
 	} else {
