@@ -892,6 +892,10 @@ type geminiFnResult struct {
 	ID       string         `json:"id,omitempty"`
 	Name     string         `json:"name"`
 	Response map[string]any `json:"response"`
+	// Parts (BP-273): tool results can carry images (browser screenshots);
+	// the vendor reads them from inlineData parts nested INSIDE the
+	// functionResponse (CLIProxyAPI be86430518). Empty for text-only results.
+	Parts []geminiPart `json:"parts,omitempty"`
 }
 
 type geminiContent struct {
@@ -1086,9 +1090,18 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 			// translation fills tool_result.tool_use_id from this field, the
 			// same way it fills tool_use.id on the call side. A result with no
 			// id gets one from the synthetic pass below.
+			fnResp := &geminiFnResult{ID: msg.ToolCallID, Name: name, Response: payload}
+			// BP-273: images the client put in the tool result (screenshots)
+			// ride inside the functionResponse — the egress used to read only
+			// text, so the model silently never saw them.
+			for _, p := range msg.Content {
+				if p.Kind == "image" && p.ImageB64 != "" {
+					fnResp.Parts = append(fnResp.Parts, geminiPart{InlineData: &geminiBlob{MIMEType: p.ImageMIME, Data: p.ImageB64}})
+				}
+			}
 			contents = append(contents, geminiContent{
 				Role:  "user",
-				Parts: []geminiPart{{FunctionResp: &geminiFnResult{ID: msg.ToolCallID, Name: name, Response: payload}}},
+				Parts: []geminiPart{{FunctionResp: fnResp}},
 			})
 		}
 	}
@@ -1270,7 +1283,12 @@ func mapFinish(reason string) ir.StopReason {
 		return ir.StopEnd
 	case "MAX_TOKENS":
 		return ir.StopLength
-	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST":
+	// BP-272 (CLIProxyAPI 24b0454811): the vendor's refusal vocabulary also
+	// includes SPII (sensitive personal info), IMAGE_SAFETY and
+	// MALFORMED_RESPONSE; letting them fall to the default read as a quiet
+	// empty success instead of the refusal the vendor meant.
+	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST",
+		"SPII", "IMAGE_SAFETY", "MALFORMED_RESPONSE":
 		return ir.StopContentFilter
 	default:
 		return ir.StopEnd

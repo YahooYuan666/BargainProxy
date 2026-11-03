@@ -1007,7 +1007,15 @@ scan:
 		stop = ir.StopEnd
 	}
 	for _, idx := range toolOrder {
-		out.Message.ToolCalls = append(out.Message.ToolCalls, *toolAcc[idx])
+		acc := toolAcc[idx]
+		// BP-274 (traework2api-panel c5aec914ff): index-only placeholder
+		// entries in parallel tool-call streams must not reach the response —
+		// an empty id/name/arguments tool call makes strict clients fail the
+		// whole round. Real shapes (named but argless, etc.) all stay.
+		if acc.ID == "" && acc.Name == "" && acc.Arguments == "" {
+			continue
+		}
+		out.Message.ToolCalls = append(out.Message.ToolCalls, *acc)
 	}
 	if len(out.Message.ToolCalls) > 0 && stop == ir.StopEnd {
 		stop = ir.StopToolUse

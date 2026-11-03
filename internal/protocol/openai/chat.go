@@ -424,6 +424,12 @@ func RenderCompletion(id, model string, created int64, resp *ir.ChatResponse) *C
 		msg.ReasoningContent = resp.Thinking
 	}
 	for _, tc := range resp.Message.ToolCalls {
+		// BP-274 (traework2api-panel c5aec914ff): a fully-empty tool call is
+		// a parallel-call placeholder — strict clients fail the whole round
+		// on it. Real shapes (named but argless etc.) always stay.
+		if tc.ID == "" && tc.Name == "" && tc.Arguments == "" {
+			continue
+		}
 		var rtc RespToolCall
 		rtc.ID = tc.ID
 		rtc.Type = "function"

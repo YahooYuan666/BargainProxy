@@ -1666,7 +1666,12 @@ function renderAccounts(){
       // user to press 刷新额度 would be telling them to press a button that
       // cannot work, and a bare "—" reads as "we have not looked".
       quota = '<span class="muted" title="该账号用工作站 API Key 登录，上游没有查询额度的接口">上游不提供额度</span>';
-    } else if (a.credits && (a.credits.balance_only || a.credits.total > 0)){
+    } else if (a.credits && (a.credits.balance_only || a.credits.total > 0 || a.credits.bonus > 0 || a.credits.bonus_total > 0)){
+      // BP-275: the bonus pool (Qoder's add-on/org/dedicated packages) must
+      // open this branch too — a plan-empty account living on its packages
+      // used to read "—" here while the KPI card (BP-135 accounting) showed
+      // the same credits correctly. The spendable branch below already
+      // renders 套餐 x/y · 资源包 x/y.
       const expiring = a.credits.expiring ? `（将到期 ${a.credits.expiring}）` : '';
       // BP-116: an unread balance is "未获取", never "0 点". The gateway stores
       // remain=0 when a probe has not run yet (or the upstream's ledger read
