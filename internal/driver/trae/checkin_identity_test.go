@@ -163,8 +163,8 @@ func TestCheckin9074FailsFast(t *testing.T) {
 	if err == nil {
 		t.Fatal("9074 must surface as a failure")
 	}
-	if claims != 1 {
-		t.Fatalf("9074 must fail on the first claim, claims=%d", claims)
+	if claims != 2 {
+		t.Fatalf("9074 gets the account's own claim + ONE client-shape claim, no more (BP-280); claims=%d", claims)
 	}
 	ue, ok := uperr.As(err)
 	if !ok || !strings.Contains(ue.Message, "9074") {

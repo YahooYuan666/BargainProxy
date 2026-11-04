@@ -2560,16 +2560,25 @@ setTimeout(function(){
 
    后台标签页不发请求；只在账号池视图生效；登录遮罩在时跳过。 */
 let silentTimer = null, silentBusy = false;
+// lastPollSig 上一次渲染用的账号+锁池快照签名（BP-278，misakano dd01a52 同病
+// 同修）：renderAccounts 先清空 tbody 再全量重建，行内焦点与悬停每 5 秒抖一次。
+let lastPollSig = '';
 function silentRefresh(){
   if (silentBusy || document.hidden) return;
   if (document.getElementById('loginVeil').classList.contains('on')) return;
   const v = document.getElementById('view-accounts');
   if (!v || v.hidden) return;
   silentBusy = true;
-  api('state').then(st => {
+  // 返回 promise 链：调用方（setInterval）忽略它，测试里 await 它拿确定性。
+  return api('state').then(st => {
+    const accts = st.accounts || [], locks = st.model_locks || [];
+    // 只在载荷真变了才重建三块（账号表/锁池/KPI）。
+    const sig = JSON.stringify([accts, locks]);
+    if (sig === lastPollSig) return;
+    lastPollSig = sig;
     const prev = allAccounts;
-    allAccounts = st.accounts || [];
-    allLocks = st.model_locks || [];
+    allAccounts = accts;
+    allLocks = locks;
     const byChan = {};
     allAccounts.forEach(a => { byChan[a.channel] = (byChan[a.channel]||0)+1; });
     renderKpis(byChan);

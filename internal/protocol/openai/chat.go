@@ -6,6 +6,7 @@ package openai
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"bargainproxy/internal/ir"
@@ -153,7 +154,7 @@ func ParseChatRequest(body []byte) (*ir.ChatRequest, error) {
 		if msg.Role == "developer" {
 			msg.Role = ir.RoleSystem
 		}
-		parts, err := parseContent(m.Role, m.Content)
+		parts, err := parseContent(m.Role, w.Model, m.Content)
 		if err != nil {
 			return nil, err
 		}
@@ -243,7 +244,7 @@ func cacheControlKey(msgs []WireMessage) string {
 	return ""
 }
 
-func parseContent(role string, raw json.RawMessage) ([]ir.ContentPart, error) {
+func parseContent(role, model string, raw json.RawMessage) ([]ir.ContentPart, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
@@ -283,6 +284,13 @@ func parseContent(role string, raw json.RawMessage) ([]ir.ContentPart, error) {
 			if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
 				out = append(out, ir.ContentPart{Kind: "image_url_unsupported", Text: url})
 			}
+		default:
+			// BP-277 (traework2api-panel a45bd4e): blocks the upstreams do not
+			// understand (input_audio etc. — astrbot stuffs QQ voice straight
+			// into content) used to vanish without a word, so a voice-only
+			// message reached Trae as content:null and died as 4001 while the
+			// client believed the model had heard it. Say what was dropped.
+			log.Printf("WARN: openai ingress dropped unsupported content block type %q (role=%s model=%s)", typ, role, model)
 		}
 	}
 	return out, nil

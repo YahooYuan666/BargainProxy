@@ -50,7 +50,7 @@ const (
 	// giftAppVersion is the ZCode app build the billing plane expects (the
 	// plugin pins the same figure; the chat lane's defaultAppVersion 1.0.7
 	// predates it and reads as a different client).
-	giftAppVersion = "3.16.3"
+	giftAppVersion = "3.17.2"
 	giftPlatform   = "win32-x64"
 	giftLanguage   = "zh-CN"
 
@@ -69,8 +69,12 @@ type GiftClaimResult struct {
 	Claimed int
 	Already int
 	Captcha int
-	Failed  int
-	Notes   []string
+	// Ineligible counts code-1004 answers (BP-279): ZCode is not offering
+	// the plan to this account at that moment — it may appear later in the
+	// day, so the day's later task runs retry it. NOT a failure.
+	Ineligible int
+	Failed     int
+	Notes      []string
 }
 
 // giftPlan is one claimable plan id (preview row or banner button), with the
@@ -174,13 +178,24 @@ func (d *Driver) ClaimGiftPlans(ctx context.Context, acc *model.Account) (*GiftC
 		case code == 3007:
 			res.Captcha++
 			res.Notes = append(res.Notes, fmt.Sprintf("captcha required for %s (claim it in the ZCode app)", label))
+		case code == 1004:
+			// BP-279 (plugins 0.1.50, #729): "not eligible for this plan yet" —
+			// ZCode is not offering the plan at that moment; a plan can be
+			// dropped into the feed later in the day (11-04: a GLOBAL BUILD
+			// banner showed 28 minutes after sign-in). Come back later, not a
+			// failure. A whole-pool run of 1004s means the APP VERSION is
+			// stale first (six accounts answered 1004 under 3.16.3 and four
+			// claimed with code 0 under 3.17.2, one night, nothing else
+			// changed) — giftAppVersion tracks that.
+			res.Ineligible++
+			res.Notes = append(res.Notes, fmt.Sprintf("not offered yet for %s (may appear later today)", label))
 		default:
 			res.Failed++
 			res.Notes = append(res.Notes, fmt.Sprintf("failed %s: code %d %s", label, code, msg))
 		}
 	}
-	log.Printf("zcode: gift plans claimed=%d already=%d captcha=%d failed=%d (account=%s)",
-		res.Claimed, res.Already, res.Captcha, res.Failed, acc.ID)
+	log.Printf("zcode: gift plans claimed=%d already=%d captcha=%d ineligible=%d failed=%d (account=%s)",
+		res.Claimed, res.Already, res.Captcha, res.Ineligible, res.Failed, acc.ID)
 	return res, nil
 }
 

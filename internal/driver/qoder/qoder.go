@@ -769,6 +769,9 @@ func (d *Driver) buildChatBody(call driver.ChatCall, rt *runtime, cat *ModelCata
 	b.Business.BeginAt = task.begin
 	b.Business.Name = task.name
 	b.Business.Stage = stage
+	// BP-276 (plugins 0.2.60 #692): the business record also names the model —
+	// the server books billing from it, not from model_config. Same key.
+	b.Business.ModelKey = qoderKey
 	toolsEnabled := applyToolConfig(b, payload)
 	b.Messages = buildQoderMessages(messages, prompt, toolsEnabled)
 	markQoderCache(b.Messages)

@@ -1340,7 +1340,10 @@ func (s *Scheduler) claimGiftZCode(ctx context.Context, acc *model.Account) (str
 	if err != nil {
 		return "zcode gift claim failed: " + err.Error(), err
 	}
-	detail := fmt.Sprintf("claimed %d, already %d, captcha %d, failed %d", res.Claimed, res.Already, res.Captcha, res.Failed)
+	// BP-279: ineligible (code 1004, plan not offered yet) is not a failure —
+	// a plan can be dropped into the feed later in the day, and the day's
+	// later runs retry it naturally. Only real failures make the row red.
+	detail := fmt.Sprintf("claimed %d, already %d, captcha %d, ineligible %d, failed %d", res.Claimed, res.Already, res.Captcha, res.Ineligible, res.Failed)
 	if len(res.Notes) > 0 {
 		detail += " (" + strings.Join(res.Notes, "; ") + ")"
 	}

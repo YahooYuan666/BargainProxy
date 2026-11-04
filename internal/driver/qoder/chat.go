@@ -58,6 +58,12 @@ type business struct {
 	// AgentLifecycle). Omitted (empty) keeps the previous wire shape, so
 	// tests pinning the old body still pass until the aggregation lands.
 	Stage string `json:"stage,omitempty"`
+	// ModelKey names the called model INSIDE the business record (BP-276,
+	// plugins 0.2.60 #692): the official qodercli 1.1.82 sends it and the
+	// server books the call's billing from it — without it Qoder books every
+	// call as Auto whatever model_config named (#638's billing never moved).
+	// Same value as model_config.key; omitted when no catalogue key resolved.
+	ModelKey string `json:"model_key,omitempty"`
 }
 
 // chatRequestBody 网关 chat 请求体（字段顺序对齐官方客户端模板）。

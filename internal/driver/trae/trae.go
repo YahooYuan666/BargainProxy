@@ -492,6 +492,12 @@ func traeEffort(effort string) string {
 	return ""
 }
 
+// nonTextPlaceholder goes out when a message's content was emptied by the
+// ingress dropping unsupported blocks (input_audio etc., BP-277): an empty
+// content array dies at the upstream with 4001 just the same, and a one-line
+// placeholder is more honest than a dead request.
+const nonTextPlaceholder = "[非文本内容已省略]"
+
 func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 	req := call.Request
 	var messages []map[string]any
@@ -522,6 +528,15 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
 					})
 				}
+			}
+			if len(parts) == 0 && m.Role != ir.RoleTool {
+				// BP-277 (traework2api-panel a45bd4e): a message whose blocks
+				// were all unsupported (input_audio etc., dropped at the openai
+				// ingress with a WARN) used to go out as content:null — the
+				// upstream answers 4001 "the param is invalid" for that, and
+				// the client believes the model heard the audio. A placeholder
+				// keeps the request alive and the drop visible in the log.
+				parts = append(parts, map[string]any{"type": "text", "text": nonTextPlaceholder})
 			}
 			wire["content"] = parts
 		}
@@ -1443,6 +1458,29 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 			return true, st.Credits, true, nil
 		}
 		if !retryableCheckinErr(lastErr) {
+			// BP-280 (plugins trae 0.2.29, #709/#722): a 9074 with no local
+			// client gets ONE more claim, in the shape those tools send (body
+			// {}, VSCode UA, uid-derived 15-digit device). A second 9074 is
+			// the day's answer — no retries after it, and the account's own
+			// device identity is never rotated.
+			if ce, ok := lastErr.(*checkinCodeErr); ok && ce.code == 9074 {
+				log.Printf("trae: checkin 9074 on the account's own device; one client-shape claim (account=%s)", acc.ID)
+				if aerr := d.clientShapeClaim(ctx, creds); aerr == nil {
+					back, serr := d.checkinStatus(ctx, creds, acc.ID)
+					switch {
+					case serr != nil:
+						// Same honesty rule as BP-147: the claim itself landed
+						// (code 0), the read-back failed — report success with
+						// the old balance rather than a red row.
+						log.Printf("trae: client-shape claim landed but status re-read failed (account=%s): %v", acc.ID, serr)
+						return true, st.Credits, true, nil
+					case back.CheckedIn:
+						return true, back.Credits, true, nil
+					}
+				} else {
+					log.Printf("trae: client-shape claim refused too (account=%s): %v", acc.ID, aerr)
+				}
+			}
 			return false, 0, false, lastErr
 		}
 		// BP-204 (magpie-community/plugins 644038d): 9074 is NOT the rush
@@ -1512,6 +1550,122 @@ func (d *Driver) claimCheckin(ctx context.Context, creds *Creds) error {
 			// of the retryable set (a 9074 "check in via the app" answers the
 			// same however often it is asked) and out of the pool's failure
 			// scoring (check-in does not ride the chat pool).
+			e := uperr.New(uperr.ClassBadRequest, 200, "trae checkin claim code=%v: %s", env.Code, env.Message)
+			return &checkinCodeErr{ue: e, code: code}
+		}
+	}
+	return nil
+}
+
+// traeMateSeed is the byte stream trae-mate's device_map.rs (MIT) derives its
+// ids from: sha256("<salt>:<uid>" ++ big-endian counter), concatenated,
+// truncated to n bytes (BP-280, plugins trae 0.2.29).
+func traeMateSeed(uid, salt string, n int) []byte {
+	out := make([]byte, 0, n+32)
+	var ctr [4]byte
+	for i := 0; len(out) < n; i++ {
+		ctr[0] = byte(i >> 24)
+		ctr[1] = byte(i >> 16)
+		ctr[2] = byte(i >> 8)
+		ctr[3] = byte(i)
+		h := sha256.New()
+		h.Write([]byte(salt + ":" + uid))
+		h.Write(ctr[:])
+		out = h.Sum(out)
+	}
+	return out[:n]
+}
+
+// traeMateDeviceID is the 15-digit device id made from the uid alone — the
+// identity the no-client check-in tools send (BP-280). Deterministic per uid.
+func traeMateDeviceID(uid string) string {
+	b := traeMateSeed(uid, "devid", 15)
+	digits := make([]byte, 15)
+	for i, v := range b {
+		digits[i] = '0' + v%10
+	}
+	return string(digits)
+}
+
+// traeMateMarketUserID is the UUID-shaped x-market-user-id made from the uid.
+func traeMateMarketUserID(uid string) string {
+	b := traeMateSeed(uid, "market", 16)
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b)
+	return h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32]
+}
+
+// traeMateSessionID is the vscode-sessionid made from the uid.
+func traeMateSessionID(uid string) string {
+	return hex.EncodeToString(traeMateSeed(uid, "sess", 32))
+}
+
+// clientShapeHeaders sets the request family of the tools which check in Trae
+// CN accounts with no local client (BP-280): a VSCode shell UA (no Electron),
+// the market/session trio derived from the uid, the lscbd pair, app-version
+// 0.1.45. Distinct from ugHeaders — this shape is only for the ONE claim a
+// 9074 gets; the account's own device identity is never rotated.
+func clientShapeHeaders(req *http.Request, c *Creds) {
+	uid := c.UID
+	trace := make([]byte, 8)
+	_, _ = rand.Read(trace)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
+	req.Header.Set("Accept-Language", "zh-CN")
+	req.Header.Set("User-Agent", "VSCode 1.107.1 (TRAE SOLO CN)")
+	req.Header.Set("Authorization", "Cloud-IDE-JWT "+c.AccessToken)
+	req.Header.Set("X-Market-Client-Id", "VSCode 1.107.1")
+	req.Header.Set("X-Market-User-Id", traeMateMarketUserID(uid))
+	req.Header.Set("X-User-Region", "CN")
+	req.Header.Set("X-Device-Id", traeMateDeviceID(uid))
+	req.Header.Set("X-Lgw-Req-Sdk-Type", "3")
+	req.Header.Set("Package-Type", "stable_cn")
+	req.Header.Set("X-Lscbd-Aid", "787976")
+	req.Header.Set("X-Lscbd-Platform", "windows")
+	req.Header.Set("App-Version", "0.1.45")
+	req.Header.Set("X-Tt-Trace-Id", "00-"+hex.EncodeToString(trace)+"-01")
+	req.Header.Set("Vscode-Sessionid", traeMateSessionID(uid))
+	reqID := make([]byte, 16)
+	_, _ = rand.Read(reqID)
+	reqID[6] = (reqID[6] & 0x0f) | 0x40
+	reqID[8] = (reqID[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(reqID)
+	req.Header.Set("X-Request-Id", h[0:8]+"-"+h[8:12]+"-"+h[12:16]+"-"+h[16:20]+"-"+h[20:32])
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "no-cors")
+	req.Header.Set("Sec-Fetch-Site", "none")
+}
+
+// clientShapeClaim is the ONE extra claim a 9074 gets (BP-280, plugins trae
+// 0.2.29 #709/#722): the request shape three tools which check in Trae CN
+// accounts with no local client send — body {}, VSCode UA, uid-derived ids.
+// magpie's own claim gets 9074 on accounts those tools check in daily, and
+// none of them retries a 9074: waiting is not what changes it, the shape is.
+// Which field Trae CN wants has not been measured, so the request goes whole,
+// and only once — a second 9074 is the day's answer.
+func (d *Driver) clientShapeClaim(ctx context.Context, creds *Creds) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.ugBase()+"/trae/api/v2/ug/checkin_credits/claim", bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return err
+	}
+	clientShapeHeaders(req, creds)
+	resp, err := d.rpc.Do(req)
+	if err != nil {
+		return uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "trae checkin claim: %v", err)
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return classifyHTTP(resp.StatusCode, raw, "")
+	}
+	var env struct {
+		Code    any    `json:"code"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal(raw, &env) == nil {
+		if code, _, ok := traeBodyCode(env.Code, env.Message); ok {
 			e := uperr.New(uperr.ClassBadRequest, 200, "trae checkin claim code=%v: %s", env.Code, env.Message)
 			return &checkinCodeErr{ue: e, code: code}
 		}

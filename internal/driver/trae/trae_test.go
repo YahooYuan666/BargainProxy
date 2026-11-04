@@ -279,8 +279,8 @@ func TestCheckinClaimBusinessCodeRetriesThenFails(t *testing.T) {
 	if checked {
 		t.Fatal("checkedIn must be false when the claim is rejected")
 	}
-	if claims != 1 {
-		t.Fatalf("claim attempts = %d, want 1 (a refusal is not retryable)", claims)
+	if claims != 2 {
+		t.Fatalf("claim attempts = %d, want 2 (the account's own claim + ONE client-shape claim, BP-280; a refusal is never retried on the own device)", claims)
 	}
 	if !strings.Contains(err.Error(), "9074") {
 		t.Fatalf("error should name the business code: %v", err)
@@ -504,8 +504,8 @@ func TestCheckin9074FailsFastEverywhere(t *testing.T) {
 	if err == nil || checked {
 		t.Fatalf("a 9074 device refusal must fail the task, got checked=%v err=%v", checked, err)
 	}
-	if claims != 1 {
-		t.Fatalf("claim attempts = %d, want 1 (no rush retry)", claims)
+	if claims != 2 {
+		t.Fatalf("claim attempts = %d, want 2 (own device + ONE client-shape, BP-280; no rush retry either way)", claims)
 	}
 	if !strings.Contains(err.Error(), "9074") {
 		t.Fatalf("error should carry the business code: %v", err)

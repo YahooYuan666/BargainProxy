@@ -32,12 +32,12 @@ func TestBP231GiftClaim(t *testing.T) {
 		case giftPreviewPath:
 			// BP-231a: the billing edge rejects the call without the app's
 			// identity family (3001 parameter error behind the ESA edge).
-			if r.URL.Query().Get("app_version") != "3.16.3" || r.URL.Query().Get("platform") != "win32-x64" {
+			if r.URL.Query().Get("app_version") != giftAppVersion || r.URL.Query().Get("platform") != "win32-x64" {
 				t.Errorf("preview query = %q, want app_version+platform", r.URL.RawQuery)
 			}
 			for k, want := range map[string]string{
 				"X-Device-Mid":         dashedDeviceMid,
-				"X-ZCode-App-Version": "3.16.3",
+				"X-ZCode-App-Version": giftAppVersion,
 				"X-Platform":          "win32-x64",
 				"Authorization":       "Bearer tok",
 			} {
