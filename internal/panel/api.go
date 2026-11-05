@@ -207,7 +207,12 @@ func (p *Panel) configView() map[string]any {
 }
 
 func (p *Panel) hotSettingsView() map[string]any {
-	out := map[string]any{"prompt_replace_enabled": true}
+	// BP-281: default OFF. Replacing the caller's system prompt deletes the
+	// agent's identity, tool discipline and output format, and that loss is
+	// invisible in casual conversation — it only shows up when the model
+	// forgets a rule it was given. Off means passthrough: the caller's text
+	// arrives intact.
+	out := map[string]any{"prompt_replace_enabled": false}
 	if v, ok, _ := p.store.GetSetting(KeyGreedyFloorSecs); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			out["greedy_floor_seconds"] = n

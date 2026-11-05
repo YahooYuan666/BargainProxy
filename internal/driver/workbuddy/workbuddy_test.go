@@ -495,11 +495,92 @@ func TestPromptReplaceHotSwitch(t *testing.T) {
 		t.Fatalf("replacement on: first message = %v", first)
 	}
 
+	// BP-281: with the switch off the caller's own system prompt must arrive
+	// intact. It used to be stripped, which dropped the agent's identity, tool
+	// rules and output format in BOTH switch positions — off was strictly
+	// worse than on, because not even a placeholder survived.
 	d.SetPromptReplaceEnabled(false)
 	msgs = run(d)
-	for _, m := range msgs {
-		if m.(map[string]any)["role"] == "system" {
-			t.Fatalf("replacement off must strip system messages, got %v", msgs)
-		}
+	if len(msgs) != 2 {
+		t.Fatalf("replacement off must forward the caller's messages, got %v", msgs)
+	}
+	if got := msgs[0].(map[string]any); got["role"] != "system" || got["content"] != "client system prompt" {
+		t.Fatalf("replacement off must keep the caller's system text verbatim, got %v", got)
+	}
+}
+
+// TestPromptModePassthroughIsVerbatim pins BP-281: passthrough forwards the
+// caller's messages untouched instead of deleting the system prompt. The
+// channel check does require a leading system message, so a request that has
+// one keeps it byte-for-byte; a request that has none gets one line prepended.
+func TestPromptModePassthroughIsVerbatim(t *testing.T) {
+	var gotBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer upstream.Close()
+
+	const clientSystem = "You are ZCode. Never invent file paths. Answer in the user's language."
+	call := driver.ChatCall{
+		Account:       testAccount(),
+		UpstreamModel: "glm-5.3",
+		Request: &ir.ChatRequest{
+			Model: "glm-5.3",
+			Messages: []ir.Message{
+				{Role: ir.RoleSystem, Content: []ir.ContentPart{{Kind: "text", Text: clientSystem}}},
+				{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}},
+			},
+		},
+	}
+
+	d := testDriver(upstream.URL)
+	d.cfg.PromptMode = "passthrough"
+	if _, err := d.Stream(context.Background(), call, func(ev ir.StreamEvent) error { return nil }); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	msgs := gotBody["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("passthrough must not add or drop messages, got %v", msgs)
+	}
+	if got := msgs[0].(map[string]any); got["content"] != clientSystem {
+		t.Fatalf("passthrough dropped the caller's system prompt: %v", got)
+	}
+}
+
+// TestPromptModePassthroughFillsMissingSystem pins the other half of BP-281:
+// the channel check refuses a request whose first message is not a system
+// prompt, so passthrough must fill one in rather than forward as-is.
+func TestPromptModePassthroughFillsMissingSystem(t *testing.T) {
+	var gotBody map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"x"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer upstream.Close()
+
+	call := driver.ChatCall{
+		Account:       testAccount(),
+		UpstreamModel: "glm-5.3",
+		Request: &ir.ChatRequest{
+			Model: "glm-5.3",
+			Messages: []ir.Message{
+				{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}},
+			},
+		},
+	}
+	d := testDriver(upstream.URL)
+	d.cfg.PromptMode = "passthrough"
+	if _, err := d.Stream(context.Background(), call, func(ev ir.StreamEvent) error { return nil }); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	msgs := gotBody["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("want a system line prepended, got %v", msgs)
+	}
+	if first := msgs[0].(map[string]any); first["role"] != "system" {
+		t.Fatalf("first message role = %v, want system", first["role"])
 	}
 }

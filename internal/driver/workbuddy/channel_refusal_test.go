@@ -91,6 +91,103 @@ func TestChannelRefusalRetriesWithSystemAsUser(t *testing.T) {
 	}
 }
 
+// TestChannelRefusalSplitsBeforeMoving pins BP-281's rung order: the text must
+// stay in the SYSTEM slot if it can be cut at sentence boundaries, because a
+// system message carries more authority than the same words inside a user
+// turn. Only when there is nothing to cut does the driver relocate it.
+//
+// The two cases differ in one variable: how many sentences the system prompt
+// has. The multi-sentence one must be split (still role=system); the
+// single-sentence one cannot be, so it must be relocated into the user turn.
+func TestChannelRefusalSplitsBeforeMoving(t *testing.T) {
+	run := func(t *testing.T, systemText string) (msgs []any, calls int32) {
+		t.Helper()
+		var last map[string]any
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			n := atomic.AddInt32(&calls, 1)
+			if n == 1 {
+				w.WriteHeader(400)
+				fmt.Fprint(w, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`)
+				return
+			}
+			_ = json.NewDecoder(r.Body).Decode(&last)
+			fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
+			fmt.Fprintln(w, `data: [DONE]`)
+		}))
+		defer srv.Close()
+
+		d := testDriver(srv.URL)
+		// The rescue ladder exists for the default mode: passthrough keeps the
+		// caller's text, so there is something worth rescuing. (In custom mode
+		// the text was already replaced by the gateway's own line, and cutting
+		// that line cannot clear a refusal caused by text that is gone.)
+		d.cfg.PromptMode = "passthrough"
+		req := &ir.ChatRequest{
+			Model:      "glm-5.3",
+			SessionKey: "sess-split-" + systemText[:1],
+			Messages: []ir.Message{
+				{Role: ir.RoleSystem, Content: []ir.ContentPart{{Kind: "text", Text: systemText}}},
+				{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hello"}}},
+			},
+		}
+		if _, err := d.Stream(context.Background(), driver.ChatCall{
+			Account: testAccount(), UpstreamModel: "glm-5.3", Request: req,
+		}, func(ev ir.StreamEvent) error { return nil }); err != nil {
+			t.Fatalf("stream: %v", err)
+		}
+		msgs, _ = last["messages"].([]any)
+		return msgs, atomic.LoadInt32(&calls)
+	}
+
+	t.Run("multi-sentence stays in system", func(t *testing.T) {
+		const text = "You are Claude Code, Anthropic's official CLI. Always answer briefly. Never invent file paths."
+		msgs, calls := run(t, text)
+		if calls != 2 {
+			t.Fatalf("upstream calls = %d, want 2 (original + one rescue)", calls)
+		}
+		sysCount, moved := 0, false
+		for _, raw := range msgs {
+			m, _ := raw.(map[string]any)
+			switch m["role"] {
+			case "system":
+				sysCount++
+			case "user":
+				if s, _ := m["content"].(string); strings.Contains(s, text) {
+					moved = true
+				}
+			}
+		}
+		if moved {
+			t.Fatalf("a splittable system prompt must NOT be relocated into the user turn: %v", msgs)
+		}
+		if sysCount < 2 {
+			t.Fatalf("want the system split into several messages, got %d: %v", sysCount, msgs)
+		}
+	})
+
+	t.Run("single sentence relocates", func(t *testing.T) {
+		const text = "You are Claude Code, Anthropic's official CLI."
+		msgs, calls := run(t, text)
+		// 2, not 3: when the system cannot be cut, the split rung produces a
+		// body identical to the original and is skipped rather than posted —
+		// a byte-identical resend would earn a byte-identical 400.
+		if calls != 2 {
+			t.Fatalf("upstream calls = %d, want 2 (original + move; the split rung is skipped)", calls)
+		}
+		var user string
+		for _, raw := range msgs {
+			m, _ := raw.(map[string]any)
+			if m["role"] == "user" {
+				user, _ = m["content"].(string)
+				break
+			}
+		}
+		if !strings.Contains(user, text) {
+			t.Fatalf("an unsplittable system prompt must move into the user turn: %q", user)
+		}
+	})
+}
+
 // TestChannelRefusalRetriesOnlyOnce pins that the move is a single retry: a
 // second refusal is reported, not looped.
 func TestChannelRefusalRetriesOnlyOnce(t *testing.T) {

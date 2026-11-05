@@ -167,13 +167,28 @@ type AntigravitySettings struct {
 }
 
 // WorkBuddySettings configures the Tencent CodeBuddy channel.
+// DefaultPromptMode is what the workbuddy channel does with the caller's
+// system prompt when nothing else is configured: forward it untouched.
+const DefaultPromptMode = "passthrough"
+
 type WorkBuddySettings struct {
 	Enabled     bool   `json:"enabled"`
 	ChatBaseCN  string `json:"chat_base_cn"`  // default https://www.workbuddy.cn (BP-130: the official desktop client's primary CN endpoint; copilot.tencent.com is only the fallback)
 	ChatBaseGL  string `json:"chat_base_gl"`  // default https://www.workbuddy.ai
 	WebBaseCN   string `json:"web_base_cn"`   // default https://www.workbuddy.cn (growth claim / web events)
 	MaxInFlight int    `json:"max_in_flight"` // default 2
-	PromptMode  string `json:"prompt_mode"`   // "custom" | "passthrough"
+	// PromptMode decides what happens to the caller's system prompt:
+	//   passthrough (default) — forwarded untouched; only a missing leading
+	//                           system message is filled in, because the
+	//                           channel check refuses a request whose first
+	//                           message is not a system prompt.
+	//   custom                — replaced by the gateway's neutral line; the
+	//                           caller's text is DROPPED.
+	//   append                — gateway line added, caller's text kept.
+	// The default is passthrough, matching upstream: replacing the system
+	// prompt throws away the agent's identity, tool discipline and output
+	// format, and that loss is invisible in casual conversation.
+	PromptMode string `json:"prompt_mode"` // "passthrough" | "custom" | "append"
 	// DisableClientFingerprint turns off the official-client header family on
 	// chat requests. Default false: the edge applies channel/risk-control
 	// checks, and bare requests are what upstream later flags as abnormal
@@ -304,10 +319,10 @@ type OpenAICompatSettings struct {
 // OpenCodeZenSettings configures the OpenCode Zen anonymous free-model
 // channel (BP-54). Enabled flips the whole feature: driver registration,
 // directory sync and the panel page read this switch.
-	type OpenCodeZenSettings struct {
-		Enabled bool   `json:"enabled"`
-		BaseURL string `json:"base_url"` // default https://opencode.ai/inference/openai/v1 (tests override, BP-264)
-	}
+type OpenCodeZenSettings struct {
+	Enabled bool   `json:"enabled"`
+	BaseURL string `json:"base_url"` // default https://opencode.ai/inference/openai/v1 (tests override, BP-264)
+}
 
 // LobsterSettings configures the NetEase Youdao LobsterAI (有道龙虾) channel
 // (BP-98). It is an unofficial channel: the endpoints below belong to the
@@ -393,7 +408,11 @@ func Default() *Config {
 				ChatBaseGL:  "https://www.workbuddy.ai",
 				WebBaseCN:   "https://www.workbuddy.cn",
 				MaxInFlight: 2,
-				PromptMode:  "custom",
+				// passthrough, not custom: replacing the caller's system
+				// prompt silently deletes the agent's identity, tool rules
+				// and output format (see WorkBuddySettings.PromptMode).
+				// Upstream defaults the same way.
+				PromptMode: DefaultPromptMode,
 			},
 			Trae: TraeSettings{
 				Enabled:     true,
@@ -417,10 +436,10 @@ func Default() *Config {
 				OpenBase:    "https://openapi.qoder.com.cn",
 				MaxInFlight: 1,
 			},
-					OpenCodeZen: OpenCodeZenSettings{
-						Enabled: false,
-						BaseURL: "https://opencode.ai/inference/openai/v1",
-					},
+			OpenCodeZen: OpenCodeZenSettings{
+				Enabled: false,
+				BaseURL: "https://opencode.ai/inference/openai/v1",
+			},
 			Lobster: LobsterSettings{
 				// Enabled by default so the panel offers the login flow; the
 				// channel takes no traffic until a model binding is added, so
@@ -434,7 +453,7 @@ func Default() *Config {
 			},
 		},
 		MaxQueueWait: Duration(120 * time.Second),
-			FallbackWait: Duration(60 * time.Second),
+		FallbackWait: Duration(60 * time.Second),
 		// BP-115: 90s → 30s. The window is spent per binding, so a five-pool
 		// cascade could hold a client for 7.5 minutes before the first byte.
 		// 30s bounded that at 2.5 min, but it also cancelled requests that

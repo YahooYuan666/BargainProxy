@@ -579,7 +579,7 @@ tr:last-child td{border-bottom:none}
           </div>
           <div class="row">
             <label class="chk"><input type="checkbox" id="setPromptReplace" style="width:auto"> 提示词替换（WorkBuddy）</label>
-            <span class="hint">开启后发往 CodeBuddy 的系统提示词替换为官方 CLI 指纹，降低风控暴露面。</span>
+            <span class="hint"><b>开启 = 丢弃客户端的系统提示词</b>，换成网关的一句中性话（「You are a helpful AI assistant」）。客户端的工具纪律、输出格式、人设、可视化目录、memory 字段等全部失效。关闭 = 原样转发，只在首条不是 system 时补一行（上游渠道校验要求）。<b>默认关闭。</b></span>
           </div>
           <div class="row">
             <label class="chk"><input type="checkbox" id="setWbGlobal" style="width:auto"> WorkBuddy 国际版账号参与调度</label>

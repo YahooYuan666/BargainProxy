@@ -276,6 +276,19 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 					resp, err = r2, nil
 				}
 			}
+			// Rung 1 before rung 2 (upstream e4dd458c): cutting the text at
+			// sentence boundaries keeps it in the system slot, so the agent's
+			// instructions keep system-level priority. Only when there is
+			// nothing to cut does the text move into the user turn, which
+			// weakens its standing.
+			if err != nil {
+				if sb, berr := d.buildBodyOpts(call, creds, bodyOpts{splitSystem: true}); berr == nil && !bytes.Equal(sb, body) {
+					log.Printf("workbuddy: 11128 channel refusal; resending with the system split at sentence boundaries")
+					if r2, jerr := d.postChat(ctx, creds, call, sb, chatCompletionsPath); jerr == nil {
+						resp, err = r2, nil
+					}
+				}
+			}
 			if err != nil {
 				moved, berr := d.buildBody(call, creds, true)
 				if berr == nil {
@@ -381,6 +394,7 @@ func (d *Driver) buildBody(call driver.ChatCall, creds *Creds, systemAsUser bool
 // bodyOpts carries the buildBody variants the retry paths need.
 type bodyOpts struct {
 	systemAsUser bool
+	splitSystem  bool // 11128 rung 1: cut the system at sentence boundaries
 	commaOpeners bool // BP-227: set the opener comma regardless of the cache
 }
 
@@ -468,17 +482,48 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 
 	mode := strings.ToLower(d.cfg.PromptMode)
 	if mode == "" {
-		mode = "custom"
+		mode = "passthrough"
 	}
-	if opts.systemAsUser {
+	replacedCallerSystem := false
+	switch {
+	case opts.systemAsUser:
 		// The retry must carry the caller's OWN system text, moved — not the
 		// replaced or stripped version — or the agent's instructions are lost
 		// and the model behaves like a different agent (BP-93).
 		messages = moveSystemToUser(messages)
-	} else if mode == "custom" && d.promptReplace.Load() {
+	case mode == "custom" && d.promptReplace.Load():
+		// Explicit opt-in: the gateway owns the system slot and the caller's
+		// text is dropped. Off by default — see config.DefaultPromptMode.
 		messages = prompt.ReplaceSystem(messages, prompt.DefaultSystemPrompt)
-	} else {
-		messages = prompt.StripSystem(messages)
+		replacedCallerSystem = true
+	case mode == "append":
+		// Gateway line plus the caller's own text, both applied.
+		messages = prompt.Append(messages, prompt.DefaultSystemPrompt)
+		messages = prompt.EnsureSystemFirst(messages, prompt.DegradedSystemPrompt)
+	default:
+		// passthrough (and custom with the replacement switch off): forward
+		// the caller's messages untouched. The only edit is guaranteeing a
+		// system message leads, which the channel check demands outright —
+		// without it a client that sends no system is refused on every call
+		// (misakano #231).
+		messages = prompt.EnsureSystemFirst(messages, prompt.DegradedSystemPrompt)
+	}
+	if opts.splitSystem && !replacedCallerSystem {
+		// 11128 rung 1, applied ON TOP of whatever the mode produced: same
+		// text, same channel, cut at sentence boundaries so the edge's
+		// continuous-run match fails. Nothing is lost and the instruction
+		// priority stays that of a system message. When there is nothing to
+		// cut the body is left as the mode built it and the next rung (move
+		// into the user turn) takes over — one relocation implementation,
+		// not two.
+		//
+		// Skipped when custom mode already swapped the caller's text out for
+		// the gateway's own line: splitting that line cannot clear a refusal
+		// caused by text that is no longer in the request, and it would burn
+		// a round trip.
+		if split, ok := prompt.SplitSystem(messages); ok {
+			messages = split
+		}
 	}
 	// BP-227: a system whose opener line the 11128 check already refused
 	// gets the comma set BEFORE the first byte — the cache spares later
