@@ -206,12 +206,25 @@ func soloHeaders(req *http.Request, c *Creds, stream bool) {
 	}
 }
 
-// ugHeaders sets the checkin/usage header set. It must read as the IDE's
+// ugHeaders sets the check-in header set. It must read as the IDE's
 // growth page: an Electron-shell User-Agent (Bun/script-shaped UAs are
 // answered 9074 no matter how seldom the check-in is asked —
-// yetone/magpie#808) and the account's device id in the 16-digit shape
-// Trae CN takes (magpie-community/plugins#194).
+// yetone/magpie#808) and the account's device id mapped onto the
+// 15-digit shape the claim accepts (BP-288, plugins 0.2.30 #709).
 func ugHeaders(req *http.Request, c *Creds) {
+	ugHeadersMode(req, c, true)
+}
+
+// ugProbeHeaders is the header set for UG READS (the credits/quota probe):
+// everything as the check-in pages, but the device id rides the STORED
+// identity — 0.2.30 measured the 15-digit mapping only on the claim (and
+// its status pre-read); the usage read kept the signed-in device, and
+// nothing measured says the read wants another shape there (BP-288).
+func ugProbeHeaders(req *http.Request, c *Creds) {
+	ugHeadersMode(req, c, false)
+}
+
+func ugHeadersMode(req *http.Request, c *Creds, mapDevice bool) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", ugUserAgent)
@@ -226,7 +239,11 @@ func ugHeaders(req *http.Request, c *Creds) {
 	req.Header.Set("X-Lscbd-Platform", "windows")
 	req.Header.Set("X-SS-DP", "787976")
 	req.Header.Set("App-Version", ideVersion)
-	if id := ugDeviceID(c.DeviceID, c.UID); id != "" {
+	id := c.DeviceID
+	if mapDevice {
+		id = ugDeviceID(c.DeviceID, c.UID)
+	}
+	if id != "" {
 		req.Header.Set("X-Device-Id", id)
 	}
 }
@@ -236,15 +253,22 @@ func ugHeaders(req *http.Request, c *Creds) {
 const ugUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TRAE-SOLO-CN/0.1.69 Chrome/120.0.6099.291 Electron/28.2.10 Safari/537.36"
 
 // ugDeviceID maps the stored device id onto the shape Trae CN's growth
-// pages accept: an id already in the clients' shape (15–16 digits) passes
-// through; anything else (19 digits from older logins, or nothing at all)
-// is mapped onto a stable 16-digit id derived from the device id and uid.
-// It is the account's own device in the accepted shape — never rotated,
-// never another account's — so a 9095 ("this device is in for today") on
-// it stays the day's answer (magpie 0.2.19 ugDevice, plugins#194).
+// pages accept — 15 digits since 2026-11-05 (plugins trae 0.2.30, #709):
+// a seconds-apart bisect on three accounts, two machines and two ISPs
+// answered the account's own 16-digit id 9074 while a 15-digit one, even
+// a random unregistered one, was taken — the 0.2.19 reading ("19 refused,
+// 16 taken", plugins#194) was a server-side change away. An id already 15
+// digits passes through; anything else (16 digits from current clients,
+// 19 digits from older logins, or nothing at all) is mapped onto a stable
+// 15-digit id derived from the device id and uid, the same mapping
+// magpie 0.2.30 ships. It is the account's own device in the accepted
+// shape — never rotated, never another account's — so a 9095 ("this
+// device is in for today") on it stays the day's answer. Chat pages and
+// renewals keep the device the account signed in with; only this UG
+// claim shape is mapped.
 func ugDeviceID(deviceID, uid string) string {
 	id := deviceID
-	if len(id) == 15 || len(id) == 16 {
+	if len(id) == 15 {
 		digitsOnly := true
 		for _, c := range id {
 			if c < '0' || c > '9' {
@@ -265,7 +289,27 @@ func ugDeviceID(deviceID, uid string) string {
 	if n == nil {
 		return ""
 	}
-	// 1e15 + (n mod 9e15): a 16-digit number, first digit 1-9.
+	// 1e14 + (n mod 9e13): a 15-digit number whose first digit is never 0
+	// (a leading 0 would make it 14 digits as a number — 0.2.30 ugDevice).
+	n.Mod(n, big.NewInt(90_000_000_000_000))
+	n.Add(n, big.NewInt(100_000_000_000_000))
+	return n.String()
+}
+
+// deriveNumber16 is the STORED numeric identity fallback (BP-210's
+// no-client path): a stable 16-digit number from the seed alone. It does
+// NOT follow ugDeviceID's 15-digit check-in shape — 0.2.30 measured only
+// the UG claim's x-device-id, and the device/machine identities riding
+// chat pages are never rotated ("chat requests and renewals keep the
+// device it signed in with"); the UG claim maps the stored id to 15
+// digits per request via ugDeviceID (BP-288).
+func deriveNumber16(seed string) string {
+	sum := sha256.Sum256([]byte("trae-cn-device\x00\x00" + seed))
+	hexv := hex.EncodeToString(sum[:])[:30]
+	n, _ := new(big.Int).SetString(hexv, 16)
+	if n == nil {
+		return ""
+	}
 	n.Mod(n, big.NewInt(9_000_000_000_000_000))
 	n.Add(n, big.NewInt(1_000_000_000_000_000))
 	return n.String()
@@ -1739,7 +1783,9 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	if err != nil {
 		return nil, err
 	}
-	ugHeaders(req, creds)
+	// BP-288: a READ keeps the stored device — the 15-digit mapping is
+	// measured for the claim chain only (plugins 0.2.30).
+	ugProbeHeaders(req, creds)
 	resp, err := d.rpc.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "trae usage: %v", err)
@@ -2015,7 +2061,7 @@ func backfillTraeDevice(acc *model.Account) error {
 		if creds.DeviceID != real {
 			creds.DeviceID = real
 			if creds.MachineID == "" {
-				creds.MachineID = ugDeviceID("", creds.UID+"-machine")
+				creds.MachineID = deriveNumber16(creds.UID + "-machine")
 			}
 			raw, err := json.Marshal(creds)
 			if err != nil {
@@ -2030,8 +2076,8 @@ func backfillTraeDevice(acc *model.Account) error {
 	if creds.DeviceID != "" {
 		return nil
 	}
-	creds.DeviceID = ugDeviceID("", creds.UID)
-	creds.MachineID = ugDeviceID("", creds.UID+"-machine")
+	creds.DeviceID = deriveNumber16(creds.UID)
+	creds.MachineID = deriveNumber16(creds.UID + "-machine")
 	raw, err := json.Marshal(creds)
 	if err != nil {
 		return nil

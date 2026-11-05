@@ -1898,8 +1898,31 @@ func probeCreditsFromDoc(doc map[string]any) *driver.ProbeResult {
 		bonusTotal += dedicatedTotal
 		note += fmt.Sprintf(", dedicated %d", dedicated)
 	}
+	// BP-290 (qhub #141): the INTL plan's SOTA-dedicated pool is its own
+	// bucket, not part of plan/add-on. The key drifted across quota endpoint
+	// generations (sotaCredits / sota / sotaQuota / sotaSpecial), the value
+	// itself as a bare number or a {remaining,total} map; the first key
+	// PRESENT wins (present-and-0 is a real "pool exhausted", absent means
+	// the account has no such pool — CN accounts never do).
+	sota, sotaTotal := int64(0), int64(0)
+	for _, key := range []string{"sotaCredits", "sota", "sotaQuota", "sotaSpecial"} {
+		v, ok := doc[key]
+		if !ok {
+			continue
+		}
+		if m, ok := v.(map[string]any); ok {
+			sota, sotaTotal = toInt64(m["remaining"]), toInt64(m["total"])
+		} else {
+			sota = toInt64(v)
+		}
+		break
+	}
+	if sota != 0 || sotaTotal != 0 {
+		note += fmt.Sprintf(", sota %d", sota)
+	}
 	return &driver.ProbeResult{Credits: &model.Credits{
-		Remain: remain, Total: total, Bonus: bonus, BonusTotal: bonusTotal, UpdatedAt: time.Now(),
+		Remain: remain, Total: total, Bonus: bonus, BonusTotal: bonusTotal,
+		Sota: sota, SotaTotal: sotaTotal, UpdatedAt: time.Now(),
 	}, Note: note}
 }
 

@@ -503,8 +503,12 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 				Content      geminiContent `json:"content"`
 				FinishReason string        `json:"finishReason"`
 			} `json:"candidates"`
-			UsageMetadata  *geminiUsage    `json:"usageMetadata"`
-			PromptFeedback *promptFeedback `json:"promptFeedback"`
+			UsageMetadata *geminiUsage `json:"usageMetadata"`
+			// BP-291 (CLIProxyAPI be69162): some antigravity builds carry the
+			// usage under cpaUsageMetadata instead of usageMetadata — read it
+			// as a fallback so those frames don't book as "no usage reported".
+			CpaUsageMetadata *geminiUsage    `json:"cpaUsageMetadata"`
+			PromptFeedback   *promptFeedback `json:"promptFeedback"`
 		}
 		if err := json.Unmarshal([]byte(payload), &frame); err != nil {
 			continue // tolerate unknown frames
@@ -519,6 +523,15 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 			if frame.PromptFeedback != nil {
 				gr.PromptFeedback = frame.PromptFeedback
 			}
+		}
+		// BP-291: usageMetadata absent → the cpaUsageMetadata shape is the
+		// same evidence from builds that rename it (wrapped form first, then
+		// the unwrapped top level).
+		if gr.UsageMetadata == nil {
+			gr.UsageMetadata = gr.CpaUsageMetadata
+		}
+		if gr.UsageMetadata == nil && frame.CpaUsageMetadata != nil {
+			gr.UsageMetadata = frame.CpaUsageMetadata
 		}
 		// BP-155: a safety block arrives as promptFeedback.blockReason with NO
 		// candidates and NO error object. The old path read the clean stream
@@ -919,9 +932,10 @@ type geminiUsage struct {
 }
 
 type geminiResponse struct {
-	Candidates     []geminiCandidate `json:"candidates"`
-	UsageMetadata  *geminiUsage      `json:"usageMetadata"`
-	PromptFeedback *promptFeedback   `json:"promptFeedback"`
+	Candidates       []geminiCandidate `json:"candidates"`
+	UsageMetadata    *geminiUsage      `json:"usageMetadata"`
+	CpaUsageMetadata *geminiUsage      `json:"cpaUsageMetadata"` // BP-291 fallback shape
+	PromptFeedback   *promptFeedback   `json:"promptFeedback"`
 }
 
 // promptFeedback is Google's pre-candidate safety verdict (BP-155).
@@ -950,6 +964,63 @@ type v1InternalRequest struct {
 // replays). A call without an id gets a synthetic one; a result without an id
 // is paired to the most recent unanswered call OF THE SAME NAME (FIFO) — the
 // same closed-form strategy the reference uses, no cross-request state.
+// continueTurnText is what a user turn put after a trailing model turn
+// says: go on from there (gcp-ai 0.2.1's CONTINUE_TEXT).
+const continueTurnText = "Continue."
+
+// leadingModelTurnText opens the user turn a leading model turn needs
+// (gcp-ai 0.2.1's LEADING_USER_TEXT).
+const leadingModelTurnText = "[Continuing from previous AI thoughts...]"
+
+// hardenGeminiContents reshapes the outbound conversation into the history
+// shapes Gemini/Vertex accepts (BP-289, plugins gcp-ai 5112465 #734):
+//
+//  1. a user turn holding both a functionResponse and the user's own parts
+//     is split — responses first, the user's parts in a user turn of their
+//     own after them;
+//  2. a conversation OPENING with the model's turn gets a user turn before
+//     it;
+//  3. a conversation ENDING with the model's turn gets a user turn after
+//     it (the compaction-prompt sniffing upstream also does is magpie's own
+//     compact flow; a plain "Continue." serves every case here).
+//
+// Order matters: the split runs first so the leading/trailing checks read
+// the turns that actually go out. A conversation that already fits the
+// rules is returned byte-identical.
+func hardenGeminiContents(contents []geminiContent) []geminiContent {
+	if len(contents) == 0 {
+		return contents
+	}
+	out := make([]geminiContent, 0, len(contents)+2)
+	for _, turn := range contents {
+		if turn.Role != "user" || len(turn.Parts) < 2 {
+			out = append(out, turn)
+			continue
+		}
+		var resp, own []geminiPart
+		for _, p := range turn.Parts {
+			if p.FunctionResp != nil {
+				resp = append(resp, p)
+			} else {
+				own = append(own, p)
+			}
+		}
+		if len(resp) > 0 && len(own) > 0 {
+			out = append(out, geminiContent{Role: "user", Parts: resp})
+			out = append(out, geminiContent{Role: "user", Parts: own})
+			continue
+		}
+		out = append(out, turn)
+	}
+	if out[0].Role == "model" {
+		out = append([]geminiContent{{Role: "user", Parts: []geminiPart{{Text: leadingModelTurnText}}}}, out...)
+	}
+	if out[len(out)-1].Role == "model" {
+		out = append(out, geminiContent{Role: "user", Parts: []geminiPart{{Text: continueTurnText}}})
+	}
+	return out
+}
+
 func ensureAntigravityToolIDs(contents []geminiContent) {
 	// Pass 1: every call carries an id (synthetic when the history lost it).
 	for ci := range contents {
@@ -1105,6 +1176,16 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 			})
 		}
 	}
+	// BP-289 (gcp-ai 0.2.1, plugins#734): Gemini/Vertex answers three history
+	// shapes with a bare 400 — a conversation ENDING with the model's turn
+	// ("Requests ending with a model turn are not supported"), one OPENING
+	// with it ("function call turn comes immediately after a user turn"),
+	// and a user turn holding a functionResponse AND the user's own text
+	// (the upstream takes those as separate turns and reports the same
+	// 400). Current clients never produce them; open-ended clients (astrbot
+	// family, prefill-style history) do. The rules are conditional, so
+	// normal conversations marshal byte-identical.
+	contents = hardenGeminiContents(contents)
 	ensureAntigravityToolIDs(contents)
 	// BP-257: ALL declarations go into ONE tools element.
 	//

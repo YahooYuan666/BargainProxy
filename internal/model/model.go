@@ -94,7 +94,14 @@ type Credits struct {
 	// "另有加赠 382", which never shows how much of the pack has been burned
 	// nor how big a fresh pack is — so "did a new pack land?" was unanswerable
 	// (BP-122).
-	BonusTotal        int64     `json:"bonus_total,omitempty"`
+	BonusTotal int64 `json:"bonus_total,omitempty"`
+	// Sota is the INTL plan's SOTA-dedicated pool (BP-290, qhub #141): a
+	// separate spendable bucket Qoder reports alongside plan/add-on credits
+	// under several key shapes (sotaCredits / sota / sotaQuota / sotaSpecial).
+	// CN accounts have no such pool and read 0. It is its own display bucket,
+	// not folded into Bonus — the panel shows it as its own remain/total.
+	Sota              int64     `json:"sota,omitempty"`
+	SotaTotal         int64     `json:"sota_total,omitempty"`
 	EarliestExpiresAt time.Time `json:"earliest_expires_at,omitempty"` // earliest future expiry among positive packs
 	EarliestRemaining int64     `json:"earliest_remaining,omitempty"`
 	UpdatedAt         time.Time `json:"updated_at"`
@@ -134,7 +141,9 @@ func (c Credits) Spendable() int64 {
 	if c.BalanceOnly {
 		return c.Remain
 	}
-	return c.Remain + c.Bonus
+	// Sota rides along (BP-290): it is spendable credit the account owns,
+	// just earmarked for the SOTA models.
+	return c.Remain + c.Bonus + c.Sota
 }
 
 // CostObservation records the observed billing tier for one (account, model)

@@ -50,11 +50,15 @@ func TestBP229SOLOHeadersMatchTheRealClient(t *testing.T) {
 	}
 }
 
-// The UG chain gains the CN package family; region/device stay as the 9074
-// fix requires.
+// The UG chain gains the CN package family; region stays CN and the device
+// rides the 15-digit check-in shape mapped from the stored id (BP-288,
+// plugins 0.2.30 #709: 16 digits are answered 9074 since 2026-11-05).
 func TestBP229UGHeadersCarryCNFamily(t *testing.T) {
 	req, _ := http.NewRequest("POST", "https://api.trae.cn/ug", nil)
 	ugHeaders(req, &Creds{AccessToken: "jwt", DeviceID: "1234567890123456"})
+	if got := req.Header.Get("X-Device-Id"); len(got) != 15 || got == "1234567890123456" {
+		t.Fatalf("X-Device-Id = %q, want the mapped 15-digit shape", got)
+	}
 	for k, want := range map[string]string{
 		"Package-Type":     "stable_cn",
 		"X-Lscbd-Aid":      "787976",
@@ -62,7 +66,6 @@ func TestBP229UGHeadersCarryCNFamily(t *testing.T) {
 		"X-SS-DP":          "787976",
 		"App-Version":      "3.4.11",
 		"X-User-Region":    "CN",
-		"X-Device-Id":      "1234567890123456",
 	} {
 		if got := req.Header.Get(k); got != want {
 			t.Fatalf("%s = %q, want %q", k, got, want)

@@ -19,38 +19,47 @@ import (
 // TRAE-2 red-first tests (BP-98): the check-in must go out looking like the
 // IDE's growth page, or Trae CN answers 9074 no matter how seldom it is
 // asked (yetone/magpie#808): Electron-shell UA, the device id, and
-// {req_source: 1} instead of {}. The device id itself must be 16 digits
-// (magpie-community/plugins#194: a 19-digit id is answered 9074 where the
-// same account on a 16-digit one is taken).
+// {req_source: 1} instead of {}. Since 2026-11-05 the claim's device id
+// itself must be 15 DIGITS (BP-288, plugins trae 0.2.30 #709 bisect: the
+// account's own 16-digit id is answered 9074 where a 15-digit one is
+// taken, seconds apart).
 
-// TestUgHeadersCarryDesktopIdentity: ugHeaders sends the Electron UA and the
-// device id when the account has one.
+// TestUgHeadersCarryDesktopIdentity: ugHeaders sends the Electron UA and a
+// check-in device id in the 15-digit shape, mapped from the stored one.
 func TestUgHeadersCarryDesktopIdentity(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, "http://x/trae/api/v2/ug/checkin_credits/claim", nil)
 	ugHeaders(req, &Creds{AccessToken: "jwt", DeviceID: "1234567890123456"})
 	if ua := req.Header.Get("User-Agent"); !strings.Contains(ua, "TRAE-SOLO-CN/") || !strings.Contains(ua, "Electron/") {
 		t.Fatalf("ug UA must be the Electron shell, got %q", ua)
 	}
-	if got := req.Header.Get("X-Device-Id"); got != "1234567890123456" {
-		t.Fatalf("X-Device-Id = %q", got)
+	got := req.Header.Get("X-Device-Id")
+	if len(got) != 15 {
+		t.Fatalf("X-Device-Id = %q, want the 15-digit shape (16 digits are answered 9074 since 2026-11-05, BP-288)", got)
+	}
+	if got == "1234567890123456" {
+		t.Fatalf("the stored 16-digit id must be mapped, not sent as is: %q", got)
 	}
 	if req.Header.Get("X-User-Region") != "CN" {
 		t.Fatal("X-User-Region must stay CN")
 	}
 }
 
-// TestUgDeviceNormalizedTo16Digits: a stored 19-digit (or empty-with-uid)
-// device id is mapped onto a stable 16-digit one, derived per account —
-// never a new random device per request (magpie 0.2.19 ugDevice: a 9095 on
-// it must stay the day's answer, so it may not rotate).
-func TestUgDeviceNormalizedTo16Digits(t *testing.T) {
+// TestUgDeviceNormalizedTo15Digits: a stored 16/19-digit (or empty-with-uid)
+// device id is mapped onto a stable 15-digit one, derived per account —
+// never a new random device per request (magpie 0.2.30 ugDevice: a 9095 on
+// it must stay the day's answer, so it may not rotate). An id already 15
+// digits passes through; 16 digits do NOT (BP-288).
+func TestUgDeviceNormalizedTo15Digits(t *testing.T) {
 	d1 := ugDeviceID("8800000012345678901", "uid-1")
-	if len(d1) != 16 {
-		t.Fatalf("derived device id = %q, want 16 digits", d1)
+	if len(d1) != 15 {
+		t.Fatalf("derived device id = %q, want 15 digits", d1)
 	}
-	for _, c := range d1 {
+	for i, c := range d1 {
 		if c < '0' || c > '9' {
 			t.Fatalf("derived device id must be digits only, got %q", d1)
+		}
+		if i == 0 && c == '0' {
+			t.Fatalf("derived device id must not start with 0 (it would be 14 digits as a number): %q", d1)
 		}
 	}
 	// Stable across calls and accounts: same inputs -> same id; a different
@@ -61,9 +70,32 @@ func TestUgDeviceNormalizedTo16Digits(t *testing.T) {
 	if d1 == ugDeviceID("8800000012345678901", "uid-2") {
 		t.Fatal("different uids must derive different device ids")
 	}
-	// An id already in the client's shape passes through untouched.
-	if got := ugDeviceID("1234567890123456", "uid-1"); got != "1234567890123456" {
-		t.Fatalf("client-shaped id must pass through, got %q", got)
+	if d1 == ugDeviceID("8800000012345678902", "uid-1") {
+		t.Fatal("different devices must derive different device ids")
+	}
+	// An id already in the accepted shape passes through untouched.
+	if got := ugDeviceID("123456789012345", "uid-1"); got != "123456789012345" {
+		t.Fatalf("15-digit id must pass through, got %q", got)
+	}
+	// A 16-digit id is mapped (not passed through): the 0.2.19 passthrough
+	// is what 2026-11-05's server-side change turned against us.
+	got16 := ugDeviceID("1234567890123456", "uid-1")
+	if got16 == "1234567890123456" || len(got16) != 15 {
+		t.Fatalf("16-digit id must map onto a stable 15-digit one, got %q", got16)
+	}
+	if got16 != ugDeviceID("1234567890123456", "uid-1") {
+		t.Fatal("the 16->15 mapping must be stable")
+	}
+}
+
+// TestUgProbeHeadersKeepStoredDevice: the quota READ (ide_user_ent_usage)
+// rides the STORED device id verbatim — the 15-digit mapping is measured
+// for the claim chain only (BP-288, plugins 0.2.30).
+func TestUgProbeHeadersKeepStoredDevice(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodPost, "http://x/trae/api/v2/pay/ide_user_ent_usage", nil)
+	ugProbeHeaders(req, &Creds{AccessToken: "jwt", DeviceID: "1234567890123456", UID: "u1"})
+	if got := req.Header.Get("X-Device-Id"); got != "1234567890123456" {
+		t.Fatalf("probe X-Device-Id = %q, want the stored id untouched", got)
 	}
 }
 
