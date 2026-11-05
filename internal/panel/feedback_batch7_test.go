@@ -17,7 +17,8 @@ func TestEmbeddedPanelLogTableDropsUserAgentAndStopsWrapping(t *testing.T) {
 	html := string(raw)
 	for _, want := range []string{
 		"#logs th,#logs td{white-space:nowrap}",
-		`<td colspan="16" class="muted">无匹配记录</td>`,
+		// BP-287 added the effort column, so the empty-state span grew by one.
+		`<td colspan="17" class="muted">无匹配记录</td>`,
 	} {
 		if !strings.Contains(html, want) {
 			t.Fatalf("embedded panel missing %q", want)

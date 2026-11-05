@@ -14,8 +14,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	crand "crypto/rand"
 	"crypto/md5"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -86,7 +86,7 @@ const (
 	// overseasVersion follows the official desktop build; the gateway checks
 	// it, and reports a mismatch as 401 "Invalid token", so it must be bumped
 	// when the client is.
-	overseasHost    = "https://autoglm-api.autoglm.ai"
+	overseasHost = "https://autoglm-api.autoglm.ai"
 	// overseasChatPath has a /v1 segment the CN gateway does not. Measured
 	// 2026-10-24 against the real overseas account:
 	//   .../autoclaw/chat/completions     -> 405 (Alibaba edge block page)
@@ -438,9 +438,33 @@ func managedLead() string {
 	return harnessMarker + "\n\n" + managedSystemPrompt
 }
 
+// KeepMaxTokensForProbe disables the max_tokens strip in managedBody so a
+// diagnostic can ask the CN managed gateway whether it really refuses the
+// field. Production never sets it.
+//
+// Measured 2026-11-06 against the live CN gateway, one account, same body, one
+// variable changed per run:
+//
+//	no max_tokens at all        -> 200, 20 chars
+//	max_tokens=30 dropped      -> 200, 20 chars
+//	max_tokens=500 dropped     -> 200, 20 chars
+//	max_tokens=30 kept         -> 406
+//	max_tokens=500 kept        -> 406
+//
+// The refusal is immediate (150-230ms) and survives the neutral-system retry,
+// so the field itself is the trigger — not the content check the error names.
+// The strip stays; the flag exists only so this can be re-measured when the
+// gateway changes.
+var KeepMaxTokensForProbe bool
+
 // managedBody rewrites the IR-built body into what the managed gateway takes:
 // the official system prompt is mandatory, and max_tokens /
-// max_completion_tokens are refused outright (verified 2026-10-21).
+// max_completion_tokens are dropped because the gateway answers 406 for them
+// (measured 2026-11-06, see KeepMaxTokensForProbe).
+//
+// Dropping them silently is itself a defect: a caller that asked for a budget
+// gets an unbounded answer and cannot tell. When a body actually carries one,
+// the drop is logged so it shows up in the gateway log instead of vanishing.
 //
 // bodyModel is what goes in body.model. It is passed separately from the route
 // id because the two lanes disagree: both address the route through the
@@ -453,8 +477,16 @@ func managedBody(body []byte, bodyModel string) ([]byte, error) {
 		return nil, err
 	}
 	obj["model"] = bodyModel
-	delete(obj, "max_tokens")
-	delete(obj, "max_completion_tokens")
+	if KeepMaxTokensForProbe {
+		// Diagnostic only: let the field through and see what the gateway says.
+	} else if budget, present := obj["max_tokens"]; present {
+		// Say so out loud. The gateway may genuinely refuse the field, but the
+		// caller asked for a bounded answer and silently getting an unbounded
+		// one is worse than either outcome.
+		log.Printf("autoclaw: dropping max_tokens=%v (the CN managed gateway refuses the field; the caller's output budget does not apply)", budget)
+		delete(obj, "max_tokens")
+		delete(obj, "max_completion_tokens")
+	}
 	delete(obj, "user")
 
 	msgs, _ := obj["messages"].([]any)
@@ -1346,11 +1378,13 @@ const neutralSystemLine = "You are a helpful assistant. Please answer the user's
 // a system message, because "…preamble. You are Claude Code…" was refused too.
 var refusedIdentities = []string{
 	"claude code",
-	"zcode",
 	"codex",
 	// BP-176 (plugins autoclaw 0.2.10, d8cfee3): "You are CodeBuddy Code" is
 	// a 406 on the CN gateway too — bisected directly against the upstream.
 	"codebuddy code",
+	// NOT "zcode": it is reworded by identityRewrites instead (BP-283),
+	// following magpie-community/plugins packages/autoclaw. Deleting the line
+	// threw away the agent's name and every rule sharing its sentence.
 }
 
 // glmOpeningRe matches the WorkBuddy opening line ("This conversation is
@@ -1373,6 +1407,14 @@ var identityRewrites = []struct {
 	{regexp.MustCompile(`(?i)You are Gemini CLI\b`), "You are the Gemini CLI agent"},
 	{regexp.MustCompile(`(?i)You are Kimi Code CLI\b`), "You are the Kimi Code CLI agent"},
 	{regexp.MustCompile(`(?i)You are goose\b`), "You are the goose agent"},
+	// BP-283 (magpie-community/plugins packages/autoclaw:80): the CN gateway
+	// refuses "You are ZCode", and the community plugin's fix is the same
+	// reword-not-delete rule used for every other agent — the agent keeps its
+	// name, which the rest of its prompt refers back to. This gateway is
+	// ZCode's own client, so deleting the line not only made the model
+	// introduce itself as AutoClaw, it took any rule sharing that sentence
+	// down with it.
+	{regexp.MustCompile(`(?i)You are ZCode\b`), "You are the ZCode agent"},
 }
 
 // refusedIdentityClaim reports whether text carries a second-person identity

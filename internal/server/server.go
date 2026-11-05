@@ -246,6 +246,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Stream:    req.Stream,
 		ClientIP:  clientIP(r),
 		UserAgent: r.UserAgent(),
+		Effort:    req.RequestedEffort,
 	}
 
 	var result *gateway.Result

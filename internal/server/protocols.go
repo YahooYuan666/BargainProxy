@@ -78,6 +78,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	logRow := &model.RequestLog{
 		Time: start, RequestID: reqID, Protocol: "anthropic-messages", Model: gateway.BareModel(req.Model),
 		Stream: req.Stream, ClientIP: clientIP(r), UserAgent: r.UserAgent(),
+		Effort: req.RequestedEffort,
 	}
 
 	if req.Stream {
@@ -203,6 +204,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	logRow := &model.RequestLog{
 		Time: start, RequestID: reqID, Protocol: "openai-responses", Model: gateway.BareModel(req.Model),
 		Stream: req.Stream, ClientIP: clientIP(r), UserAgent: r.UserAgent(),
+		Effort: req.RequestedEffort,
 	}
 
 	if req.Stream {
@@ -344,6 +346,7 @@ func (s *Server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 	logRow := &model.RequestLog{
 		Time: start, RequestID: reqID, Protocol: "gemini-v1beta", Model: gateway.BareModel(req.Model),
 		Stream: streaming, ClientIP: clientIP(r), UserAgent: r.UserAgent(),
+		Effort: req.RequestedEffort,
 	}
 
 	req.Stream = streaming // the gateway needs stream-ness for no-duplicate cascading (ticket 28)
@@ -537,6 +540,7 @@ func logResult(row *model.RequestLog, result *gateway.Result, start time.Time) {
 		row.ToolCalls = len(result.Response.Message.ToolCalls)
 	}
 	row.ToolsDeclared = result.ToolsDeclared
+	row.Effort = result.Effort
 	if result.Degraded != "" {
 		row.Degraded = result.Degraded
 	}

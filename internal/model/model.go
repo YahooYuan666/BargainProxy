@@ -259,6 +259,14 @@ type RequestLog struct {
 	// still counts in the hit-rate denominator (BP-53).
 	CachedTokens int  `json:"cached_tokens,omitempty"`
 	CacheKnown   bool `json:"cache_known,omitempty"`
+	// Effort is the thinking gear that actually left the gateway, after any
+	// downgrade the gateway applied (BP-287). Empty = the request named none.
+	//
+	// This column exists because the gear was invisible for three weeks: the
+	// ingress stopped reading the field clients send (output_config.effort) and
+	// silently fell back to "high". With nothing recorded there was no way to
+	// tell the client's choice from the gateway's rewrite.
+	Effort string `json:"effort,omitempty"`
 }
 
 // TaskRun is one scheduled-task execution record (checkin, growth tasks,

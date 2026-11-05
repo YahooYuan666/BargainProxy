@@ -101,6 +101,14 @@ var outputLimits = map[string]int{
 	"gemini-3.5-flash":         65536,
 	"gemini-claude-sonnet-4-6": 64000,
 	"gemini-claude-opus-4-6":   64000,
+
+	// Anthropic models served through the workbuddy /v1/messages lane, keyed by
+	// the bare upstream id the driver sends there (BP-285). Same family as the
+	// gemini- prefixed entries above — the antigravity copies carry the vendor
+	// prefix, these do not, and the messages lane asks about the bare name.
+	"claude-sonnet-4-6": 64000,
+	"claude-opus-4-6":   64000,
+	"claude-opus-5.5":   64000,
 }
 
 // OutputLimit returns the model's maximum output tokens. ok=false when the

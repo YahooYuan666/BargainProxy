@@ -27,13 +27,24 @@ var transferKeys = []string{
 	KeyCooldownBaseSecs,
 	KeyFirstByteWindowSecs,
 	KeyMaxInFlight,
-	KeyPromptReplace,
 	KeyWorkBuddyGlobal,
 	KeyThoughtSigReplay,
 	"include_disabled_in_tasks",
 	KeyZenAutoSync,
 	KeyZenSyncMinutes,
 	KeyZenAddToGateway,
+}
+
+// retiredTransferKeys are keys a bundle may still carry from an older export
+// but that no longer mean anything. They are accepted and discarded rather
+// than rejected: a machine upgrading from a bundle exported before the key was
+// retired should not lose every OTHER setting because of one dead field.
+//
+// prompt_replace_enabled (BP-282): the workbuddy system-prompt replacement
+// switch is gone. It never chose whether the caller's prompt survived — only
+// how it died.
+var retiredTransferKeys = map[string]bool{
+	KeyPromptReplace: true,
 }
 
 // transferKeySet resolves to a deduplicated allowlist.
@@ -95,6 +106,9 @@ func (p *Panel) handleSettingsImport(w http.ResponseWriter, r *http.Request) {
 	}
 	allow := transferKeySet()
 	for key := range bundle.Keys {
+		if retiredTransferKeys[key] {
+			continue // accepted and dropped; see retiredTransferKeys
+		}
 		if !allow[key] {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bundle carries non-transferable key " + key + "（请在来源机重新导出）"})
 			return

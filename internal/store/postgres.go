@@ -114,6 +114,8 @@ ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS cache_known BOOLEAN NOT NULL D
 -- BP-133: tool declarations vs actual calls (misakano ce6e753, issue #44).
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS tools_declared INT NOT NULL DEFAULT 0;
 ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS tool_calls INT NOT NULL DEFAULT 0;
+-- BP-287: the thinking gear that actually reached upstream. Empty = none named.
+ALTER TABLE request_logs ADD COLUMN IF NOT EXISTS effort TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS request_logs_ts_idx ON request_logs (ts);
 
 CREATE TABLE IF NOT EXISTS task_runs (
@@ -324,11 +326,11 @@ func (p *Postgres) AppendRequestLog(l *model.RequestLog) error {
 	_, err := p.pool.Exec(ctx, `
         INSERT INTO request_logs (ts, request_id, protocol, model, channel, account_id, account_label,
             status, error_class, ttfb_ms, duration_ms, input_tokens, output_tokens, stream, client_ip, user_agent, degraded,
-            attempts, attempt_channels, credit, credit_known, cached_tokens, cache_known, tools_declared, tool_calls)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+            attempts, attempt_channels, credit, credit_known, cached_tokens, cache_known, tools_declared, tool_calls, effort)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
 		l.Time, l.RequestID, l.Protocol, l.Model, l.Channel, l.AccountID, l.AccountLabel,
 		l.Status, l.ErrorClass, l.TTFBMs, l.DurationMs, l.InputTokens, l.OutputTokens, l.Stream, l.ClientIP, l.UserAgent, l.Degraded,
-		l.Attempts, l.AttemptChannels, l.Credit, l.CreditKnown, l.CachedTokens, l.CacheKnown, l.ToolsDeclared, l.ToolCalls)
+		l.Attempts, l.AttemptChannels, l.Credit, l.CreditKnown, l.CachedTokens, l.CacheKnown, l.ToolsDeclared, l.ToolCalls, l.Effort)
 	return err
 }
 
@@ -346,7 +348,7 @@ func (p *Postgres) RecentRequestLogs(limit int) ([]model.RequestLog, error) {
 	rows, err := p.pool.Query(ctx, `
         SELECT id, ts, request_id, protocol, model, channel, account_id, account_label, status,
                error_class, ttfb_ms, duration_ms, input_tokens, output_tokens, stream, client_ip, user_agent, degraded,
-               attempts, attempt_channels, credit, credit_known, cached_tokens, cache_known, tools_declared, tool_calls
+               attempts, attempt_channels, credit, credit_known, cached_tokens, cache_known, tools_declared, tool_calls, effort
         FROM request_logs ORDER BY ts DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -358,7 +360,7 @@ func (p *Postgres) RecentRequestLogs(limit int) ([]model.RequestLog, error) {
 		if err := rows.Scan(&l.ID, &l.Time, &l.RequestID, &l.Protocol, &l.Model, &l.Channel, &l.AccountID, &l.AccountLabel,
 			&l.Status, &l.ErrorClass, &l.TTFBMs, &l.DurationMs, &l.InputTokens, &l.OutputTokens, &l.Stream, &l.ClientIP, &l.UserAgent, &l.Degraded,
 			&l.Attempts, &l.AttemptChannels, &l.Credit, &l.CreditKnown, &l.CachedTokens, &l.CacheKnown,
-			&l.ToolsDeclared, &l.ToolCalls); err != nil {
+			&l.ToolsDeclared, &l.ToolCalls, &l.Effort); err != nil {
 			return nil, err
 		}
 		out = append(out, l)

@@ -550,6 +550,7 @@ tr:last-child td{border-bottom:none}
         <div class="tbl-wrap">
           <table id="logs"><thead><tr>
             <th>时间</th><th>协议</th><th>模型</th><th>渠道</th><th>账号</th><th>状态</th><th class="mono">尝试</th>
+            <th class="mono" title="最终发给上游的思考强度（客户端所选，若网关降档则为降档后的值）；— 表示这次请求没指定">思考强度</th>
             <th>来源 IP</th><th class="mono">输入 tok</th><th class="mono">输出 tok</th><th class="mono">消耗</th><th class="mono">缓存</th><th class="mono">效率</th><th class="mono">首字</th><th class="mono">耗时</th><th>请求 ID</th>
           </tr></thead><tbody></tbody></table>
         </div>
@@ -576,10 +577,6 @@ tr:last-child td{border-bottom:none}
           <div class="row">
             <label class="chk">每渠道单号并发 <input id="setMaxInflight" type="text" style="max-width:260px" placeholder='{"workbuddy":3,"zcode":2}'></label>
             <span class="hint">保护上游账号不被并发冲爆（Trae 固定 1 不可改）。JSON 格式，例：{"antigravity":3,"workbuddy":2,"zcode":2}。改大立即唤醒排队请求。</span>
-          </div>
-          <div class="row">
-            <label class="chk"><input type="checkbox" id="setPromptReplace" style="width:auto"> 提示词替换（WorkBuddy）</label>
-            <span class="hint"><b>开启 = 丢弃客户端的系统提示词</b>，换成网关的一句中性话（「You are a helpful AI assistant」）。客户端的工具纪律、输出格式、人设、可视化目录、memory 字段等全部失效。关闭 = 原样转发，只在首条不是 system 时补一行（上游渠道校验要求）。<b>默认关闭。</b></span>
           </div>
           <div class="row">
             <label class="chk"><input type="checkbox" id="setWbGlobal" style="width:auto"> WorkBuddy 国际版账号参与调度</label>
@@ -961,7 +958,6 @@ async function refresh(){
     if (hs.cooldown_soft_base_seconds) document.getElementById('setCooldownBase').value = hs.cooldown_soft_base_seconds;
     if (hs.first_byte_window_seconds) document.getElementById('setFirstByteWindow').value = hs.first_byte_window_seconds;
     if (hs.max_in_flight) document.getElementById('setMaxInflight').value = JSON.stringify(hs.max_in_flight);
-    document.getElementById('setPromptReplace').checked = hs.prompt_replace_enabled !== false;
     document.getElementById('setIncludeDisabled').checked = hs.include_disabled_in_tasks === true;
     document.getElementById('setThoughtSigReplay').checked = hs.thought_signature_replay === true;
     document.getElementById('setWbGlobal').checked = st.workbuddy_global === true;
@@ -1422,6 +1418,17 @@ function effTps(l){
   const gen = dur - (Number(l.ttfb_ms)||0);
   const denom = gen >= 200 ? gen : dur;
   return denom > 0 ? out/(denom/1000) : 0;
+}
+// 思考强度（BP-287）：记录的是最终发给上游的档位——客户端所选，若网关降档
+// 则是降档后的值。空值表示这次请求没指定档位（不是数据缺失）。
+// 这一列存在的原因：客户端从 v3.15.1 起把档位写在 output_config.effort，
+// 网关只读 budget_tokens，于是所有档位静默变成 high，而日志里什么都没有，
+// 三周无人发现。
+const effortNames = {low:'低', medium:'中', high:'高', xhigh:'极高', max:'最高'};
+function effortCell(l){
+  const e = (l && l.effort) || '';
+  if (!e) return '<span class="muted" title="本次请求未指定思考档位">—</span>';
+  return esc(effortNames[e] ? effortNames[e]+' ('+e+')' : e);
 }
 // 缓存命中率（BP-53，agentpoints issue #92 口径）：hit / 上报了缓存账目的请求
 // 的 prompt 之和——0 命中的首轮也计入分母，否则命中率会虚高；无样本显示 —。
@@ -1935,7 +1942,7 @@ function renderLogRows(){
   });
   document.getElementById('logCount').textContent = `${rows.length} / ${logRows.length} 条`;
   const tb = document.querySelector('#logs tbody'); tb.innerHTML='';
-  if (!rows.length){ tb.innerHTML = '<tr><td colspan="16" class="muted">无匹配记录</td></tr>'; return; }
+  if (!rows.length){ tb.innerHTML = '<tr><td colspan="17" class="muted">无匹配记录</td></tr>'; return; }
   rows.forEach(l => {
     const tr = document.createElement('tr');
     const cls = l.status === 200 ? 'ok' : 'bad';
@@ -1952,6 +1959,7 @@ function renderLogRows(){
       <td>${esc(l.account_label||l.account_id||'—')}</td>
       <td class="${esc(cls)}">${esc(l.status)}${l.error_class ? ' / '+esc(l.error_class) : ''}</td>
       <td class="mono ${(l.attempts>1)?'warn':''}" title="${esc(chain)}">${esc(att)}</td>
+      <td class="mono">${effortCell(l)}</td>
       <td class="mono small">${esc(l.client_ip||'—')}</td>
       <td class="mono">${tokKnown ? (l.input_tokens||0) : '—'}</td><td class="mono">${tokKnown ? (l.output_tokens||0) : '—'}</td>
       <td class="mono">${creditCell}</td>
@@ -2382,7 +2390,6 @@ async function saveSettings(){
   if (fb) body.first_byte_window_seconds = parseInt(fb, 10);
   const mi = document.getElementById('setMaxInflight').value.trim();
   if (mi) { try { body.max_in_flight = JSON.parse(mi); } catch(e){ return toast('并发上限不是合法 JSON', true); } }
-  body.prompt_replace_enabled = document.getElementById('setPromptReplace').checked;
   body.include_disabled_in_tasks = document.getElementById('setIncludeDisabled').checked;
   body.thought_signature_replay = document.getElementById('setThoughtSigReplay').checked;
   body.workbuddy_global = document.getElementById('setWbGlobal').checked;

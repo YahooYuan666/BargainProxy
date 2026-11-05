@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 
 	"bargainproxy/internal/ir"
@@ -107,8 +108,44 @@ type WireTool struct {
 	} `json:"function"`
 }
 
+// knownRequestFields are the top-level keys ChatRequest declares. Anything
+// else in the body is dropped by encoding/json without a word, which is how a
+// caller's response_format used to disappear: the client set a JSON-mode
+// constraint, got plain prose back, and nothing anywhere said the field never
+// left the gateway.
+var knownRequestFields = map[string]bool{
+	"model": true, "messages": true, "tools": true, "tool_choice": true,
+	"temperature": true, "top_p": true, "max_tokens": true,
+	"max_completion_tokens": true, "stop": true, "stream": true,
+	"stream_options": true, "reasoning_effort": true, "metadata": true,
+	"conversation_id": true, "prompt_cache_key": true, "thinking": true,
+}
+
+// warnUnknownFields names the request keys this gateway cannot honour, so the
+// loss is visible in the log instead of silent. It only names them: receiving
+// a field is not an error, and rejecting the request over one the caller
+// considers optional would be worse than ignoring it.
+func warnUnknownFields(body []byte) {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(body, &raw) != nil {
+		return
+	}
+	var dropped []string
+	for k := range raw {
+		if !knownRequestFields[k] {
+			dropped = append(dropped, k)
+		}
+	}
+	if len(dropped) == 0 {
+		return
+	}
+	sort.Strings(dropped)
+	log.Printf("openai: ignoring request field(s) this gateway does not implement: %s", strings.Join(dropped, ", "))
+}
+
 // ParseChatRequest converts a wire request into IR.
 func ParseChatRequest(body []byte) (*ir.ChatRequest, error) {
+	warnUnknownFields(body)
 	var w ChatRequest
 	if err := json.Unmarshal(body, &w); err != nil {
 		return nil, fmt.Errorf("openai: parse request: %w", err)

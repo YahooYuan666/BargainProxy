@@ -7,6 +7,8 @@ package anthropic
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"sort"
 	"strings"
 
 	"bargainproxy/internal/ir"
@@ -15,19 +17,33 @@ import (
 
 // Request is the wire shape of POST /v1/messages.
 type Request struct {
-	Model         string          `json:"model"`
-	Messages      []WireMessage   `json:"messages"`
-	System        json.RawMessage `json:"system,omitempty"` // string | []block
-	Tools         []WireTool      `json:"tools,omitempty"`
-	ToolChoice    map[string]any  `json:"tool_choice,omitempty"`
-	MaxTokens     int             `json:"max_tokens,omitempty"`
-	Temperature   *float64        `json:"temperature,omitempty"`
-	TopP          *float64        `json:"top_p,omitempty"`
-	TopK          *int            `json:"top_k,omitempty"`
-	StopSequences []string        `json:"stop_sequences,omitempty"`
-	Stream        bool            `json:"stream,omitempty"`
-	Thinking      *WireThinking   `json:"thinking,omitempty"`
-	Metadata      map[string]any  `json:"metadata,omitempty"`
+	Model         string            `json:"model"`
+	Messages      []WireMessage     `json:"messages"`
+	System        json.RawMessage   `json:"system,omitempty"` // string | []block
+	Tools         []WireTool        `json:"tools,omitempty"`
+	ToolChoice    map[string]any    `json:"tool_choice,omitempty"`
+	MaxTokens     int               `json:"max_tokens,omitempty"`
+	Temperature   *float64          `json:"temperature,omitempty"`
+	TopP          *float64          `json:"top_p,omitempty"`
+	TopK          *int              `json:"top_k,omitempty"`
+	StopSequences []string          `json:"stop_sequences,omitempty"`
+	Stream        bool              `json:"stream,omitempty"`
+	Thinking      *WireThinking     `json:"thinking,omitempty"`
+	Metadata      map[string]any    `json:"metadata,omitempty"`
+	OutputConfig  *WireOutputConfig `json:"output_config,omitempty"`
+}
+
+// WireOutputConfig is how current Anthropic clients name the thinking gear:
+// output_config.effort holds a level ("low"/"medium"/"high"/"xhigh"/"max")
+// instead of thinking.budget_tokens holding a number.
+//
+// ZCode switched to this shape in v3.15.1 (2026-10-10, zai-org/ZCode
+// anthropic-effort-wire.test.ts): that test asserts output_config.effort is
+// present and that NEITHER thinking.budget_tokens NOR reasoning_effort is
+// sent. This gateway kept reading only budget_tokens, so every gear the user
+// picked arrived as the "high" fallback from 2026-10-10 onward.
+type WireOutputConfig struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 // WireThinking is the Anthropic extended-thinking block.
@@ -49,10 +65,48 @@ type WireTool struct {
 	InputSchema map[string]any `json:"input_schema,omitempty"`
 }
 
+// knownRequestFields are the top-level keys Request declares. Anything else is
+// dropped by encoding/json without a word — which is how output_config used to
+// disappear: ZCode sends output_config:{effort:"max"} next to a thinking block
+// that names no budget, the gateway derives the gear from the (absent) budget,
+// lands on "high", and nothing anywhere said the client's "max" never arrived.
+var knownRequestFields = map[string]bool{
+	"model": true, "messages": true, "system": true, "tools": true,
+	"tool_choice": true, "max_tokens": true, "temperature": true,
+	"top_p": true, "top_k": true, "stop_sequences": true, "stream": true,
+	"thinking": true, "metadata": true,
+	// output_config carries the thinking gear (effort) and is read by
+	// ParseMessagesRequest since BP-286.
+	"output_config": true,
+}
+
+// warnUnknownFields names request keys this gateway cannot honour. Receiving
+// one is not an error worth refusing the request over — it is a loss worth
+// seeing in the log, because the caller will otherwise debug behaviour it
+// thinks it configured.
+func warnUnknownFields(body []byte) {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(body, &raw) != nil {
+		return
+	}
+	var dropped []string
+	for k := range raw {
+		if !knownRequestFields[k] {
+			dropped = append(dropped, k)
+		}
+	}
+	if len(dropped) == 0 {
+		return
+	}
+	sort.Strings(dropped)
+	log.Printf("anthropic: ignoring request field(s) this gateway does not implement: %s", strings.Join(dropped, ", "))
+}
+
 // ParseMessagesRequest converts a wire request into IR, applying the
 // Anthropic-specific normalization (system extraction, adjacent same-role
 // merging, tool_result blocks becoming tool messages).
 func ParseMessagesRequest(body []byte) (*ir.ChatRequest, error) {
+	warnUnknownFields(body)
 	var w Request
 	if err := json.Unmarshal(body, &w); err != nil {
 		return nil, fmt.Errorf("anthropic: parse request: %w", err)
@@ -68,14 +122,29 @@ func ParseMessagesRequest(body []byte) (*ir.ChatRequest, error) {
 	}
 	if w.Thinking != nil && (w.Thinking.Type == "enabled" || w.Thinking.Type == "adaptive") {
 		// Anthropic semantics: thinking enabled means the client expects the
-		// reasoning blocks back (Include), and channels that only speak gear
-		// names get a level derived from the budget (BP-41).
+		// reasoning blocks back (Include).
 		req.Thinking = &ir.ThinkingConfig{Enabled: true, BudgetTokens: w.Thinking.BudgetTokens, Include: true}
-		if lvl := ir.LevelFromBudget(w.Thinking.BudgetTokens); lvl != "" {
-			req.Thinking.Level = lvl
+		// The gear, in order of authority:
+		//   1. output_config.effort — what current clients send (ZCode v3.15.1+
+		//      sends this and explicitly omits budget_tokens).
+		//   2. thinking.budget_tokens — what the original Anthropic shape used,
+		//      and what channels that speak only budget still rely on.
+		//   3. "high" — the last resort when neither is present.
+		//
+		// Reading only (2) is what silently downgraded every gear to "high" from
+		// 2026-10-10 onward: the field holding the answer was (1).
+		switch {
+		case w.OutputConfig != nil && strings.TrimSpace(w.OutputConfig.Effort) != "":
+			lvl := strings.ToLower(strings.TrimSpace(w.OutputConfig.Effort))
 			req.RequestedEffort = lvl
-		} else {
-			req.RequestedEffort = "high"
+			req.Thinking.Level = lvl
+		default:
+			if lvl := ir.LevelFromBudget(w.Thinking.BudgetTokens); lvl != "" {
+				req.Thinking.Level = lvl
+				req.RequestedEffort = lvl
+			} else {
+				req.RequestedEffort = "high"
+			}
 		}
 	}
 
@@ -309,25 +378,25 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 						if t, _ := sub["text"].(string); t != "" {
 							resultParts = append(resultParts, ir.ContentPart{Kind: "text", Text: t})
 						}
-				case "image":
-					if src, ok := sub["source"].(map[string]any); ok {
-						switch srcType, _ := src["type"].(string); srcType {
-						case "base64":
-							mime, _ := src["media_type"].(string)
-							data, _ := src["data"].(string)
-							// BP-235: same whitelist as the message-level image.
-							if !imageMIMEAllowed(mime) {
-								continue
-							}
-							if data != "" {
-								resultParts = append(resultParts, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: data})
-							}
-						case "url":
-							if u, _ := src["url"].(string); u != "" {
-								resultParts = append(resultParts, ir.ContentPart{Kind: "image_url_unsupported", Text: u})
+					case "image":
+						if src, ok := sub["source"].(map[string]any); ok {
+							switch srcType, _ := src["type"].(string); srcType {
+							case "base64":
+								mime, _ := src["media_type"].(string)
+								data, _ := src["data"].(string)
+								// BP-235: same whitelist as the message-level image.
+								if !imageMIMEAllowed(mime) {
+									continue
+								}
+								if data != "" {
+									resultParts = append(resultParts, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: data})
+								}
+							case "url":
+								if u, _ := src["url"].(string); u != "" {
+									resultParts = append(resultParts, ir.ContentPart{Kind: "image_url_unsupported", Text: u})
+								}
 							}
 						}
-					}
 					}
 				}
 			}

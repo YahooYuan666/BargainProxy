@@ -123,9 +123,6 @@ type Driver struct {
 	cfg  config.WorkBuddySettings
 	http *http.Client // streaming chat calls (no total timeout + header/idle watchdogs)
 	rpc  *http.Client // short billing / growth / refresh calls (total timeout)
-	// promptReplace is the hot-switchable system-prompt replacement (panel
-	// setting; default on). Off falls back to StripSystem like passthrough.
-	promptReplace atomic.Bool
 	// messagesAllowed gates the Anthropic-native /v1/messages lane (BP-131).
 	// Starts true; a 404/route refusal degrades it to false for the process,
 	// after which claude models ride the chat lane exactly as before.
@@ -146,13 +143,9 @@ func New(cfg config.WorkBuddySettings, httpClient *http.Client) *Driver {
 		httpClient = httpx.ChatClient()
 	}
 	d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
-	d.promptReplace.Store(true)
 	d.messagesAllowed.Store(true)
 	return d
 }
-
-// SetPromptReplaceEnabled toggles system-prompt replacement at runtime.
-func (d *Driver) SetPromptReplaceEnabled(enabled bool) { d.promptReplace.Store(enabled) }
 
 // Channel implements driver.Driver.
 func (d *Driver) Channel() string { return model.ChannelWorkBuddy }
@@ -491,9 +484,11 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 		// replaced or stripped version — or the agent's instructions are lost
 		// and the model behaves like a different agent (BP-93).
 		messages = moveSystemToUser(messages)
-	case mode == "custom" && d.promptReplace.Load():
-		// Explicit opt-in: the gateway owns the system slot and the caller's
-		// text is dropped. Off by default — see config.DefaultPromptMode.
+	case mode == "custom":
+		// Explicit opt-in, config.json only: the gateway owns the system slot
+		// and the caller's text is dropped. There is no runtime switch for it
+		// any more (BP-282) — the old one only chose between "replace with a
+		// neutral line" and "strip outright", and both destroyed the prompt.
 		messages = prompt.ReplaceSystem(messages, prompt.DefaultSystemPrompt)
 		replacedCallerSystem = true
 	case mode == "append":

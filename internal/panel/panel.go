@@ -48,8 +48,12 @@ const (
 	// (BP-72). One number replaces the old AutoClaw-only knob; per-channel
 	// config overrides still win.
 	KeyFirstByteWindowSecs = "first_byte_window_seconds"
-	KeyMaxInFlight         = "max_in_flight"          // JSON map: channel -> limit
-	KeyPromptReplace       = "prompt_replace_enabled" // "true" | "false"
+	KeyMaxInFlight         = "max_in_flight" // JSON map: channel -> limit
+	// KeyPromptReplace is retired (BP-282): the system-prompt replacement
+	// switch was removed because it only ever chose HOW the caller's prompt
+	// got destroyed. The constant stays because exported settings files and
+	// older stores still carry the key; it is read by nothing.
+	KeyPromptReplace = "prompt_replace_enabled" // retired, ignored
 	// KeyThoughtSigReplay: experimental real Gemini thought_signature capture
 	// + replay on the antigravity driver (BP-44). "true" | "false"; default off.
 	KeyThoughtSigReplay = "thought_signature_replay"
@@ -220,17 +224,17 @@ func (p *Panel) handleIndex(w http.ResponseWriter, r *http.Request) {
 	// — the 2026-10-16 "强制刷新密码框又回来了" report had a script-failure
 	// root cause, but stale HTML is the same class of trap and costs nothing
 	// to close.
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write(b)
-	}
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write(b)
+}
 
-	const cryingFaviconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">😭</text></svg>`
+const cryingFaviconSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">😭</text></svg>`
 
-	func handleFavicon(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
-		w.Header().Set("Cache-Control", "public, max-age=86400")
-		_, _ = w.Write([]byte(cryingFaviconSVG))
-	}
+func handleFavicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	_, _ = w.Write([]byte(cryingFaviconSVG))
+}
 
 // --- auth ---
 

@@ -52,6 +52,13 @@ type Result struct {
 	// ToolsDeclared rides the request's tool count so the log row can record
 	// it next to the calls actually made (BP-133).
 	ToolsDeclared int
+	// Effort is the thinking gear that actually left the gateway, after any
+	// downgrade the gateway itself applied (BP-287). Empty means the request
+	// named no gear. Recorded because the gear was invisible for three weeks:
+	// the ingress stopped reading the field clients send (output_config.effort)
+	// and fell back to "high", and with nothing in the log there was no way to
+	// notice which of the client's choice and the gateway's rewrite won.
+	Effort string
 }
 
 // Trace records how a request was attempted across bindings, so the request
@@ -767,6 +774,11 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			_ = emit(ir.StreamEvent{Kind: ir.EvAttemptReset})
 		}
 		resp, streamErr := drv.Stream(actx, call, attemptEmit)
+		// What the wire actually carried, for the request log (BP-287). The
+		// effort repair paths below rewrite a COPY of the request, so reading
+		// req.RequestedEffort at the end would report the caller's original
+		// choice even when the gateway stepped it down. Track it per attempt.
+		effortSent := call.Request.RequestedEffort
 		// max_tokens floor repair (BP-99): some upstreams reject a too-small
 		// max_tokens with a 400 whose text carries the minimum they demand
 		// ("max_tokens: 1 is less than the minimum of 16"). A client sending
@@ -820,6 +832,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 							binding.Channel, req.RequestedEffort, map[bool]string{true: stepped, false: "no gear"}[stepped != ""])
 						started = time.Now()
 						resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
+						effortSent = stepped // the log reports what was retried with
 					}
 				} else if want := tokenFieldWanted(ue.Message); want != "" && req.MaxTokens > 0 {
 					// BP-233: the refusal names the token-budget field it
@@ -1103,7 +1116,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			for i := range resp.Message.ToolCalls {
 				resp.Message.ToolCalls[i].Arguments = dropLoneCR(resp.Message.ToolCalls[i].Arguments)
 			}
-			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts, ToolsDeclared: len(req.Tools)}
+			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts, ToolsDeclared: len(req.Tools), Effort: effortSent}
 			if degraded {
 				res.Degraded = binding.Channel
 			}
@@ -1365,17 +1378,6 @@ func (g *Gateway) SetChannelLimit(channel string, n int) { g.pool.SetLimit(chann
 // CostTier reports the freshest observed cost tier for a native model
 // (0 free, 2 paid). ok=false when unobserved.
 func (g *Gateway) CostTier(native string) (int, bool) { return g.pool.ModelCostTier(native) }
-
-// promptReplacer is implemented by drivers with a hot-switchable system
-// prompt replacement.
-type promptReplacer interface{ SetPromptReplaceEnabled(bool) }
-
-// SetPromptReplace toggles the workbuddy system-prompt replacement at runtime.
-func (g *Gateway) SetPromptReplace(enabled bool) {
-	if d, ok := g.drivers[model.ChannelWorkBuddy].(promptReplacer); ok {
-		d.SetPromptReplaceEnabled(enabled)
-	}
-}
 
 // thoughtSigReplayer is implemented by drivers with the experimental
 // real-thought-signature replay cache (BP-44, antigravity).

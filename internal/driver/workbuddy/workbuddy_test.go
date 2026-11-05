@@ -495,17 +495,18 @@ func TestPromptReplaceHotSwitch(t *testing.T) {
 		t.Fatalf("replacement on: first message = %v", first)
 	}
 
-	// BP-281: with the switch off the caller's own system prompt must arrive
-	// intact. It used to be stripped, which dropped the agent's identity, tool
-	// rules and output format in BOTH switch positions — off was strictly
-	// worse than on, because not even a placeholder survived.
-	d.SetPromptReplaceEnabled(false)
+	// BP-281/BP-282: dropping the runtime switch leaves exactly two modes.
+	// custom (above) drops the caller's text; passthrough must forward it
+	// intact. Off used to strip outright — strictly worse than replace,
+	// because not even a placeholder survived — and the switch itself is
+	// gone so nobody can reach that state again.
+	d.cfg.PromptMode = "passthrough"
 	msgs = run(d)
 	if len(msgs) != 2 {
-		t.Fatalf("replacement off must forward the caller's messages, got %v", msgs)
+		t.Fatalf("passthrough must forward the caller's messages, got %v", msgs)
 	}
 	if got := msgs[0].(map[string]any); got["role"] != "system" || got["content"] != "client system prompt" {
-		t.Fatalf("replacement off must keep the caller's system text verbatim, got %v", got)
+		t.Fatalf("passthrough must keep the caller's system text verbatim, got %v", got)
 	}
 }
 

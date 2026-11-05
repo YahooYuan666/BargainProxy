@@ -207,12 +207,14 @@ func (p *Panel) configView() map[string]any {
 }
 
 func (p *Panel) hotSettingsView() map[string]any {
-	// BP-281: default OFF. Replacing the caller's system prompt deletes the
-	// agent's identity, tool discipline and output format, and that loss is
-	// invisible in casual conversation — it only shows up when the model
-	// forgets a rule it was given. Off means passthrough: the caller's text
-	// arrives intact.
-	out := map[string]any{"prompt_replace_enabled": false}
+	// BP-282: the whole switch is gone. It controlled nothing the operator
+	// could reason about — it only picked HOW the caller's system prompt got
+	// destroyed (replaced by a neutral line, or stripped outright), and only
+	// while prompt_mode was "custom". Off was strictly worse than on: not
+	// even a placeholder survived. The channel now always forwards the
+	// caller's prompt and rescues a 11128 refusal on its own, so there is
+	// nothing left to toggle.
+	out := map[string]any{}
 	if v, ok, _ := p.store.GetSetting(KeyGreedyFloorSecs); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			out["greedy_floor_seconds"] = n
@@ -239,9 +241,6 @@ func (p *Panel) hotSettingsView() map[string]any {
 		if d := p.cfg.FirstByteWindow.D(); d > 0 {
 			out["first_byte_window_seconds"] = int(d.Seconds())
 		}
-	}
-	if v, ok, _ := p.store.GetSetting(KeyPromptReplace); ok {
-		out["prompt_replace_enabled"] = v != "false"
 	}
 	if v, ok, _ := p.store.GetSetting("include_disabled_in_tasks"); ok {
 		out["include_disabled_in_tasks"] = v != "false"
@@ -695,7 +694,11 @@ type settingsRequest struct {
 	// (BP-72). 0 or absent = leave unchanged.
 	FirstByteWindowSeconds *int           `json:"first_byte_window_seconds,omitempty"`
 	MaxInFlight            map[string]int `json:"max_in_flight,omitempty"`
-	PromptReplaceEnabled   *bool          `json:"prompt_replace_enabled,omitempty"`
+	// PromptReplaceEnabled is accepted and ignored (BP-282): the switch was
+	// removed from the UI. Old clients and exported settings files still send
+	// it, and rejecting the whole save over a field that no longer does
+	// anything would lose every other setting in the same request.
+	PromptReplaceEnabled *bool `json:"prompt_replace_enabled,omitempty"`
 	// IncludeDisabledInTasks: keep-alive tasks also run for disabled
 	// accounts (ticket 32; key matches tasks.KeyIncludeDisabledInTasks).
 	IncludeDisabledInTasks *bool `json:"include_disabled_in_tasks,omitempty"`
@@ -794,17 +797,6 @@ func (p *Panel) handleSettings(w http.ResponseWriter, r *http.Request) {
 			prov.SetIncludeDisabledInTasks(*req.IncludeDisabledInTasks)
 		}
 	}
-	if req.PromptReplaceEnabled != nil {
-		val := "false"
-		if *req.PromptReplaceEnabled {
-			val = "true"
-		}
-		if err := p.store.SetSetting(KeyPromptReplace, val); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
-		}
-		p.gw.SetPromptReplace(*req.PromptReplaceEnabled)
-	}
 	if req.ThoughtSignatureReplay != nil {
 		val := "false"
 		if *req.ThoughtSignatureReplay {
@@ -860,10 +852,6 @@ func RestoreHotSettings(gw *gateway.Gateway, st store.Store) []string {
 			}
 			applied = append(applied, "max_in_flight")
 		}
-	}
-	if v, ok, _ := st.GetSetting(KeyPromptReplace); ok {
-		gw.SetPromptReplace(v == "true")
-		applied = append(applied, "prompt_replace="+v)
 	}
 	if v, ok, _ := st.GetSetting(KeyRoutes); ok {
 		var rows []router.Row

@@ -954,15 +954,19 @@ func TestSettingsHotUpdateValidationAndRestore(t *testing.T) {
 	}
 	_ = json.NewDecoder(stResp.Body).Decode(&state)
 	stResp.Body.Close()
+	// BP-282: prompt_replace_enabled is gone from the state — the switch never
+	// chose whether the caller's system prompt survived, only how it died.
 	if state.Settings["greedy_floor_seconds"].(float64) != 30 ||
-		state.Settings["first_byte_window_seconds"].(float64) != 120 ||
-		state.Settings["prompt_replace_enabled"] != false {
+		state.Settings["first_byte_window_seconds"].(float64) != 120 {
 		t.Fatalf("state settings = %+v", state.Settings)
+	}
+	if _, present := state.Settings["prompt_replace_enabled"]; present {
+		t.Fatalf("retired switch must not reappear in state: %+v", state.Settings)
 	}
 
 	// Restart recovery: the persisted values are re-applied to the gateway.
 	applied := strings.Join(panel.RestoreHotSettings(gw, st), ",")
-	for _, want := range []string{"greedy_floor=30s", "cooldown_soft_base=90s", "first_byte_window=120s", "max_in_flight", "prompt_replace=false"} {
+	for _, want := range []string{"greedy_floor=30s", "cooldown_soft_base=90s", "first_byte_window=120s", "max_in_flight"} {
 		if !strings.Contains(applied, want) {
 			t.Fatalf("restore applied = %q, missing %q", applied, want)
 		}

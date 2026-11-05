@@ -26,6 +26,7 @@ import (
 	"strings"
 	"time"
 
+	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
@@ -179,11 +180,26 @@ func (d *Driver) buildMessagesBody(call driver.ChatCall, creds *Creds) ([]byte, 
 			break
 		}
 	}
+	// max_tokens is a required field on this wire. When the caller names none,
+	// ask the model's capability table instead of pinning 8192: the ceiling on
+	// this lane is what the model can emit, not what some constant says. 8192
+	// stays only as the last resort for a model the table has never heard of.
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		if limit, ok := config.OutputLimit(call.UpstreamModel); ok {
+			maxTokens = limit
+		} else if limit, ok := config.OutputLimit(call.Request.Model); ok {
+			maxTokens = limit
+		} else {
+			maxTokens = 8192
+			log.Printf("workbuddy: /v1/messages max_tokens unset and %q has no known output ceiling; sending 8192", call.UpstreamModel)
+		}
+	}
 	body := map[string]any{
 		"model":      call.UpstreamModel,
 		"messages":   msgs,
 		"stream":     true,
-		"max_tokens": map[bool]int{true: req.MaxTokens, false: 8192}[req.MaxTokens > 0],
+		"max_tokens": maxTokens,
 	}
 	if len(system) > 0 {
 		body["system"] = system

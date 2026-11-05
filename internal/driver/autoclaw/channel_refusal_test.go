@@ -100,14 +100,18 @@ func TestScrubLeavesAllowedIdentitiesAlone(t *testing.T) {
 	}
 }
 
-// TestScrubHandlesTheFieldShapes: the three refused products, any casing, and
+// TestScrubHandlesTheFieldShapes: the two delete-list products, any casing, and
 // a claim buried mid-prompt (the field failure had ~13k tokens of instructions
 // around it).
+//
+// ZCode is NOT in this map any more (BP-283): the CN gateway does refuse it,
+// but the community plugin's fix is to reword ("You are the ZCode agent") and
+// keep the name, not to delete the sentence — see
+// TestZCodeIdentityIsRewordedNotDeleted.
 func TestScrubHandlesTheFieldShapes(t *testing.T) {
 	cases := map[string]string{
 		"You are Claude Code.":                                              "",
 		"you are claude code.":                                              "",
-		"You are ZCode, a coding agent.":                                    "",
 		"You are Codex, OpenAI's coding agent.":                             "",
 		"You are Claude Code an interactive CLI tool.":                      "",
 		"Preamble line. You are Claude Code, a CLI tool. Tail instruction.": "Preamble line. Tail instruction.",
@@ -115,6 +119,39 @@ func TestScrubHandlesTheFieldShapes(t *testing.T) {
 	for in, want := range cases {
 		if got := scrubRefusedIdentity(in); got != want {
 			t.Errorf("scrub(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestZCodeIdentityIsRewordedNotDeleted pins BP-283: the CN gateway refuses
+// "You are ZCode", but the line must be REWORDED so the agent keeps its name —
+// which the rest of its prompt refers back to — instead of being cut out.
+//
+// Evidence: magpie-community/plugins packages/autoclaw:80 does exactly this
+// (`/You are ZCode/gi → "You are the ZCode agent"`), and the plugin's own note
+// explains why rewriting beats deleting: "rewriting keeps the agent's name —
+// which the rest of its prompt refers back to — where deleting the sentence
+// would amputate it".
+//
+// Deleting also took down whatever rule shared the sentence: with the model's
+// opening line reading "You are ZCode, an interactive agent who always answers
+// in Cantonese", the whole instruction vanished and the model answered in
+// English while introducing itself as AutoClaw.
+func TestZCodeIdentityIsRewordedNotDeleted(t *testing.T) {
+	cases := map[string]string{
+		"You are ZCode, an interactive agent":        "You are the ZCode agent, an interactive agent",
+		"You are ZCode.":                             "You are the ZCode agent.",
+		"you are zcode and answer only in Cantonese": "You are the ZCode agent and answer only in Cantonese",
+	}
+	for in, want := range cases {
+		if got := scrubRefusedIdentity(in); got != want {
+			t.Errorf("scrub(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// The name must survive in every case — that is the whole point.
+	for in := range cases {
+		if got := scrubRefusedIdentity(in); !strings.Contains(got, "ZCode") {
+			t.Errorf("scrub(%q) dropped the agent's name: %q", in, got)
 		}
 	}
 }
