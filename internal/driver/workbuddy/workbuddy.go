@@ -603,6 +603,7 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 				effort = "high"
 			}
 			body["reasoning_effort"] = effort
+			raiseMinBudget(body, req, req.MaxTokens, effort, call.UpstreamModel)
 		}
 	} else if strings.HasPrefix(strings.ToLower(call.UpstreamModel), "deepseek") {
 		// BP-177 (misakano f4d48ac, measured 2026-10-28 on www.workbuddy.ai):
@@ -614,6 +615,7 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 		// unverified, so they stay unset. An explicit off/none still takes
 		// the BP-130 disabled path above.
 		body["reasoning_effort"] = "high"
+		raiseMinBudget(body, req, req.MaxTokens, "high", call.UpstreamModel)
 	}
 	// prompt_cache_key injection (per-account stable key, panel parity).
 	prompt.InjectPromptCacheKey(body, creds.UID, sessionFromReq(req))
@@ -623,6 +625,30 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 		return nil, err
 	}
 	return prompt.SanitizeBody(raw), nil
+}
+
+// raiseMinBudget lifts an explicit client budget to the effort floor
+// (BP-295, misakano 2b9b773): this upstream settles thinking and answer
+// tokens against the SAME max_tokens, so a small budget next to a thinking
+// gear dies mid-sentence at finish=length. The floor is a cap, not a target —
+// the model still stops when the answer is done, so the raise neither
+// lengthens a finished answer nor bills more by itself. The client's own
+// thinking-off choice, probe-level budgets, a learned ceiling (BP-129) and
+// the catalog ceiling all bound the raise.
+func raiseMinBudget(body map[string]any, req *ir.ChatRequest, current int, gear, upstreamModel string) {
+	if req.Thinking != nil && !req.Thinking.Enabled {
+		return
+	}
+	raised, changed := config.RaiseMinOutputBudget(current, gear, upstreamModel, req.Model)
+	if !changed {
+		return
+	}
+	if ceil := config.LearnedOutputCeiling(model.ChannelWorkBuddy, upstreamModel); ceil > 0 && raised > ceil {
+		return
+	}
+	body["max_tokens"] = raised
+	log.Printf("workbuddy: max_tokens %d → %d (effort=%s output floor: thinking shares this budget; the floor is a cap, not a target)",
+		current, raised, gear)
 }
 
 // moveSystemToUser rewrites the conversation so the caller's system prompt is
@@ -757,6 +783,9 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 		stop       ir.StopReason
 		gotUsage   bool
 		terminated bool
+		// BP-296: lifts <think:SUF>…</think:SUF> leaked into content back into
+		// the thinking channel (stateful: tags split across deltas).
+		tt ThinkTag
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -826,9 +855,22 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 				}
 			}
 			if ch.Delta.Content != "" {
-				textBuf.WriteString(ch.Delta.Content)
-				if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: ch.Delta.Content}); err != nil {
-					return nil, err
+				// BP-296: the reasoning parser occasionally leaks the whole
+				// chain of thought into content wrapped in <think:SUF> tags —
+				// split it back into the thinking channel before anything
+				// aggregates or emits it.
+				think, body := tt.Feed(ch.Delta.Content)
+				if think != "" {
+					thinkBuf.WriteString(think)
+					if err := emit(ir.StreamEvent{Kind: ir.EvThinking, Delta: think}); err != nil {
+						return nil, err
+					}
+				}
+				if body != "" {
+					textBuf.WriteString(body)
+					if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: body}); err != nil {
+						return nil, err
+					}
 				}
 			}
 			for _, tc := range ch.Delta.ToolCalls {
@@ -894,6 +936,25 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 	}
 	if !terminated {
 		return nil, uperr.New(uperr.ClassTransport, 0, "workbuddy: stream ended without terminal signal")
+	}
+	// BP-298: the loop broke on [DONE] — read the tail so net/http can return
+	// the connection to the pool instead of paying a fresh TCP+TLS per request.
+	httpx.Drain(r)
+	// BP-296: drain the splitter's tail — the last bytes of a leaked block
+	// must not be lost when the stream ends mid-tag.
+	if think, body := tt.Flush(); think != "" || body != "" {
+		if think != "" {
+			thinkBuf.WriteString(think)
+			if err := emit(ir.StreamEvent{Kind: ir.EvThinking, Delta: think}); err != nil {
+				return nil, err
+			}
+		}
+		if body != "" {
+			textBuf.WriteString(body)
+			if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: body}); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	for _, idx := range toolOrder {

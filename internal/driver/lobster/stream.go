@@ -495,6 +495,9 @@ func parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit dr
 	if !terminated {
 		return nil, uperr.New(uperr.ClassTransport, 0, "lobster: stream ended without terminal signal")
 	}
+	// BP-298: the loop breaks on [DONE] — read the tail so the pooled
+	// connection survives.
+	httpx.Drain(r)
 
 	for _, idx := range toolOrder {
 		out.Message.ToolCalls = append(out.Message.ToolCalls, *tools[idx])

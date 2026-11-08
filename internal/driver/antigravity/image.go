@@ -170,6 +170,9 @@ func parseImageSSE(ctx context.Context, r io.Reader, upstreamModel string) (*dri
 	if err := sc.Err(); err != nil {
 		return nil, uperr.New(uperr.ClassTransport, 0, "antigravity: image stream read: %v", err)
 	}
+	// BP-298: the loop breaks on [DONE] — read the tail so the pooled
+	// connection survives.
+	httpx.Drain(r)
 	if blocked != "" && len(images) == 0 {
 		return nil, uperr.New(uperr.ClassContentBlocked, 400,
 			"antigravity: image prompt blocked by safety filter (%s): %s", blocked, blockMsg)

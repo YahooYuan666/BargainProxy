@@ -240,6 +240,63 @@ func LearnOutputCeiling(channel, model string, cap int) {
 	learnedCeilings.Store(ceilingKey(channel, model), learnedCeiling{cap: cap, until: time.Now().Add(learnedCeilingTTL)})
 }
 
+// --- BP-295: effort-aware output floor ----------------------------------------
+//
+// WorkBuddy settles thinking and answer tokens against the SAME max_tokens
+// (misakano 2b9b773, production-measured 2026-11-08 on cn:deepseek-v4.1-flash:
+// effort=high + max_tokens=2048 → total=4096, thinking eats 2048, the answer
+// dies mid-sentence at finish=length; effort=max thinking swings 7612~37110 on
+// the same prompt). A client that names a thinking gear but a smaller budget
+// gets its answer stolen by thinking — a combination error only the gateway
+// can fix. Raising the budget to the tier floor fixes the shape: the floor is
+// a CAP, not a target — the model still stops when the answer is done, so the
+// raise neither lengthens the answer nor bills more by itself.
+
+var minBudgetByEffort = map[string]int{
+	"minimal": 4096,
+	"low":     4096,
+	"medium":  6144,
+	"high":    8192,
+	"xhigh":   12288,
+	"max":     16384,
+}
+
+// minBudgetProbe: at or below this the budget is a liveness probe
+// (max_tokens=1 "Reply with OK.") — raising it would slow probes for no
+// answer-quality gain. Mirrors minStarvedBudget in the gateway.
+const minBudgetProbe = 16
+
+// MinOutputBudget returns the effort tier's floor, capped by the catalog
+// ceiling for the model. ok=false when the gear is unknown — callers must not
+// guess a floor for a gear the upstream never confirmed.
+func MinOutputBudget(effort, model, canonical string) (int, bool) {
+	base, ok := minBudgetByEffort[strings.ToLower(strings.TrimSpace(effort))]
+	if !ok {
+		return 0, false
+	}
+	if limit, known := OutputLimit(model); known && limit > 0 && base > limit {
+		base = limit
+	} else if limit, known := OutputLimit(canonical); known && limit > 0 && base > limit {
+		base = limit
+	}
+	return base, true
+}
+
+// RaiseMinOutputBudget lifts an explicit client budget to the effort floor.
+// changed=true carries the raised value the caller must send instead.
+// Budgets below minBudgetProbe are probes and stay untouched; an unknown gear
+// never raises.
+func RaiseMinOutputBudget(maxTokens int, effort, model, canonical string) (int, bool) {
+	if maxTokens < minBudgetProbe {
+		return maxTokens, false
+	}
+	floor, ok := MinOutputBudget(effort, model, canonical)
+	if !ok || maxTokens >= floor {
+		return maxTokens, false
+	}
+	return floor, true
+}
+
 // LearnedOutputCeiling returns a still-fresh learned ceiling, or 0.
 func LearnedOutputCeiling(channel, model string) int {
 	v, ok := learnedCeilings.Load(ceilingKey(channel, model))

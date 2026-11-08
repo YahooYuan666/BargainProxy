@@ -206,6 +206,12 @@ func (d *Driver) buildMessagesBody(call driver.ChatCall, creds *Creds) ([]byte, 
 	}
 	if gear, ok := messagesEffort(req.RequestedEffort); ok {
 		body["output_config"] = map[string]any{"effort": gear}
+		// BP-295: this lane's max_tokens is required, so even the injected
+		// fallback budget is "explicit" — and 8192 cannot hold a max-gear
+		// turn's thinking on an upstream that settles think+answer against
+		// the same budget (misakano 2b9b773). The floor is a cap, not a
+		// target; the client's thinking-off choice and probe budgets stand.
+		raiseMinBudget(body, req, maxTokens, gear, call.UpstreamModel)
 	}
 	if req.Thinking != nil && req.Thinking.Enabled && req.Thinking.BudgetTokens > 0 && req.RequestedEffort == "" {
 		// An explicit Anthropic thinking block rides as itself when the client
@@ -311,6 +317,7 @@ func (d *Driver) parseMessagesSSE(ctx context.Context, r io.Reader, call driver.
 		stop       ir.StopReason
 		gotUsage   bool
 		terminated bool
+		tt         ThinkTag // BP-296: <think:SUF> leak splitter for text_delta
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -398,9 +405,22 @@ func (d *Driver) parseMessagesSSE(ctx context.Context, r io.Reader, call driver.
 			}
 			switch ev.Delta.Type {
 			case "text_delta":
-				textBuf.WriteString(ev.Delta.Text)
-				if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: ev.Delta.Text}); err != nil {
-					return nil, err
+				// BP-296: the same leak ships on this lane — a CoT wrapped in
+				// <think:SUF> arriving as text_delta. Anthropic clients only
+				// read content_block.type=thinking, so an inline tag would
+				// surface as plain text. Split before emit/aggregate.
+				think, body := tt.Feed(ev.Delta.Text)
+				if think != "" {
+					thinkBuf.WriteString(think)
+					if err := emit(ir.StreamEvent{Kind: ir.EvThinking, Delta: think}); err != nil {
+						return nil, err
+					}
+				}
+				if body != "" {
+					textBuf.WriteString(body)
+					if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: body}); err != nil {
+						return nil, err
+					}
 				}
 			case "thinking_delta":
 				thinkBuf.WriteString(ev.Delta.Thinking)
@@ -450,6 +470,22 @@ func (d *Driver) parseMessagesSSE(ctx context.Context, r io.Reader, call driver.
 	}
 	if !terminated {
 		return nil, uperr.New(uperr.ClassTransport, 0, "workbuddy: messages stream ended without message_stop")
+	}
+	// BP-296: drain the splitter's tail so a leak cut off by message_stop
+	// still lands in the right channel.
+	if think, body := tt.Flush(); think != "" || body != "" {
+		if think != "" {
+			thinkBuf.WriteString(think)
+			if err := emit(ir.StreamEvent{Kind: ir.EvThinking, Delta: think}); err != nil {
+				return nil, err
+			}
+		}
+		if body != "" {
+			textBuf.WriteString(body)
+			if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: body}); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if textBuf.Len() == 0 && thinkBuf.Len() == 0 && len(toolOrder) == 0 && !gotUsage {
 		return nil, uperr.New(uperr.ClassTransport, 0,

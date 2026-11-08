@@ -243,7 +243,7 @@ func parseContent(content any) ([]ir.ContentPart, error) {
 			case "input_image", "image_url":
 				if u, _ := m["image_url"].(string); strings.HasPrefix(u, "data:") {
 					if meta, data, ok := splitDataURL(u); ok {
-						parts = append(parts, ir.ContentPart{Kind: "image", ImageMIME: meta, ImageB64: data})
+						parts = append(parts, ir.ContentPart{Kind: "image", ImageMIME: meta, ImageB64: ir.StdBase64(data)})
 					}
 				} else if u, _ := m["image_url"].(string); u != "" {
 					parts = append(parts, ir.ContentPart{Kind: "image_url_unsupported", Text: u})

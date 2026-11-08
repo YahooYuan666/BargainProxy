@@ -195,7 +195,7 @@ func ParseRequest(body []byte, sessionKey string) (*ir.ChatRequest, error) {
 			case p.Text != "":
 				msg.Content = append(msg.Content, ir.ContentPart{Kind: "text", Text: p.Text})
 			case p.InlineData != nil:
-				msg.Content = append(msg.Content, ir.ContentPart{Kind: "image", ImageMIME: p.InlineData.MIMEType, ImageB64: p.InlineData.Data})
+				msg.Content = append(msg.Content, ir.ContentPart{Kind: "image", ImageMIME: p.InlineData.MIMEType, ImageB64: ir.StdBase64(p.InlineData.Data)})
 			case p.FunctionCall != nil:
 				id := p.FunctionCall.ID
 				if id == "" {

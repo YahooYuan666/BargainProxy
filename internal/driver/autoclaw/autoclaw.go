@@ -1763,6 +1763,9 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 	if !terminated {
 		return nil, uperr.New(uperr.ClassTransport, 0, "autoclaw: stream ended without terminal signal")
 	}
+	// BP-298: the loop broke on [DONE] — read the tail so the pooled
+	// connection survives.
+	httpx.Drain(r)
 
 	for _, idx := range toolOrder {
 		out.Message.ToolCalls = append(out.Message.ToolCalls, *tools[idx])

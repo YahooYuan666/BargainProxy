@@ -1062,6 +1062,9 @@ scan:
 	if !terminated {
 		return nil, uperr.New(uperr.ClassTransport, 0, "trae: stream ended without terminal signal")
 	}
+	// BP-298: the loop broke on [DONE] — read the tail so the pooled
+	// connection survives.
+	httpx.Drain(r)
 	if stop == "" {
 		stop = ir.StopEnd
 	}

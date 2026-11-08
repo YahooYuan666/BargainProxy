@@ -481,6 +481,11 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	if !sawDone && ctx.Err() == nil {
 		return nil, emitted, uperr.New(uperr.ClassTransport, 0, "qoder: stream ended without [DONE] marker (connection truncated?)")
 	}
+	if sawDone {
+		// BP-298: the loop broke on [DONE] — read the tail so the pooled
+		// connection survives.
+		httpx.Drain(streamBody)
+	}
 	// BP-222: the accumulator saw finish_reason "error" — a failed turn, not a
 	// finished one. Fail the attempt before building a success-shaped response.
 	if acc.failedFinish {

@@ -68,6 +68,17 @@ type streamLedger struct {
 	sawTool  bool
 	usage    ir.Usage
 	usageSet bool
+
+	// BP-295: the terminal event is HELD here instead of flowing straight to
+	// the protocol writers. A writer's EvDone is the wire's one terminal
+	// ([DONE] / message_stop / response.completed) — anything spliced after
+	// it is garbage the client never reads. Post-stream rescues (BP-112) and
+	// length continuations (BP-295) add segments AFTER the driver returned,
+	// so executeBinding releases exactly one terminal carrying the FINAL stop
+	// reason once every rescue decision has run. Done events that arrive
+	// after the release (should not happen) pass through untouched.
+	heldDone     *ir.StreamEvent
+	doneReleased bool
 }
 
 func (l *streamLedger) record(ev ir.StreamEvent) {

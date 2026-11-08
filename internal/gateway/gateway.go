@@ -326,6 +326,20 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 			// sentinel guard, protocol writers). It says nothing about what
 			// the client has SEEN — the reset only flows when nothing was
 			// delivered, so firstEvent stays false and the retry proceeds.
+		case ir.EvDone:
+			// BP-295: hold the terminal. The protocol writers turn EvDone into
+			// the wire's one terminal ([DONE] / message_stop /
+			// response.completed); the post-stream rescues (BP-112) and the
+			// length continuation (BP-295) still have to add segments AFTER
+			// this point, so the terminal goes out only when executeBinding
+			// releases it with the final stop reason. Held events still pass
+			// the ledger record above, and the sentinel has already flushed
+			// (it sits between the driver and here).
+			if !ledger.doneReleased {
+				done := ev
+				ledger.heldDone = &done
+				return nil
+			}
 		}
 		return emit(ev)
 	}
@@ -1049,9 +1063,13 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			}
 		}
 		elapsed := time.Since(started)
-		if cancel != nil {
-			cancel()
-		}
+		// NOTE (BP-295): the window context stays ALIVE through the rescues
+		// below — BP-112's rescue used to run after this cancel() on an
+		// already-canceled context, so every rescue since 2026-10-25 failed
+		// with "context canceled" whenever the binding had a first-byte
+		// window (any non-last binding). The timer itself stopped long ago
+		// (first emitted event), so releasing later is pure hygiene.
+		//
 		// Starved-thinking rescue (BP-112): a turn that spent its WHOLE output
 		// budget on reasoning (finish=length, no text, no tools, no surfaced
 		// thinking) gets ONE retry with thinking off at the SAME budget. The
@@ -1072,6 +1090,29 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				// The rescue failing is not the client's problem: the original
 				// empty answer already says finish=length honestly.
 				log.Printf("gateway: starved-thinking rescue failed (%v); returning the original answer", rerr)
+			}
+		}
+		// BP-295 length continuation: a finish=length turn with a PARTIAL prose
+		// answer whose budget the gateway raised (or whose thinking ate the
+		// shared budget) continues on the same account with thinking off —
+		// misakano 2b9b773/34a3ae6/29db878/e54c6e0/562d0d8. Pure client limits
+		// stay truncated: that length is the client's own semantics.
+		if contReq, why, ok := lengthContinuationPlan(binding.Channel, req, ledger, resp); ok {
+			resp = runLengthContinuation(actx, binding, lease, contReq, req, ledger, resp, drv, attemptEmit, why)
+		}
+		if cancel != nil {
+			cancel()
+		}
+		// BP-295: release the held terminal — exactly one, carrying the FINAL
+		// stop reason (a continuation may have turned length into end).
+		if ledger.heldDone != nil && !ledger.doneReleased {
+			ledger.doneReleased = true
+			final := ledger.heldDone.Stop
+			if resp != nil && resp.StopReason != "" {
+				final = resp.StopReason
+			}
+			if err := emit(ir.StreamEvent{Kind: ir.EvDone, Stop: final}); err != nil {
+				return nil, err
 			}
 		}
 		if streamErr == nil {

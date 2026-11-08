@@ -348,7 +348,7 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 					if !imageMIMEAllowed(mime) {
 						continue
 					}
-					main.Content = append(main.Content, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: data})
+					main.Content = append(main.Content, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: ir.StdBase64(data)})
 				} else if srcType == "url" {
 					u, _ := src["url"].(string)
 					main.Content = append(main.Content, ir.ContentPart{Kind: "image_url_unsupported", Text: u})
@@ -389,7 +389,7 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 									continue
 								}
 								if data != "" {
-									resultParts = append(resultParts, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: data})
+									resultParts = append(resultParts, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: ir.StdBase64(data)})
 								}
 							case "url":
 								if u, _ := src["url"].(string); u != "" {

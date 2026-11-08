@@ -313,7 +313,7 @@ func parseContent(role, model string, raw json.RawMessage) ([]ir.ContentPart, er
 				continue
 			}
 			if mime, b64, ok := ParseDataURL(url); ok {
-				out = append(out, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: b64})
+				out = append(out, ir.ContentPart{Kind: "image", ImageMIME: mime, ImageB64: ir.StdBase64(b64)})
 			}
 			// External http(s) image URLs are rejected upstream-side by
 			// policy (no server-side fetching). We keep them as a marker so

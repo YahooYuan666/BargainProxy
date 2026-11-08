@@ -636,6 +636,9 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 	if !terminated {
 		return nil, uperr.New(uperr.ClassTransport, 0, "antigravity: stream ended without terminal signal")
 	}
+	// BP-298: the loop broke on [DONE] — read the tail so the pooled
+	// connection survives.
+	httpx.Drain(r)
 
 	if len(toolCalls) > 0 && (stop == "" || stop == ir.StopEnd) {
 		// Gemini reports finishReason STOP even when it emitted function
