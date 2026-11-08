@@ -1444,6 +1444,21 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		if uperr.IsEdgeBlock(body) {
 			return uperr.EdgeBlocked(status, "antigravity: edge blocked: %s", truncate(body, 300))
 		}
+		if isTOSViolation(lower) {
+			// Google disabled the ACCOUNT for a Terms-of-Service violation
+			// (google.rpc.ErrorInfo reason=TOS_VIOLATION with an appeal_url).
+			// BP-292: this used to land in the ClassWAF bucket, whose pool
+			// handling is a 60-second rest — so the banned account returned to
+			// rotation every minute and was re-selected on every turn, firing a
+			// fresh 403 upstream each time, while the client was told "upstream
+			// edge blocked the request". Field case: xchu2693@gmail.com was
+			// disabled 2026-11-06 03:19 and kept being tried on 2026-11-07.
+			// A ban is per Google identity, so the pool must take this account
+			// out for its 7-day rest and let the sibling accounts (verified 200
+			// on the same egress) serve the turn.
+			return uperr.New(uperr.ClassAccountRestricted, status,
+				"antigravity: account disabled by upstream (TOS violation, appeal required): %s", truncate(body, 300))
+		}
 		return uperr.New(uperr.ClassWAF, status, "antigravity: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "antigravity: %s", truncate(body, 300))
@@ -1452,6 +1467,22 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	default:
 		return uperr.New(uperr.ClassInternal, status, "antigravity: %s", truncate(body, 300))
 	}
+}
+
+// isTOSViolation reports whether a 403 body is Google disabling the account
+// for a Terms-of-Service violation rather than an edge/Cloudflare refusal.
+// The structured marker is the ErrorInfo `reason` (surfaced verbatim in the
+// details array); the message wording is the fallback for shapes that drop the
+// details array. Expects the already-lowercased body.
+func isTOSViolation(lower string) bool {
+	if strings.Contains(lower, "tos_violation") {
+		return true
+	}
+	// "This service has been disabled in this account for violation of Terms
+	// of Service." — the appeal wording, not the account-specific ban text
+	// other products use ("account has been restricted"), which is what keeps a
+	// generic 403 on the WAF path.
+	return strings.Contains(lower, "violation of terms of service")
 }
 
 // parseQuotaReset extracts a precise reset moment from a QuotaFailure body.

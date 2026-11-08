@@ -1546,7 +1546,7 @@ func (s *Scheduler) probeAll(ctx context.Context, accountID string) (string, err
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
 		model.ChannelOpenAICompat, model.ChannelLobster,
 	}
-	probed, failed, skipped := 0, 0, 0
+	probed, failed, skipped, rested := 0, 0, 0, 0
 	var firstErr error
 	s.mu.Lock()
 	googleEvery := time.Duration(s.googleProbeMin) * time.Minute
@@ -1571,6 +1571,21 @@ func (s *Scheduler) probeAll(ctx context.Context, accountID string) (string, err
 				s.accountWait(ctx, probeOffsets[i])
 			}
 			if (acc.Disabled && !s.includeDisabledNow()) || (accountID != "" && acc.ID != accountID) {
+				continue
+			}
+			// BP-294: a resting account is upstream traffic with no upside —
+			// the pool will not select it until its cooldown lifts, so probing
+			// it only re-states what the panel already shows. This is the
+			// second path that kept a TOS-banned Google account polled every
+			// google_probe_minutes after BP-292 fixed the request path: the
+			// quota endpoint keeps answering 200 for a suspended account, so
+			// the probe never failed, never marked anything, and ran ~96
+			// times a day on credentials Google had just revoked service for
+			// (magpie hit the identical hole: yetone/magpie issue #5478).
+			// Automatic runs skip them like Disabled accounts; an explicit
+			// account-targeted run (the panel's probe button) still probes.
+			if accountID == "" && time.Now().Before(acc.AccountCooldownUntil) {
+				rested++
 				continue
 			}
 			// Channel cadence for automatic runs: Google every
@@ -1608,6 +1623,9 @@ func (s *Scheduler) probeAll(ctx context.Context, accountID string) (string, err
 	msg := fmt.Sprintf("probed %d accounts (%d failed", probed, failed)
 	if skipped > 0 {
 		msg += fmt.Sprintf(", %d within google %dmin cadence", skipped, int(googleEvery.Minutes()))
+	}
+	if rested > 0 {
+		msg += fmt.Sprintf(", %d resting skipped", rested)
 	}
 	return msg + ")", firstErr
 }
