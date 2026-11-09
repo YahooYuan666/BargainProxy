@@ -166,7 +166,9 @@ func (d *Driver) buildMessagesBody(call driver.ChatCall, creds *Creds) ([]byte, 
 			parts = append(parts, map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": input})
 		}
 		if len(parts) == 0 {
-			parts = append(parts, map[string]any{"type": "text", "text": ""})
+			// BP-299: pad with a space, not "" — an empty text block is a hard
+			// 400 (11151) upstream, and "   " passes its zero-length check.
+			parts = append(parts, map[string]any{"type": "text", "text": emptyTextFill})
 		}
 		msgs = append(msgs, map[string]any{"role": string(m.Role), "content": parts})
 	}

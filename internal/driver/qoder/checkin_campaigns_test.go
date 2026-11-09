@@ -74,8 +74,9 @@ func TestCheckinCampaignsFallback(t *testing.T) {
 }
 
 // TestCheckinCampaignsCarriesMachineIdentity: the campaigns requests must
-// carry Cosy-MachineToken / Cosy-MachineType (and a client-like UA), not
-// "Go-http-client/2.0" with no identity — that is what 0.2.30 fixed.
+// look like the client (UA), and the machine pair rides ONLY when it is REAL
+// (BP-305, hub issue #10): a derived pair gets the daily campaign silently
+// filtered, so without a helper the pair is omitted entirely.
 func TestCheckinCampaignsCarriesMachineIdentity(t *testing.T) {
 	var sawToken, sawType, sawUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,11 +102,11 @@ func TestCheckinCampaignsCarriesMachineIdentity(t *testing.T) {
 	if _, _, _, err := d.Checkin(context.Background(), acc); err != nil {
 		t.Fatalf("checkin: %v", err)
 	}
-	if sawToken == "" {
-		t.Fatal("campaigns request must carry Cosy-MachineToken (else the list omits CLAIM_BENEFIT)")
+	if sawToken != "" || sawType != "" {
+		t.Fatalf("derived fallback must omit the machine pair, sent (%q, %q)", sawToken, sawType)
 	}
-	if sawType == "" {
-		t.Fatal("campaigns request must carry Cosy-MachineType")
+	if sawUA == "" || sawUA == "Go-http-client/2.0" {
+		t.Fatalf("campaigns UA must read as the client, got %q", sawUA)
 	}
 	if sawUA == "Go-http-client/2.0" {
 		t.Fatalf("campaigns UA must read as the client, got %q", sawUA)

@@ -197,8 +197,9 @@ func TestLengthContinuationOnThinkingDominant(t *testing.T) {
 	}
 }
 
-// 纯客户端限额（预算够大、正文占大头、没有思考）→ length 是客户端自己的语义，
-// 不续写，原样下发。
+// 纯客户端限额（预算 < clientLimitLongAnswer=32000、正文占大头、没有思考）→
+// length 是客户端自己的语义，不续写，原样下发。（BP-301：≥32000 的预算按
+// 「要长文」处理，见 bp301 测试；16384 在 high 下限之上、阈值之下，是纯限额。）
 func TestPureClientLimitStaysTruncated(t *testing.T) {
 	drv := &lcFake{steps: []func(n int, call driver.ChatCall) ([]ir.StreamEvent, *ir.ChatResponse, error){
 		func(n int, call driver.ChatCall) ([]ir.StreamEvent, *ir.ChatResponse, error) {
@@ -210,7 +211,7 @@ func TestPureClientLimitStaysTruncated(t *testing.T) {
 				}, nil
 		},
 	}}
-	resp, res := runLC(t, drv, lcReq(32768, "high"))
+	resp, res := runLC(t, drv, lcReq(16384, "high"))
 	if len(drv.calls) != 1 {
 		t.Fatalf("driver calls = %d, want 1 (no continuation)", len(drv.calls))
 	}

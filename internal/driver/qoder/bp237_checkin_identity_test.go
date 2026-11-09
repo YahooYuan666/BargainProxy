@@ -166,9 +166,13 @@ func TestCheckinIdentityFallsBackToDerived(t *testing.T) {
 	if len(cs.tokens) == 0 {
 		t.Fatal("the campaigns list was never requested")
 	}
-	wantTok, wantTyp := d.machineIdentityFor(acc.UID)
-	if cs.tokens[0] != wantTok || cs.types[0] != wantTyp {
-		t.Fatalf("sent (%q, %q), want the derived pair (%q, %q)", cs.tokens[0], cs.types[0], wantTok, wantTyp)
+	// BP-305 (hub issue #10, MIT port): a DERIVED pair reads as a non-official
+	// client and the upstream silently filters the daily campaign out of the
+	// list. The derived fallback therefore sends NO machine pair at all —
+	// which also keeps the campaign visible for accounts without a local
+	// Qoder install.
+	if cs.tokens[0] != "" || cs.types[0] != "" {
+		t.Fatalf("derived fallback must send no machine pair, sent (%q, %q)", cs.tokens[0], cs.types[0])
 	}
 }
 
@@ -191,7 +195,7 @@ func TestCheckinIdentityCachesHelperReads(t *testing.T) {
 	d := New(config.QoderSettings{CheckinRuntimeInfo: exe}, nil)
 	acc := testQoderAccountWithUID(t)
 	for i := 0; i < 3; i++ {
-		if _, _, ok := d.realCheckinIdentity(context.Background(), acc.UID); !ok {
+		if _, _, ok := d.realCheckinIdentity(context.Background(), acc.UID, realmCfg("cn")); !ok {
 			t.Fatalf("read %d: helper identity not obtained", i)
 		}
 	}
@@ -223,7 +227,7 @@ func TestCheckinIdentityBadHelperOutputFallsBack(t *testing.T) {
 		CheckinMachineType:  "PINNED-TYPE",
 	}
 	d := New(cfg, nil)
-	tok, typ, source := d.checkinIdentity(context.Background(), "uid-1")
+	tok, typ, source := d.checkinIdentity(context.Background(), "uid-1", realmCfg("cn"))
 	if source != "config" {
 		t.Fatalf("source = %q, want config (a garbage helper must not be trusted)", source)
 	}
@@ -261,7 +265,7 @@ func TestChatHeadersKeepDerivedIdentity(t *testing.T) {
 	}
 	// And the check-in path really does take the real identity, so the
 	// comparison above is not vacuous.
-	tok, typ, source := d.checkinIdentity(context.Background(), acc.UID)
+	tok, typ, source := d.checkinIdentity(context.Background(), acc.UID, realmCfg("cn"))
 	if source != "runtime-info" || tok != "REAL-TOKEN" || typ != "REAL-TYPE" {
 		t.Fatalf("check-in identity = (%q, %q, %q), want the runtime-info pair", tok, typ, source)
 	}
@@ -326,11 +330,11 @@ func isWindows() bool {
 // accidental execution of something else).
 func TestFindQoderRuntimeInfoHonoursConfigPath(t *testing.T) {
 	exe := fakeRuntimeInfo(t, "TOK", "TYP")
-	if got := findQoderRuntimeInfo(); got != "" && !filepath.IsAbs(got) {
+	if got := findQoderRuntimeInfo(realmCfg("cn")); got != "" && !filepath.IsAbs(got) {
 		t.Fatalf("auto-detected path %q is not absolute", got)
 	}
 	d := New(config.QoderSettings{CheckinRuntimeInfo: exe}, nil)
-	tok, typ, source := d.checkinIdentity(context.Background(), "uid-1")
+	tok, typ, source := d.checkinIdentity(context.Background(), "uid-1", realmCfg("cn"))
 	if source != "runtime-info" {
 		t.Fatalf("source = %q, want runtime-info", source)
 	}

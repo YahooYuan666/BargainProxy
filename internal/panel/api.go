@@ -19,6 +19,7 @@ import (
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
 	"bargainproxy/internal/driver/lobster"
+	qoderpkg "bargainproxy/internal/driver/qoder"
 	"bargainproxy/internal/driver/zcode"
 	"bargainproxy/internal/gateway"
 	"bargainproxy/internal/model"
@@ -488,6 +489,7 @@ func normalizeImport(channel string, raw json.RawMessage, label string) (*model.
 		return &model.Account{
 			ID: model.ChannelQoder + ":" + shortHash(pat), Channel: channel,
 			Nickname: firstNonEmpty(label, strOf(m["name"]), "qoder"), CredsJSON: creds,
+			Realm: qoderpkg.NormalizeRealm(strOf(m["realm"])),
 		}, nil
 	case model.ChannelLobster:
 		var m map[string]any

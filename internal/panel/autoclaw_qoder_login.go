@@ -83,13 +83,14 @@ func (p *Panel) handleQoderPAT(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		PAT   string `json:"pat"`
 		Label string `json:"label"`
+		Realm string `json:"realm"` // BP-305: "cn"（默认）| "intl"
 	}
 	if !decode(w, r, &req) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	acc, err := d.LoginPAT(ctx, req.PAT, req.Label)
+	acc, err := d.LoginPAT(ctx, req.PAT, req.Label, req.Realm)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 		return

@@ -37,7 +37,7 @@ func TestStarvedShapeTriggersRescue(t *testing.T) {
 	req := starvedReq()
 	req.Thinking = &ir.ThinkingConfig{Enabled: true, Level: "high"}
 	req.RequestedEffort = "high"
-	retry, ok := starvedRetryRequest(req, starvedResp())
+	retry, ok := starvedRetryRequest(req, starvedResp(), &streamLedger{})
 	if !ok {
 		t.Fatal("starved shape must trigger the rescue")
 	}
@@ -80,7 +80,7 @@ func TestProducedContentIsNotStarved(t *testing.T) {
 		},
 	}
 	for name, resp := range cases {
-		if _, ok := starvedRetryRequest(starvedReq(), resp); ok {
+		if _, ok := starvedRetryRequest(starvedReq(), resp, &streamLedger{}); ok {
 			t.Fatalf("%s must NOT trigger the rescue", name)
 		}
 	}
@@ -90,7 +90,7 @@ func TestProducedContentIsNotStarved(t *testing.T) {
 func TestNoDeclaredBudgetNoRescue(t *testing.T) {
 	req := starvedReq()
 	req.MaxTokens = 0
-	if _, ok := starvedRetryRequest(req, starvedResp()); ok {
+	if _, ok := starvedRetryRequest(req, starvedResp(), &streamLedger{}); ok {
 		t.Fatal("no max_tokens: the rescue cannot know the budget, must not fire")
 	}
 }
@@ -99,7 +99,7 @@ func TestNoDeclaredBudgetNoRescue(t *testing.T) {
 func TestTinyBudgetNoRescue(t *testing.T) {
 	req := starvedReq()
 	req.MaxTokens = minStarvedBudget - 1
-	if _, ok := starvedRetryRequest(req, starvedResp()); ok {
+	if _, ok := starvedRetryRequest(req, starvedResp(), &streamLedger{}); ok {
 		t.Fatal("probe-sized budget must not be rescued")
 	}
 }
@@ -108,17 +108,17 @@ func TestTinyBudgetNoRescue(t *testing.T) {
 func TestThinkingAlreadyOffNoRescue(t *testing.T) {
 	req := starvedReq()
 	req.Thinking = &ir.ThinkingConfig{Enabled: false}
-	if _, ok := starvedRetryRequest(req, starvedResp()); ok {
+	if _, ok := starvedRetryRequest(req, starvedResp(), &streamLedger{}); ok {
 		t.Fatal("thinking already disabled: nothing for the rescue to change")
 	}
 }
 
 // Nil inputs never fire.
 func TestNilInputsNoRescue(t *testing.T) {
-	if _, ok := starvedRetryRequest(nil, starvedResp()); ok {
+	if _, ok := starvedRetryRequest(nil, starvedResp(), &streamLedger{}); ok {
 		t.Fatal("nil request must not fire")
 	}
-	if _, ok := starvedRetryRequest(starvedReq(), nil); ok {
+	if _, ok := starvedRetryRequest(starvedReq(), nil, &streamLedger{}); ok {
 		t.Fatal("nil response must not fire")
 	}
 }
@@ -128,7 +128,7 @@ func TestRescuePreservesRequest(t *testing.T) {
 	req := starvedReq()
 	req.Temperature = func() *float64 { f := 0.3; return &f }()
 	req.Thinking = &ir.ThinkingConfig{Enabled: true, Include: true}
-	retry, ok := starvedRetryRequest(req, starvedResp())
+	retry, ok := starvedRetryRequest(req, starvedResp(), &streamLedger{})
 	if !ok {
 		t.Fatal("must fire")
 	}
@@ -140,5 +140,77 @@ func TestRescuePreservesRequest(t *testing.T) {
 	// preference, not a thinking switch).
 	if retry.Thinking == nil || !retry.Thinking.Include {
 		t.Fatalf("Include must survive the rewrite, got %+v", retry.Thinking)
+	}
+}
+
+// BP-300 (misakano 07f8ae0 emptiedByThinking): finish=stop + zero answer
+// bytes + zero tools + reasoning DID stream → the same rescue (thinking off,
+// same budget). The client saw the thinking; the rescue segment adds only the
+// answer.
+func TestBP300ReasoningOnlyStopRescues(t *testing.T) {
+	req := starvedReq()
+	req.Thinking = &ir.ThinkingConfig{Enabled: true}
+	resp := starvedResp()
+	resp.StopReason = ir.StopEnd
+	resp.Thinking = "reasoning the client watched stream by"
+	retry, ok := starvedRetryRequest(req, resp, &streamLedger{})
+	if !ok {
+		t.Fatal("reasoning-only stop must trigger the rescue")
+	}
+	if retry.Thinking == nil || retry.Thinking.Enabled {
+		t.Fatal("rescue must disable thinking")
+	}
+	if retry.RequestedEffort != "" {
+		t.Fatal("rescue must drop the gear")
+	}
+	// The ledger variant counts too (streamed turns may leave resp.Thinking
+	// empty): thinking recorded in the ledger is surfaced to the client.
+	ledger := &streamLedger{}
+	ledger.thinking.WriteString("streamed reasoning")
+	resp2 := starvedResp()
+	resp2.StopReason = ir.StopEnd
+	if _, ok := starvedRetryRequest(req, resp2, ledger); !ok {
+		t.Fatal("ledger-recorded reasoning must trigger the rescue too")
+	}
+}
+
+// BP-300 guards: the discriminator is the COMBINATION — any missing leg is a
+// legitimate shape the rescue must not touch.
+func TestBP300ReasoningOnlyStopGuards(t *testing.T) {
+	ledger := &streamLedger{}
+	// Stop + reasoning but the turn produced text: a normal answer.
+	l1 := &streamLedger{}
+	l1.text.WriteString("an answer")
+	l1.thinking.WriteString("thought")
+	resp := &ir.ChatResponse{StopReason: ir.StopEnd, Thinking: "thought"}
+	if _, ok := starvedRetryRequest(starvedReq(), resp, l1); ok {
+		t.Fatal("stop with text is a normal answer, not a rescue")
+	}
+	// Stop + reasoning but tools were called: a tool turn.
+	l2 := &streamLedger{}
+	l2.thinking.WriteString("thought")
+	l2.sawTool = true
+	if _, ok := starvedRetryRequest(starvedReq(), resp, l2); ok {
+		t.Fatal("stop with tools is a tool turn, not a rescue")
+	}
+	// Stop, text 0B, but NO reasoning at all: a legitimately empty answer.
+	if _, ok := starvedRetryRequest(starvedReq(), &ir.ChatResponse{StopReason: ir.StopEnd}, ledger); ok {
+		t.Fatal("empty answer without reasoning must pass through untouched")
+	}
+	// Stop + reasoning but the client turned thinking OFF: nothing to change.
+	off := starvedReq()
+	off.Thinking = &ir.ThinkingConfig{Enabled: false}
+	r2 := starvedResp()
+	r2.StopReason = ir.StopEnd
+	r2.Thinking = "thought"
+	if _, ok := starvedRetryRequest(off, r2, ledger); ok {
+		t.Fatal("thinking-off client: the rescue cannot change anything")
+	}
+	// Length + surfaced thinking (client SAW thinking, turn truncated): shape A
+	// refuses, shape B requires stop — the surfaced thinking stays content.
+	r3 := starvedResp()
+	r3.Thinking = "partial reasoning"
+	if _, ok := starvedRetryRequest(starvedReq(), r3, ledger); ok {
+		t.Fatal("length with surfaced thinking must not be rescued")
 	}
 }

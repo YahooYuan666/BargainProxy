@@ -60,13 +60,21 @@ type cachedIdentity struct {
 //     old behaviour: the check-in then honestly reports "not available").
 //
 // The returned source is for logging/diagnostics, never for a decision.
-func (d *Driver) checkinIdentity(ctx context.Context, uid string) (token, typ, source string) {
-	if tok, ty, ok := d.realCheckinIdentity(ctx, uid); ok {
+func (d *Driver) checkinIdentity(ctx context.Context, uid string, rc realmConfig) (token, typ, source string) {
+	if tok, ty, ok := d.realCheckinIdentity(ctx, uid, rc); ok {
 		return tok, ty, "runtime-info"
 	}
-	if tok := strings.TrimSpace(d.cfg.CheckinMachineToken); tok != "" {
-		if ty := strings.TrimSpace(d.cfg.CheckinMachineType); ty != "" {
-			return tok, ty, "config"
+	if rc.Name == "cn" {
+		if tok := strings.TrimSpace(d.cfg.CheckinMachineToken); tok != "" {
+			if ty := strings.TrimSpace(d.cfg.CheckinMachineType); ty != "" {
+				return tok, ty, "config"
+			}
+		}
+	} else {
+		if tok := strings.TrimSpace(d.cfg.CheckinMachineTokenIntl); tok != "" {
+			if ty := strings.TrimSpace(d.cfg.CheckinMachineTypeIntl); ty != "" {
+				return tok, ty, "config"
+			}
 		}
 	}
 	t, ty := d.machineIdentityFor(uid)
@@ -76,27 +84,35 @@ func (d *Driver) checkinIdentity(ctx context.Context, uid string) (token, typ, s
 // realCheckinIdentity reads (and caches) the identity from Qoder's helper.
 // A failure is not fatal: the caller falls through to the pinned/derived
 // identity, which is the pre-BP-237 behaviour.
-func (d *Driver) realCheckinIdentity(ctx context.Context, uid string) (string, string, bool) {
+func (d *Driver) realCheckinIdentity(ctx context.Context, uid string, rc realmConfig) (string, string, bool) {
 	if uid == "" {
 		return "", "", false
 	}
+	cacheKey := rc.Name + "|" + uid
 	d.identMu.Lock()
-	if c, ok := d.identCache[uid]; ok && time.Since(c.at) < checkinIdentityTTL {
+	if c, ok := d.identCache[cacheKey]; ok && time.Since(c.at) < checkinIdentityTTL {
 		d.identMu.Unlock()
 		return c.token, c.typ, true
 	}
 	d.identMu.Unlock()
 
 	exe := strings.TrimSpace(d.cfg.CheckinRuntimeInfo)
+	if rc.Name != "cn" {
+		exe = strings.TrimSpace(d.cfg.CheckinRuntimeInfoIntl)
+	}
 	if exe == "" {
-		exe = findQoderRuntimeInfo()
+		exe = findQoderRuntimeInfo(rc)
 	}
 	if exe == "" {
 		return "", "", false
 	}
-	env := strings.TrimSpace(d.cfg.CheckinRuntimeEnv)
-	if env == "" {
-		env = "0" // Qoder CN
+	env := rc.UmidEnv
+	if rc.Name == "cn" {
+		// Legacy CN-only override (BP-237 era) keeps its seat; the intl
+		// realm has no legacy key and uses its own environment (3).
+		if e := strings.TrimSpace(d.cfg.CheckinRuntimeEnv); e != "" {
+			env = e
+		}
 	}
 	tok, ty, err := readRuntimeIdentity(ctx, exe, env, uid)
 	if err != nil {
@@ -109,7 +125,7 @@ func (d *Driver) realCheckinIdentity(ctx context.Context, uid string) (string, s
 	if d.identCache == nil {
 		d.identCache = map[string]cachedIdentity{}
 	}
-	d.identCache[uid] = cachedIdentity{token: tok, typ: ty, at: time.Now()}
+	d.identCache[cacheKey] = cachedIdentity{token: tok, typ: ty, at: time.Now()}
 	d.identMu.Unlock()
 	return tok, ty, true
 }
@@ -143,21 +159,37 @@ func readRuntimeIdentity(ctx context.Context, exe, environment, uid string) (str
 // findQoderRuntimeInfo locates Qoder's own helper. Paths mirror magpie
 // campaignRuntime: the desktop install first (user installer, then the
 // machine-wide one), then the CLI's cached copy.
-func findQoderRuntimeInfo() string {
+func findQoderRuntimeInfo(rc realmConfig) string {
 	name := "runtime-info.exe"
 	var dirs []string
 	if local := os.Getenv("LOCALAPPDATA"); local != "" {
-		dirs = append(dirs,
-			filepath.Join(local, "Programs", "Qoder CN", "resources", "umid"),
-			filepath.Join(local, "Programs", "Qoder", "resources", "umid"),
-		)
+		if rc.Name == "intl" {
+			// BP-305: this machine's intl install is "Qoder Global"; the
+			// plain "Qoder" name stays in the list (hub's intl app dir).
+			dirs = append(dirs,
+				filepath.Join(local, "Programs", "Qoder Global", "resources", "umid"),
+				filepath.Join(local, "Programs", "Qoder", "resources", "umid"),
+			)
+		} else {
+			dirs = append(dirs,
+				filepath.Join(local, "Programs", "Qoder CN", "resources", "umid"),
+				filepath.Join(local, "Programs", "Qoder", "resources", "umid"),
+			)
+		}
 	}
 	for _, key := range []string{"ProgramFiles", "ProgramW6432", "PROGRAMFILES"} {
 		if dir := os.Getenv(key); dir != "" {
-			dirs = append(dirs,
-				filepath.Join(dir, "Qoder CN", "resources", "umid"),
-				filepath.Join(dir, "Qoder", "resources", "umid"),
-			)
+			if rc.Name == "intl" {
+				dirs = append(dirs,
+					filepath.Join(dir, "Qoder Global", "resources", "umid"),
+					filepath.Join(dir, "Qoder", "resources", "umid"),
+				)
+			} else {
+				dirs = append(dirs,
+					filepath.Join(dir, "Qoder CN", "resources", "umid"),
+					filepath.Join(dir, "Qoder", "resources", "umid"),
+				)
+			}
 		}
 	}
 	// Non-default install roots (this machine keeps Qoder CN on D:).
@@ -173,7 +205,13 @@ func findQoderRuntimeInfo() string {
 	}
 	// CLI cache: <config>/.bin/umid-win32-<arch>-<hash>/runtime-info.exe
 	home, _ := os.UserHomeDir()
-	for _, cfgName := range []string{".qoder-cn", ".qoder"} {
+	// BP-305: the realm's own cache first — a wrong-realm helper answers
+	// with the wrong environment's identity.
+	cfgNames := []string{".qoder-cn", ".qoder"}
+	if rc.Name == "intl" {
+		cfgNames = []string{".qoder"}
+	}
+	for _, cfgName := range cfgNames {
 		base := filepath.Join(home, cfgName, ".bin")
 		entries, err := os.ReadDir(base)
 		if err != nil {

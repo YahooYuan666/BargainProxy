@@ -762,6 +762,10 @@ tr:last-child td{border-bottom:none}
         <div class="row" style="margin-bottom:8px">
           <input id="qdPat" placeholder="pt-..." style="min-width:320px">
           <input id="qdLabel" placeholder="备注名（可选）">
+          <select id="qdRealm" title="令牌所属站点（选错会报 personal token is invalid）">
+            <option value="cn">国内版</option>
+            <option value="intl">国际版</option>
+          </select>
         </div>
         <button class="primary" onclick="addQoder()">校验并添加</button>
       </div>
@@ -2306,7 +2310,7 @@ async function addQoder(){
   const label = document.getElementById('qdLabel').value.trim();
   if (!pat) return toast('请粘贴 pt- 开头的 PAT', true);
   try {
-    const r = await api('accounts/qoder/pat', {method:'POST', body: JSON.stringify({pat, label})});
+    const r = await api('accounts/qoder/pat', {method:'POST', body: JSON.stringify({pat, label, realm: (document.getElementById('qdRealm')||{value:'cn'}).value})});
     onboardOk('已添加：' + (r.id || ''));
   } catch(e){ onboardFail('添加失败：' + e.message); }
 }

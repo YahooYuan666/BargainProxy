@@ -146,6 +146,10 @@ type runtime struct {
 
 	bearerTok   string
 	bearerExpMs int64
+
+	// realm carries the per-account site config (BP-305): hosts, UMID
+	// environment, campaigns origin. Resolved once in runtimeFor.
+	realm realmConfig
 }
 
 // Driver implements driver.Driver for Qoder.
@@ -161,8 +165,10 @@ type Driver struct {
 	rt map[string]*runtime
 
 	catMu sync.Mutex
-	cat   *ModelCatalog
-	catAt time.Time
+	// cats caches the live model listing PER REALM (BP-305): CN and intl
+	// listings are different documents with different model sets.
+	cats  map[string]*ModelCatalog
+	catAt map[string]time.Time
 
 	// Device-fingerprint salt (see machineSalt): generated once, persisted in
 	// the driver's data dir, never changed afterwards.
@@ -189,6 +195,27 @@ func (d *Driver) gatewayBase() string {
 		return strings.TrimRight(d.cfg.GatewayBase, "/")
 	}
 	return authBase
+}
+
+// rt-scoped bases (BP-305): every caller that holds a runtime serves the
+// account's own realm.
+func (rt *runtime) openAPIBase() string { return rt.realm.OpenAPI }
+func (rt *runtime) gatewayBase() string { return rt.realm.Gateway }
+
+// realmCfgFor resolves the realm config with the legacy CN config overrides
+// applied (BP-305): the overrides keep steering the CN lane only; the intl
+// hosts are constants of the upstream's own client.
+func (d *Driver) realmCfgFor(realm string) realmConfig {
+	rc := realmCfg(realm)
+	if rc.Name == "cn" {
+		if d.cfg.OpenBase != "" {
+			rc.OpenAPI = strings.TrimRight(d.cfg.OpenBase, "/")
+		}
+		if d.cfg.GatewayBase != "" {
+			rc.Gateway = strings.TrimRight(d.cfg.GatewayBase, "/")
+		}
+	}
+	return rc
 }
 
 func (d *Driver) openAPIBase() string {
@@ -287,7 +314,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 			rt.mu.Unlock()
 			if haveState && requestSetID != "" && sess != nil {
 				deadline := time.Now().Add(minDuration(wait, queuePollBudget))
-				if d.awaitQueue(ctx, sess, state, requestSetID, deadline) {
+				if d.awaitQueue(ctx, rt.realm, sess, state, requestSetID, deadline) {
 					polled = true
 				} else if ctx.Err() != nil {
 					return nil, qoderError(ctx.Err())
@@ -317,6 +344,9 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 
 func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCall, emit driver.Emit, requestSetID string, usedSetID *string) (*ir.ChatResponse, bool, error) {
 	cat := d.getCatalog(ctx, rt)
+	if err := guardRealmModel(cat, call.UpstreamModel, rt.realm); err != nil {
+		return nil, false, err
+	}
 	body, display, qoderKey, toolsEnabled, setId, err := d.buildChatBody(call, rt, cat, requestSetID)
 	if err != nil {
 		return nil, false, err
@@ -328,7 +358,7 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	if err != nil {
 		return nil, false, uperr.New(uperr.ClassInternal, 0, "qoder: encode body: %v", err)
 	}
-	fullURL := d.gatewayBase() + chatPath
+	fullURL := rt.gatewayBase() + chatPath
 	date := time.Now().Unix()
 	rt.mu.Lock()
 	sess := rt.sess
@@ -352,7 +382,12 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return nil, false, classifyQoder(resp.StatusCode, string(raw))
+		ue := classifyQoder(resp.StatusCode, string(raw))
+		// BP-304 (plugins qoder 0.2.64 #880): `400 unknown or disabled model`
+		// on a listing-disabled key with the credits spent is the account's
+		// daily quota, not a bad request — recast so the pool rests instead
+		// of hammering a drained account every minute.
+		return nil, false, d.recastCreditsOffModel(ctx, rt, ue)
 	}
 	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer streamBody.Close()
@@ -926,7 +961,7 @@ func (d *Driver) runtimeFor(acc *model.Account) (*runtime, error) {
 		acc.CredsJSON = c.Marshal()
 		acc.CredsDirty = true
 	}
-	rt := &runtime{creds: *c, sessions: newSessionTable()}
+	rt := &runtime{creds: *c, realm: d.realmCfgFor(acc.Realm), sessions: newSessionTable()}
 	d.rt[acc.ID] = rt
 	return rt, nil
 }
@@ -1004,7 +1039,7 @@ func (d *Driver) ensureFreshSession(ctx context.Context, rt *runtime) error {
 			// through to the PAT exchange — the PAT lasts a year, the
 			// refresh two days.
 		}
-		jt, err := d.exchangeJobToken(ctx, &rt.creds)
+		jt, err := d.exchangeJobToken(ctx, rt.realm, &rt.creds)
 		if err != nil {
 			return err
 		}
@@ -1019,7 +1054,7 @@ func (d *Driver) ensureFreshSession(ctx context.Context, rt *runtime) error {
 // rebuilt from it (the info blob embeds securityOauthToken/refreshToken).
 func (d *Driver) refreshJobToken(ctx context.Context, rt *runtime, refreshToken string) error {
 	body, _ := json.Marshal(map[string]any{"refresh_token": refreshToken})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.openAPIBase()+pathJobRefresh, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.openAPIBase()+pathJobRefresh, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -1097,7 +1132,7 @@ func (d *Driver) applyJobToken(ctx context.Context, rt *runtime, jt map[string]a
 	sec := toString(jt["securityOauthToken"])
 	ref := toString(jt["refreshToken"])
 	if ut == "" && id != "" {
-		if u, err := d.fetchUserStatus(ctx, &rt.creds, id); err == nil {
+		if u, err := d.fetchUserStatus(ctx, rt.realm, &rt.creds, id); err == nil {
 			ut = u
 		}
 	}
@@ -1130,7 +1165,7 @@ func (d *Driver) applyJobToken(ctx context.Context, rt *runtime, jt map[string]a
 }
 
 func (d *Driver) forceRefresh(ctx context.Context, rt *runtime) error {
-	jt, err := d.exchangeJobToken(ctx, &rt.creds)
+	jt, err := d.exchangeJobToken(ctx, rt.realm, &rt.creds)
 	if err != nil {
 		return err
 	}
@@ -1316,15 +1351,15 @@ func (d *Driver) postEncoded(ctx context.Context, url string, obj any, c *Creds)
 	return out, nil
 }
 
-func (d *Driver) exchangeJobToken(ctx context.Context, c *Creds) (map[string]any, error) {
+func (d *Driver) exchangeJobToken(ctx context.Context, rc realmConfig, c *Creds) (map[string]any, error) {
 	inner, err := marshalNoEscape(jobTokenInner{PersonalToken: c.PAT, AuthInfo: json.RawMessage("{}")})
 	if err != nil {
 		return nil, err
 	}
-	return d.postEncoded(ctx, d.gatewayBase()+jobPath, encodedPayload{Payload: string(inner), EncodeVersion: "1"}, c)
+	return d.postEncoded(ctx, rc.Gateway+jobPath, encodedPayload{Payload: string(inner), EncodeVersion: "1"}, c)
 }
 
-func (d *Driver) fetchUserStatus(ctx context.Context, c *Creds, userID string) (string, error) {
+func (d *Driver) fetchUserStatus(ctx context.Context, rc realmConfig, c *Creds, userID string) (string, error) {
 	inner, err := marshalNoEscape(struct {
 		UserID             string          `json:"userId"`
 		PersonalToken      string          `json:"personalToken"`
@@ -1336,15 +1371,15 @@ func (d *Driver) fetchUserStatus(ctx context.Context, c *Creds, userID string) (
 	if err != nil {
 		return "", err
 	}
-	raw, err := d.postEncoded(ctx, d.gatewayBase()+statPath, encodedPayload{Payload: string(inner), EncodeVersion: "1"}, c)
+	raw, err := d.postEncoded(ctx, rc.Gateway+statPath, encodedPayload{Payload: string(inner), EncodeVersion: "1"}, c)
 	if err != nil {
 		return "", err
 	}
 	return toString(raw["userType"]), nil
 }
 
-func (d *Driver) fetchModelCatalog(ctx context.Context, sess *sessionContext) (map[string]any, error) {
-	full := d.gatewayBase() + modelPath
+func (d *Driver) fetchModelCatalog(ctx context.Context, rc realmConfig, sess *sessionContext) (map[string]any, error) {
+	full := rc.Gateway + modelPath
 	dateUnix := time.Now().Unix()
 	bearer := sess.buildBearer(dateUnix, "", sigPath(full))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)
@@ -1379,7 +1414,7 @@ func (d *Driver) openBearer(ctx context.Context, rt *runtime) (string, error) {
 		return tok, nil
 	}
 	body, _ := marshalNoEscape(map[string]string{"personal_token": rt.creds.PAT})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.openAPIBase()+pathJobExchange, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rt.openAPIBase()+pathJobExchange, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
@@ -1418,7 +1453,7 @@ func deriveCheckinID(uid, salt string) string {
 
 // checkinHeaders builds the campaigns/check-in header set. machineToken and
 // machineType come from the account's derived device triple (BP-98 Qoder-2).
-func checkinHeaders(bearer, uid, machineToken, machineType string) map[string]string {
+func checkinHeaders(bearer, uid, machineToken, machineType, identSource string, rc realmConfig) map[string]string {
 	h := map[string]string{
 		"Content-Type":  "application/json",
 		"Accept":        "application/json, text/plain, */*",
@@ -1427,8 +1462,8 @@ func checkinHeaders(bearer, uid, machineToken, machineType string) map[string]st
 		"X-Request-ID":  deriveCheckinID(uid, "req") + fmt.Sprintf("-%06d", time.Now().UnixNano()%1e6),
 		"X-Machine-ID":  deriveCheckinID(uid, "machine"),
 		"X-Session-ID":  deriveCheckinID(uid, "session"),
-		"Origin":        "https://qoder.com.cn",
-		"Referer":       "https://qoder.com.cn/",
+		"Origin":        rc.Website,
+		"Referer":       rc.Website + "/",
 		// Device identity on the Cosy header family (BP-98 Qoder-2,
 		// magpie-community/plugins packages/qoder 0.2.30 campaignCall):
 		// Qoder CN moved the daily 100 credits to the desktop benefit center
@@ -1436,11 +1471,19 @@ func checkinHeaders(bearer, uid, machineToken, machineType string) map[string]st
 		// request carries the account's device identity.
 		"Cosy-ClientType": "10",
 	}
-	if machineToken != "" {
-		h["Cosy-MachineToken"] = machineToken
-	}
-	if machineType != "" {
-		h["Cosy-MachineType"] = machineType
+	// Hub issue #10 (per-header isolation, MIT port): a MADE-UP device token
+	// reads as a non-official client and the upstream silently filters the
+	// daily-benefit campaign out of the list; sending NO machine pair at all
+	// keeps the campaign visible. So the pair rides only when it is REAL
+	// (runtime-info helper or a pinned config pair) — the derived fallback
+	// sends nothing (BP-305).
+	if identSource == "runtime-info" || identSource == "config" {
+		if machineToken != "" {
+			h["Cosy-MachineToken"] = machineToken
+		}
+		if machineType != "" {
+			h["Cosy-MachineType"] = machineType
+		}
 	}
 	return h
 }
@@ -1458,7 +1501,7 @@ const (
 	campaignClaim = "/sash/api/v1/me/campaigns/%s/claim"
 )
 
-func (d *Driver) checkinJSON(ctx context.Context, method, url string, body []byte, uid, bearer string) (map[string]any, error) {
+func (d *Driver) checkinJSON(ctx context.Context, method, url string, body []byte, uid, bearer string, rc realmConfig) (map[string]any, error) {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
@@ -1471,8 +1514,8 @@ func (d *Driver) checkinJSON(ctx context.Context, method, url string, body []byt
 	// own client registered (BP-237); the derived identity is an unknown
 	// device there. See checkinIdentity for the precedence and why this is
 	// scoped to the check-in path.
-	mt, mty, _ := d.checkinIdentity(ctx, uid)
-	for k, v := range checkinHeaders(bearer, uid, mt, mty) {
+	mt, mty, src := d.checkinIdentity(ctx, uid, rc)
+	for k, v := range checkinHeaders(bearer, uid, mt, mty, src, rc) {
 		req.Header.Set(k, v)
 	}
 	resp, err := d.rpc.Do(req)
@@ -1535,9 +1578,15 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 	// Qoder's helper, a pinned pair, or the derived (unknown-device) one. The
 	// "no campaign" answer means different things per source, so it travels
 	// with the result.
-	_, _, identSource := d.checkinIdentity(ctx, uid)
-	out, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+pathCheckStatus, nil, uid, bearer)
+	_, _, identSource := d.checkinIdentity(ctx, uid, rt.realm)
+	out, err := d.checkinJSON(ctx, http.MethodGet, rt.openAPIBase()+pathCheckStatus, nil, uid, bearer, rt.realm)
 	if err != nil {
+		// BP-305: the intl site 404s the legacy daily-check-in endpoints
+		// (hub: the daily benefit lives on the campaigns platform there) —
+		// fall through to campaigns exactly like the CN DISABLED case.
+		if ue, ok := uperr.As(err); ok && ue.Status == http.StatusNotFound {
+			return d.checkinCampaigns(ctx, uid, bearer, identSource, rt.realm)
+		}
 		return false, 0, false, qoderError(err)
 	}
 	switch status := toString(out["status"]); status {
@@ -1555,9 +1604,9 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 		// claimStatus was CLAIMED, i.e. the account HAD been claiming — just
 		// never through us. Fall through to the campaigns path; it is the only
 		// path that can still answer "claimable" on today's upstream.
-		return d.checkinCampaigns(ctx, uid, bearer, identSource)
+		return d.checkinCampaigns(ctx, uid, bearer, identSource, rt.realm)
 	case "CLAIMABLE":
-		claim, cerr := d.checkinJSON(ctx, http.MethodPost, d.openAPIBase()+pathCheckClaim, []byte("{}"), uid, bearer)
+		claim, cerr := d.checkinJSON(ctx, http.MethodPost, rt.openAPIBase()+pathCheckClaim, []byte("{}"), uid, bearer, rt.realm)
 		if cerr != nil {
 			return false, 0, false, qoderError(cerr)
 		}
@@ -1569,16 +1618,16 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 		}
 		reward := toInt64(claim["rewardCredits"])
 		// Pro upgrade pack is one-off; claim it best-effort after a fresh sign-in.
-		if elig, eerr := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+pathProElig, nil, uid, bearer); eerr == nil {
+		if elig, eerr := d.checkinJSON(ctx, http.MethodGet, rt.openAPIBase()+pathProElig, nil, uid, bearer, rt.realm); eerr == nil {
 			if ok, _ := elig["eligible"].(bool); ok {
-				_, _ = d.checkinJSON(ctx, http.MethodPost, d.openAPIBase()+pathProClaim, []byte("{}"), uid, bearer)
+				_, _ = d.checkinJSON(ctx, http.MethodPost, rt.openAPIBase()+pathProClaim, []byte("{}"), uid, bearer, rt.realm)
 			}
 		}
 		return false, reward, true, nil
 	default:
 		// The legacy endpoint no longer describes the daily credit: read the
 		// campaigns page the current client uses.
-		return d.checkinCampaigns(ctx, uid, bearer, identSource)
+		return d.checkinCampaigns(ctx, uid, bearer, identSource, rt.realm)
 	}
 }
 
@@ -1594,8 +1643,8 @@ func (d *Driver) Checkin(ctx context.Context, acc *model.Account) (checkedIn boo
 // NESTED benefit.amount — `rewardCredits` and a flat `benefit.amount` key
 // belong to the retired daily-check-in endpoints, so reading them reported a
 // successful claim as "+0 credits".
-func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer, identSource string) (bool, int64, bool, error) {
-	list, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+campaignPath, nil, uid, bearer)
+func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer, identSource string, rc realmConfig) (bool, int64, bool, error) {
+	list, err := d.checkinJSON(ctx, http.MethodGet, rc.OpenAPI+campaignPath, nil, uid, bearer, rc)
 	if err != nil {
 		return false, 0, false, qoderError(err)
 	}
@@ -1685,7 +1734,7 @@ func (d *Driver) checkinCampaigns(ctx context.Context, uid, bearer, identSource 
 	if id == "" {
 		return false, 0, true, fmt.Errorf("qoder campaigns: CLAIM_BENEFIT campaign without id")
 	}
-	claim, err := d.checkinJSON(ctx, http.MethodPost, d.openAPIBase()+fmt.Sprintf(campaignClaim, id), []byte("{}"), uid, bearer)
+	claim, err := d.checkinJSON(ctx, http.MethodPost, rc.OpenAPI+fmt.Sprintf(campaignClaim, id), []byte("{}"), uid, bearer, rc)
 	if err != nil {
 		return false, 0, false, qoderError(err)
 	}
@@ -1763,7 +1812,7 @@ func (d *Driver) CatalogMap(ctx context.Context, acc *model.Account) (map[string
 	if sess == nil {
 		return nil, fmt.Errorf("no session")
 	}
-	raw, err := d.fetchModelCatalog(ctx, sess)
+	raw, err := d.fetchModelCatalog(ctx, rt.realm, sess)
 	if err != nil {
 		return nil, qoderError(err)
 	}
@@ -1795,7 +1844,7 @@ func (d *Driver) QuotaRaw(ctx context.Context, acc *model.Account) (map[string]a
 			return nil, qoderError(err)
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.openAPIBase()+quotaPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.openAPIBase()+quotaPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1823,17 +1872,30 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "qoder: %v", err)
 	}
-	if err := d.ensureFreshSession(ctx, rt); err != nil {
+	doc, err := d.fetchUsageDoc(ctx, rt)
+	if err != nil {
+		if ue, ok := uperr.As(err); ok {
+			return nil, ue
+		}
 		return nil, qoderError(err)
+	}
+	return probeCreditsFromDoc(doc), nil
+}
+
+// fetchUsageDoc pulls the quota document (probe + BP-304 recast share it).
+func (d *Driver) fetchUsageDoc(ctx context.Context, rt *runtime) (map[string]any, error) {
+	if err := d.ensureFreshSession(ctx, rt); err != nil {
+		return nil, err
 	}
 	rt.mu.Lock()
 	tok := rt.securityOauth
 	rt.mu.Unlock()
 	if tok == "" {
-		tok, err = d.openBearer(ctx, rt)
+		t, err := d.openBearer(ctx, rt)
 		if err != nil {
-			return nil, qoderError(err)
+			return nil, err
 		}
+		tok = t
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.openAPIBase()+quotaPath, nil)
 	if err != nil {
@@ -1854,7 +1916,7 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, uperr.New(uperr.ClassTransport, 0, "qoder: quota decode: %v", err)
 	}
-	return probeCreditsFromDoc(doc), nil
+	return doc, nil
 }
 
 // probeCreditsFromDoc maps the quota document onto the balance: plan remain/
@@ -1933,7 +1995,7 @@ func probeCreditsFromDoc(doc map[string]any) *driver.ProbeResult {
 
 // LoginPAT validates a personal access token and builds the account
 // (panel onboarding). The stable identity is the jobToken id.
-func (d *Driver) LoginPAT(ctx context.Context, pat, label string) (*model.Account, error) {
+func (d *Driver) LoginPAT(ctx context.Context, pat, label, realm string) (*model.Account, error) {
 	pat = strings.TrimSpace(pat)
 	if !strings.HasPrefix(pat, "pt-") {
 		return nil, fmt.Errorf("PAT 必须以 pt- 开头")
@@ -1942,7 +2004,7 @@ func (d *Driver) LoginPAT(ctx context.Context, pat, label string) (*model.Accoun
 	// yields the same virtual device instead of a fresh random one.
 	m := deriveMachineIDs(patFingerprint(pat), d.machineSalt())
 	c := &Creds{PAT: pat, Name: label, MachineID: m.machineID, MachineToken: m.machineToken, MachineType: m.machineType}
-	jt, err := d.exchangeJobToken(ctx, c)
+	jt, err := d.exchangeJobToken(ctx, d.realmCfgFor(realm), c)
 	if err != nil {
 		return nil, err
 	}
@@ -1952,7 +2014,7 @@ func (d *Driver) LoginPAT(ctx context.Context, pat, label string) (*model.Accoun
 		return nil, fmt.Errorf("jobToken 响应缺少 id，无法建立稳定身份")
 	}
 	return &model.Account{
-		ID: model.ChannelQoder + ":" + id, Channel: model.ChannelQoder,
+		ID: model.ChannelQoder + ":" + id, Channel: model.ChannelQoder, Realm: normalizeRealm(realm),
 		UID: id, Nickname: firstNonEmpty(label, name, "qoder"),
 		CredsJSON: c.Marshal(),
 	}, nil
@@ -2108,6 +2170,77 @@ func qoderQuotaFallback(body string) string {
 func nextLocal04(now time.Time) time.Time {
 	n := now.AddDate(0, 0, 1)
 	return time.Date(n.Year(), n.Month(), n.Day(), 4, 0, 0, 0, now.Location())
+}
+
+// disabledModelRe (BP-304): the shape Qoder answers for a model the
+// account's listing has turned off — `400 unknown or disabled model "key"`.
+var disabledModelRe = regexp.MustCompile(`unknown or disabled model "([^"]+)"`)
+
+// nextLocal10 is the next daily-credits grant. Qoder releases the day's
+// share at 10:00 local (BP-150/151), so a credits-exhausted rest ends there.
+func nextLocal10(now time.Time) time.Time {
+	t := time.Date(now.Year(), now.Month(), now.Day(), 10, 0, 0, 0, now.Location())
+	if !t.After(now) {
+		t = t.AddDate(0, 0, 1)
+	}
+	return t
+}
+
+// recastCreditsOffModel (BP-304, plugins qoder 0.2.64 #880, magpie#5726):
+// once the daily credits are spent, Qoder turns the account's models OFF in
+// the listing and answers chat requests with `400 unknown or disabled model`
+// — which reads as a bad request while the truth is "this account's quota is
+// gone until the 10:00 grant". The recast fires only when ALL THREE hold:
+// the error names that shape, the LIVE listing has the key marked disabled
+// (a fresh fetch — the 10-minute cache can predate the drain), and the
+// account's usage says nothing spendable is left. An id the upstream never
+// served, credits still remaining, or an unreadable usage doc all stay a 400
+// (misakano's own boundary: 宁可少判不可判错).
+func (d *Driver) recastCreditsOffModel(ctx context.Context, rt *runtime, ue *uperr.Error) *uperr.Error {
+	if ue == nil || ue.Class != uperr.ClassBadRequest {
+		return ue
+	}
+	m := disabledModelRe.FindStringSubmatch(ue.Message)
+	if m == nil {
+		return ue
+	}
+	key := m[1]
+	rt.mu.Lock()
+	sess := rt.sess
+	rt.mu.Unlock()
+	if sess == nil {
+		return ue
+	}
+	raw, err := d.fetchModelCatalog(ctx, rt.realm, sess)
+	if err != nil {
+		return ue
+	}
+	cat := extractCatalog(raw)
+	off := cat != nil && cat.Off[key]
+	doc, docErr := d.fetchUsageDoc(ctx, rt)
+	var cr *model.Credits
+	if docErr == nil {
+		cr = probeCreditsFromDoc(doc).Credits
+	}
+	return recastCreditsOff(ue, key, off, cr)
+}
+
+// recastCreditsOff is the BP-304 decision, split out for the branch matrix:
+// recast ONLY when the key is confirmed disabled in the live listing AND the
+// usage doc says nothing is spendable. Every other combination keeps the
+// original 400.
+func recastCreditsOff(ue *uperr.Error, key string, off bool, cr *model.Credits) *uperr.Error {
+	if key == "" || !off {
+		return ue
+	}
+	if cr == nil || cr.Remain+cr.Bonus+cr.Sota > 0 {
+		return ue
+	}
+	e := uperr.New(uperr.ClassHardCredit, 429,
+		"qoder: usage limit reached (credits exhausted): %s is off in the account's listing until the daily grant", key)
+	e.Code = "credits_off"
+	e.ResetAt = nextLocal10(time.Now())
+	return e
 }
 
 func classifyQoder(status int, body string) *uperr.Error {

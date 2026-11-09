@@ -116,6 +116,7 @@ func (d *Driver) CheckinStatus(ctx context.Context, acc *model.Account) (*Checki
 	if err != nil {
 		return nil, err
 	}
+	rc := rt.realm
 	bearer, err := d.openBearer(ctx, rt)
 	if err != nil {
 		return nil, qoderError(err)
@@ -128,7 +129,7 @@ func (d *Driver) CheckinStatus(ctx context.Context, acc *model.Account) (*Checki
 	if uid == "" {
 		uid = acc.UID
 	}
-	out, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+pathCheckStatus, nil, uid, bearer)
+	out, err := d.checkinJSON(ctx, http.MethodGet, rc.OpenAPI+pathCheckStatus, nil, uid, bearer, rc)
 	if err != nil {
 		return nil, qoderError(err)
 	}
@@ -146,7 +147,7 @@ func (d *Driver) CheckinStatus(ctx context.Context, acc *model.Account) (*Checki
 	}
 	// DISABLED / anything else: ask the campaigns page instead of repeating a
 	// status that no longer describes the programme.
-	if cs, cerr := d.campaignCheckinState(ctx, uid, bearer); cerr == nil && cs != nil {
+	if cs, cerr := d.campaignCheckinState(ctx, uid, bearer, rc); cerr == nil && cs != nil {
 		cs.StreakDays = st.StreakDays
 		return cs, nil
 	}
@@ -157,8 +158,8 @@ func (d *Driver) CheckinStatus(ctx context.Context, acc *model.Account) (*Checki
 // campaignCheckinState derives the check-in status from the campaigns page:
 // the active CLAIM_BENEFIT campaign is the daily 100-credit benefit.
 // A nil result means "no active daily campaign at all".
-func (d *Driver) campaignCheckinState(ctx context.Context, uid, bearer string) (*CheckinState, error) {
-	list, err := d.checkinJSON(ctx, http.MethodGet, d.openAPIBase()+campaignPath, nil, uid, bearer)
+func (d *Driver) campaignCheckinState(ctx context.Context, uid, bearer string, rc realmConfig) (*CheckinState, error) {
+	list, err := d.checkinJSON(ctx, http.MethodGet, rc.OpenAPI+campaignPath, nil, uid, bearer, rc)
 	if err != nil {
 		return nil, qoderError(err)
 	}

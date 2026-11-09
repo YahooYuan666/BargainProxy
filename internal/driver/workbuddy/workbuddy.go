@@ -105,6 +105,13 @@ const (
 	// same body fails on every account, so this is request-level: no rotation,
 	// no account penalty (2026-10-19).
 	codePromptTooLong = 11115
+	// codeEmptyContent (BP-299, misakano f987bac): "a message has empty
+	// content" — some text block in the history is empty. The same body fails
+	// on every account, so rotation only burns the pool and feeds the
+	// loss-streak; the empty shapes are padded on the way out (emptytext.go),
+	// so reaching classify means the repair missed a shape and the client
+	// should hear the honest 400.
+	codeEmptyContent = 11151
 	// codeAccountRestricted: upstream restricted the ACCOUNT ("request
 	// illegal" + displayMsg "账号存在异常行为，已被限制使用"). Refreshing cannot
 	// fix it; the account must leave routing. The same code also carries a
@@ -416,15 +423,25 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 		if m.Role == ir.RoleTool {
 			// OpenAI tool messages carry a plain string; image parts are not
 			// representable here and must not leak into the request (BP-70).
-			wire["content"] = ir.TextOf(m.Content)
+			// BP-299: a string that sniffs as a parts array with an empty text
+			// block (scraped form JSON) dies at the upstream with 11151 — pad
+			// before it leaves.
+			wire["content"] = padSniffedString(ir.TextOf(m.Content))
 		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
-			wire["content"] = m.Content[0].Text
+			wire["content"] = padSniffedString(m.Content[0].Text)
 		} else {
 			var parts []map[string]any
 			for _, p := range m.Content {
 				switch p.Kind {
 				case "text":
-					parts = append(parts, map[string]any{"type": "text", "text": p.Text})
+					// BP-299: an empty text part is a hard 400 (11151); the
+					// upstream passes "   ", so one space carries the shape
+					// without giving the model anything to read.
+					text := p.Text
+					if text == "" {
+						text = emptyTextFill
+					}
+					parts = append(parts, map[string]any{"type": "text", "text": text})
 				case "image":
 					parts = append(parts, map[string]any{
 						"type":      "image_url",
@@ -1192,6 +1209,11 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		return e
 	case codeBadParams:
 		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: %s", msg)
+	case codeEmptyContent:
+		// BP-299 (misakano f987bac): request-level empty text block. No
+		// rotation, no account penalty — bad_request never rotates — and the
+		// 400 carries the upstream words so the client can drop that message.
+		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: empty text block in request history: %s", msg)
 	case codeChannelRefused:
 		// The channel check refused the caller's system prompt. Request-level:
 		// no account penalty, and the driver retries once with the prompt moved

@@ -9,12 +9,18 @@
 // dies mid-sentence; effort=max thinking swings 7612~37110 on one prompt).
 // The client sees stop=length with a half answer and no way to know why.
 //
-// Two signals say "this length was not the client's choice":
+// Three signals say "this length was not the client's choice":
 //  1. the gateway raised the budget to the effort floor on the way out — the
 //     effective cap was OUR number, not the client's (34a3ae6 budgetWasRaised);
 //  2. thinking dominates the answer — the same steal, measured after the fact
 //     (562d0d8 starvedByThinking; this upstream reports no reasoning_tokens,
-//     so bytes stand in for the token ratio).
+//     so bytes stand in for the token ratio);
+//  3. the client's budget is ≥ clientLimitLongAnswer (6e7fe62): measured on
+//     the reference panel (global:deepseek-v4.1-flash-sg, "count to 20000"),
+//     max_tokens=32000 cut at exactly 32000 mid-sentence while the same prompt
+//     without a limit ran to 60660 — this upstream gives-as-much-as-you-pay,
+//     and a budget that large is a client DEFAULT (ZCode's own), not "I want
+//     exactly this many tokens".
 //
 // Either one → continue on the SAME account with thinking disabled (the only
 // thing that ate the budget), spliced into the same client stream by the
@@ -61,6 +67,11 @@ const (
 	// continuationMinBudget mirrors config's probe floor: max_tokens below
 	// this is a liveness probe, not a budget.
 	continuationMinBudget = 16
+	// clientLimitLongAnswer (misakano 6e7fe62): a client budget at or above
+	// this is treated as "wants a long answer", not "wants exactly this many
+	// tokens" — the field measurement behind it is in the package comment
+	// (signal 3).
+	clientLimitLongAnswer = 32000
 )
 
 // floorGear normalizes the client's requested gear for the floor lookup;
@@ -72,6 +83,23 @@ func floorGear(effort string) (string, bool) {
 		return "", false
 	}
 	return gear, true
+}
+
+// effortFloor is the output-budget floor for the request's effort gear, 0
+// when no gear is set or the catalog has no floor for the model. Shared by
+// the length continuation and the stop rescues (same cumulative cap).
+func effortFloor(req *ir.ChatRequest) int {
+	if req == nil {
+		return 0
+	}
+	gear, ok := floorGear(req.RequestedEffort)
+	if !ok {
+		return 0
+	}
+	if f, known := config.MinOutputBudget(gear, req.Model, req.Model); known {
+		return f
+	}
+	return 0
 }
 
 // lengthContinuationPlan decides whether a finish=length turn with a partial
@@ -90,34 +118,51 @@ func lengthContinuationPlan(channel string, req *ir.ChatRequest, ledger *streamL
 		// continued here (see the package comment).
 		return nil, "", false
 	}
-	if req.Thinking != nil && !req.Thinking.Enabled {
-		// Already off: a continuation cannot change anything.
+	if req.MaxTokens < continuationMinBudget {
 		return nil, "", false
 	}
 	why := ""
+	longAnswer := false
 	wasRaised := false
-	floor := 0
-	if gear, ok := floorGear(req.RequestedEffort); ok {
-		if f, known := config.MinOutputBudget(gear, req.Model, req.Model); known {
-			floor = f
-			if req.MaxTokens >= continuationMinBudget && req.MaxTokens < f {
-				wasRaised = true
-				why = fmt.Sprintf("budget was raised to the %s floor %d", gear, f)
-			}
-		}
+	floor := effortFloor(req)
+	if floor > 0 && req.MaxTokens < floor {
+		wasRaised = true
+		why = fmt.Sprintf("budget was raised to the %s floor %d", strings.ToLower(req.RequestedEffort), floor)
 	}
-	if !wasRaised && ledger.thinking.Len() > 0 && ledger.thinking.Len() >= ledger.text.Len() {
+	if why == "" && ledger.thinking.Len() > 0 && ledger.thinking.Len() >= ledger.text.Len() {
 		// Bytes stand in for the token ratio: this upstream reports no
 		// reasoning_tokens. Think >= text ≈ thinking ate at least half of the
 		// shared budget.
 		why = "thinking dominates the answer"
 	}
+	if why == "" && req.MaxTokens >= clientLimitLongAnswer {
+		// Signal 3 (misakano 6e7fe62): the budget is a client default, not an
+		// answer spec. Unlike signals 1-2 this one does not need thinking to
+		// be on — the cut is pure length, so a thinking-off client's answer
+		// cut at 32000 continues just the same.
+		longAnswer = true
+		why = fmt.Sprintf("client budget %d is a long-answer default (>= %d)", req.MaxTokens, clientLimitLongAnswer)
+	}
 	if why == "" {
+		return nil, "", false
+	}
+	if req.Thinking != nil && !req.Thinking.Enabled && !longAnswer {
+		// Already off: for signals 1-2 a continuation cannot change anything
+		// (the mechanism was freeing the budget FROM thinking). Signal 3
+		// carries on regardless — the answer was cut by the number itself.
 		return nil, "", false
 	}
 	capTokens := defaultContinueTotalCap
 	if floor > 0 {
 		capTokens = floor * continueTotalCapRatio
+	}
+	if longAnswer && capTokens < 2*clientLimitLongAnswer {
+		// Our cap is CUMULATIVE across segments (the upstream's is
+		// per-segment), so the plain floor×4 / 32768 default would stop a
+		// 32000-budget continuation almost immediately. The measured natural
+		// length (60660) fits under 2× the client default; keep the floor's
+		// own cap when its ×4 already exceeds that.
+		capTokens = 2 * clientLimitLongAnswer
 	}
 	if ledger.usage.OutputTokens >= capTokens {
 		log.Printf("gateway: workbuddy cumulative output %d reached the continuation cap %d (floor %d × %d) — leaving the answer truncated at finish=length",

@@ -1070,14 +1070,17 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		// window (any non-last binding). The timer itself stopped long ago
 		// (first emitted event), so releasing later is pure hygiene.
 		//
-		// Starved-thinking rescue (BP-112): a turn that spent its WHOLE output
-		// budget on reasoning (finish=length, no text, no tools, no surfaced
-		// thinking) gets ONE retry with thinking off at the SAME budget. The
-		// retry reclaims the budget FROM thinking; raising it would overspend
-		// what the client asked. See starved.go for every guard.
-		if retryReq, starved := starvedRetryRequest(req, resp); starved {
-			log.Printf("gateway: %s turn ended finish=length with no output at max_tokens=%d — thinking consumed the budget; retrying once with thinking disabled",
-				binding.Channel, req.MaxTokens)
+		// Starved-thinking rescue (BP-112, BP-300): a turn whose output budget
+		// produced NOTHING the client can act on gets ONE retry with thinking
+		// off at the SAME budget. Shape A (BP-112): finish=length, nothing
+		// surfaced — thinking silently ate the budget. Shape B (BP-300,
+		// misakano 07f8ae0): finish=stop with reasoning streamed and no answer
+		// — the upstream "thought and said done". See starved.go for every
+		// guard.
+		stopRescueTried := false
+		if retryReq, starved := starvedRetryRequest(req, resp, ledger); starved {
+			log.Printf("gateway: %s turn ended stop=%s with no output at max_tokens=%d — thinking left nothing answerable; retrying once with thinking disabled",
+				binding.Channel, resp.StopReason, req.MaxTokens)
 			retryCall := call
 			retryCall.Request = retryReq
 			startedRetry := time.Now()
@@ -1090,6 +1093,50 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				// The rescue failing is not the client's problem: the original
 				// empty answer already says finish=length honestly.
 				log.Printf("gateway: starved-thinking rescue failed (%v); returning the original answer", rerr)
+			}
+		}
+		// BP-302/303 stop-shaped rescues (misakano c2003af + 1037397): the
+		// turn ended stop with prose the upstream called complete, but that
+		// reads as "stopped mid-thought" — a lead-in tail (narration) or a
+		// one-liner right after a tool result (tool-only). ONE segment per
+		// request; the tool-only segment's prose is discarded and the segment
+		// adopted only when it produces tool calls (BP-293's gateway-side
+		// remedy). See stoprescue.go for every gate.
+		if scReq, kind, why, ok := stopRescuePlan(binding.Channel, req, ledger, resp, stopRescueTried); ok {
+			stopRescueTried = true
+			segEmit := attemptEmit
+			if kind == "toolonly" {
+				// Discard the rescue's prose/thinking everywhere: the client
+				// sees nothing unless the segment actually acts.
+				segEmit = func(ev ir.StreamEvent) error {
+					if ev.Kind == ir.EvText || ev.Kind == ir.EvThinking {
+						return nil
+					}
+					return attemptEmit(ev)
+				}
+			}
+			log.Printf("gateway: %s turn ended stop but looks unfinished (%s) — trying one %s rescue segment on the same account",
+				binding.Channel, why, kind)
+			rescResp, rerr := drv.Stream(actx, driver.ChatCall{
+				Account: lease.Account, UpstreamModel: binding.UpstreamModel,
+				Request: scReq,
+			}, segEmit)
+			switch {
+			case rerr != nil:
+				log.Printf("gateway: %s %s rescue failed (%v); the original answer stands", binding.Channel, kind, rerr)
+			case rescResp == nil:
+				log.Printf("gateway: %s %s rescue returned nothing; the original answer stands", binding.Channel, kind)
+			case kind == "narration", len(rescResp.Message.ToolCalls) > 0, ledger.sawTool:
+				if kind == "toolonly" {
+					log.Printf("gateway: %s tool-only rescue produced tool calls — adopted", binding.Channel)
+				}
+				resp = mergedResponse(ledger, rescResp)
+			default:
+				// Rollback: the rescue only talked. The client has seen
+				// nothing extra (the prose was filtered), so the original
+				// answer and terminal stand byte-for-byte.
+				log.Printf("gateway: %s tool-only rescue produced no tool calls (%d B prose discarded) — rolled back to the original answer",
+					binding.Channel, len(ledger.text.String()))
 			}
 		}
 		// BP-295 length continuation: a finish=length turn with a PARTIAL prose

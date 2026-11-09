@@ -189,7 +189,7 @@ func queuePause(q queueState) time.Duration {
 //
 // A false answer is not an error: the caller then falls back to the plain
 // sleep retry it used before this existed.
-func (d *Driver) awaitQueue(ctx context.Context, sess *sessionContext, q queueState, requestSetID string, deadline time.Time) bool {
+func (d *Driver) awaitQueue(ctx context.Context, rc realmConfig, sess *sessionContext, q queueState, requestSetID string, deadline time.Time) bool {
 	if requestSetID == "" || sess == nil {
 		return false
 	}
@@ -198,7 +198,7 @@ func (d *Driver) awaitQueue(ctx context.Context, sess *sessionContext, q queueSt
 		if !time.Now().Before(deadline) {
 			return false
 		}
-		state, err := d.queueStatus(ctx, sess, requestSetID, q)
+		state, err := d.queueStatus(ctx, rc, sess, requestSetID, q)
 		if err != nil {
 			// 404 means there is no queue status here at all; anything else is
 			// tolerated a few times before giving up on polling.
@@ -234,7 +234,7 @@ func (d *Driver) awaitQueue(ctx context.Context, sess *sessionContext, q queueSt
 }
 
 // queueStatus asks the queue where the request stands.
-func (d *Driver) queueStatus(ctx context.Context, sess *sessionContext, requestSetID string, q queueState) (queueState, error) {
+func (d *Driver) queueStatus(ctx context.Context, rc realmConfig, sess *sessionContext, requestSetID string, q queueState) (queueState, error) {
 	params := url.Values{"requestSetId": {requestSetID}}
 	if q.ModelKey != "" {
 		params.Set("modelKey", q.ModelKey)
@@ -242,7 +242,7 @@ func (d *Driver) queueStatus(ctx context.Context, sess *sessionContext, requestS
 	if q.QueueType != "" {
 		params.Set("queueType", q.QueueType)
 	}
-	full := d.gatewayBase() + queueStatusPath + "?" + params.Encode()
+	full := rc.Gateway + queueStatusPath + "?" + params.Encode()
 	dateUnix := time.Now().Unix()
 	bearer := sess.buildBearer(dateUnix, "", sigPath(full))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, full, nil)

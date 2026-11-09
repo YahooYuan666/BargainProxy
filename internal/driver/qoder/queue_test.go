@@ -112,7 +112,7 @@ func TestAwaitQueueReleasesWhenNoLongerQueued(t *testing.T) {
 // sleep retry it always had.
 func TestAwaitQueueGivesUpWithoutStatusEndpoint(t *testing.T) {
 	d := &Driver{}
-	if d.awaitQueue(context.Background(), nil, queueState{}, "rs-1", time.Now().Add(time.Second)) {
+	if d.awaitQueue(context.Background(), realmCfg("cn"), nil, queueState{}, "rs-1", time.Now().Add(time.Second)) {
 		t.Fatal("awaitQueue must not claim a release without a session")
 	}
 }

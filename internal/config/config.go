@@ -305,6 +305,14 @@ type QoderSettings struct {
 	// They are a snapshot: Qoder's desktop client renews its native identity
 	// hourly, so a hand-pinned pair goes stale — prefer the helper.
 	CheckinMachineToken string `json:"checkin_machine_token"`
+	// CheckinRuntimeInfoIntl is the intl realm's helper path (BP-305); empty
+	// = auto-detect (Qoder Global desktop, then the .qoder CLI cache).
+	CheckinRuntimeInfoIntl string `json:"checkin_runtime_info_intl"`
+	// CheckinMachineTokenIntl / CheckinMachineTypeIntl pin the intl realm's
+	// identity by hand (intl upstream offers the daily credits ONLY to a
+	// real device identity).
+	CheckinMachineTokenIntl string `json:"checkin_machine_token_intl"`
+	CheckinMachineTypeIntl  string `json:"checkin_machine_type_intl"`
 	CheckinMachineType  string `json:"checkin_machine_type"`
 }
 

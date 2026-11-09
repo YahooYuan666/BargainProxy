@@ -180,6 +180,19 @@ const continueToolNudge = "你上一条回复在调用工具时因连接中断�
 // mutated request would leak the synthetic assistant turn into the next binding
 // and into the caller's own retries.
 func continuationRequest(req *ir.ChatRequest, ledger *streamLedger, redoTool bool) *ir.ChatRequest {
+	nudge := continueNudge
+	if redoTool {
+		nudge = continueToolNudge
+	}
+	return continuationRequestNudge(req, ledger, nudge)
+}
+
+// continuationRequestNudge is continuationRequest with an explicit
+// instruction: the stop-shaped rescues use their own nudges (the model must
+// be told WHY it is being asked to go on — "you stopped on a lead-in" vs
+// "carry on from the cut"), while the transport and length paths keep the
+// shared ones.
+func continuationRequestNudge(req *ir.ChatRequest, ledger *streamLedger, nudge string) *ir.ChatRequest {
 	clone := *req
 	msgs := make([]ir.Message, 0, len(req.Messages)+2)
 	msgs = append(msgs, req.Messages...)
@@ -188,10 +201,6 @@ func continuationRequest(req *ir.ChatRequest, ledger *streamLedger, redoTool boo
 			Role:    ir.RoleAssistant,
 			Content: []ir.ContentPart{{Kind: "text", Text: txt}},
 		})
-	}
-	nudge := continueNudge
-	if redoTool {
-		nudge = continueToolNudge
 	}
 	msgs = append(msgs, ir.Message{
 		Role:    ir.RoleUser,

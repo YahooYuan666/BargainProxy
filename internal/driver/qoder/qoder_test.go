@@ -131,7 +131,7 @@ func TestLoginPAT(t *testing.T) {
 	}))
 	defer srv.Close()
 	d := New(config.QoderSettings{Enabled: true, GatewayBase: srv.URL, OpenBase: srv.URL, MaxInFlight: 1}, nil)
-	acc, err := d.LoginPAT(context.Background(), "pt-abc", "备注")
+	acc, err := d.LoginPAT(context.Background(), "pt-abc", "备注", "cn")
 	if err != nil {
 		t.Fatalf("login: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestLoginPAT(t *testing.T) {
 	if _, err := ParseCreds(acc.CredsJSON); err != nil {
 		t.Fatalf("creds: %v", err)
 	}
-	if _, err := d.LoginPAT(context.Background(), "bad", ""); err == nil {
+	if _, err := d.LoginPAT(context.Background(), "bad", "", "cn"); err == nil {
 		t.Fatal("non-pt PAT must be rejected")
 	}
 }

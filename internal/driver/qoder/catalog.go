@@ -43,6 +43,17 @@ type ModelCatalog struct {
 	VisionModels map[string]bool
 	Caps         map[string]*ModelCaps
 	DefaultName  string
+	// Off (BP-304, plugins qoder 0.2.64 #880): keys the listing names but
+	// marks enable=false — since the daily credits run out, Qoder turns the
+	// account's models off in the listing instead of erroring in quota code,
+	// and chat requests to them come back `400 unknown or disabled model`.
+	// Keys the listing does not name at all are NOT here (a never-served id
+	// must stay a 400).
+	Off map[string]bool
+	// Live marks a catalog fetched from the upstream listing (BP-305): the
+	// static fallback must not gate models — an intl account falling back to
+	// the CN static list would wrongly reject intl-exclusive keys.
+	Live bool
 }
 
 const defaultMaxOutputTokens = 32000
@@ -362,17 +373,22 @@ func extractCatalog(raw map[string]interface{}) *ModelCatalog {
 	modelMap := map[string]string{}
 	vision := map[string]bool{}
 	caps := map[string]*ModelCaps{}
+	off := map[string]bool{}
 	for _, item := range sceneList {
 		m, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		if enableVal, has := m["enable"]; has && !enableFlag(enableVal) {
-			continue
-		}
 		key, _ := m["key"].(string)
 		name, _ := m["display_name"].(string)
 		if key == "" || name == "" || key == "auto" || key == "default" {
+			continue
+		}
+		if enableVal, has := m["enable"]; has && !enableFlag(enableVal) {
+			// BP-304: named-but-disabled keys are RECORDED, not dropped — the
+			// credits-exhausted recast needs to tell them apart from ids the
+			// upstream never served.
+			off[key] = true
 			continue
 		}
 		// The app scene wins over chat twins: the first entry for a key in
@@ -398,7 +414,7 @@ func extractCatalog(raw map[string]interface{}) *ModelCatalog {
 	if len(modelMap) == 0 {
 		return nil
 	}
-	return &ModelCatalog{ModelMap: modelMap, VisionModels: vision, Caps: caps,
+	return &ModelCatalog{ModelMap: modelMap, VisionModels: vision, Caps: caps, Off: off,
 		DefaultName: nameForKey(modelMap, preferredDefaultKey)}
 }
 
@@ -446,9 +462,9 @@ func (c *ModelCatalog) resolveModel(model string) (string, string, error) {
 // getCatalog returns the cached catalogue, refreshing it from the upstream
 // every 10 minutes. Any failure falls back to the static map.
 func (d *Driver) getCatalog(ctx context.Context, rt *runtime) *ModelCatalog {
+	realm := rt.realm.Name
 	d.catMu.Lock()
-	if d.cat != nil && time.Since(d.catAt) < 10*time.Minute {
-		cat := d.cat
+	if cat := d.cats[realm]; cat != nil && time.Since(d.catAt[realm]) < 10*time.Minute {
 		d.catMu.Unlock()
 		return cat
 	}
@@ -461,7 +477,7 @@ func (d *Driver) getCatalog(ctx context.Context, rt *runtime) *ModelCatalog {
 			sess := rt.sess
 			rt.mu.Unlock()
 			if sess != nil {
-				if raw, err := d.fetchModelCatalog(ctx, sess); err == nil {
+				if raw, err := d.fetchModelCatalog(ctx, rt.realm, sess); err == nil {
 					fetched = extractCatalog(raw)
 					// BP-203 (plugins 3c279f6): a listing that names NONE of
 					// the known paid models means the job token is restricted
@@ -478,7 +494,7 @@ func (d *Driver) getCatalog(ctx context.Context, rt *runtime) *ModelCatalog {
 							sess = rt.sess
 							rt.mu.Unlock()
 							if sess != nil {
-								if raw2, err2 := d.fetchModelCatalog(ctx, sess); err2 == nil {
+								if raw2, err2 := d.fetchModelCatalog(ctx, rt.realm, sess); err2 == nil {
 									if refetched := extractCatalog(raw2); refetched != nil && !paidModelMissing(refetched) {
 										fetched = refetched
 									}
@@ -494,12 +510,18 @@ func (d *Driver) getCatalog(ctx context.Context, rt *runtime) *ModelCatalog {
 			log.Printf("qoder model/list session: %v (fallback)", err)
 		}
 	}
+	live := fetched != nil
 	if fetched == nil {
 		fetched = defaultCatalog()
 	}
+	fetched.Live = live
 	d.catMu.Lock()
-	d.cat = fetched
-	d.catAt = time.Now()
+	if d.cats == nil {
+		d.cats = map[string]*ModelCatalog{}
+		d.catAt = map[string]time.Time{}
+	}
+	d.cats[realm] = fetched
+	d.catAt[realm] = time.Now()
 	d.catMu.Unlock()
 	return fetched
 }
