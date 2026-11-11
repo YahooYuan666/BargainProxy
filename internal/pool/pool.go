@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"sort"
 	"strings"
@@ -1954,6 +1955,44 @@ func (p *Pool) SessionBinding(channel, sessionKey string) (string, bool) {
 	defer p.mu.Unlock()
 	b, ok := p.sessions[channel+"|"+sessionKey]
 	return b.accountID, ok
+}
+
+// UnbindSession drops a conversation's stickiness on one channel (BP-311).
+//
+// Stickiness exists to keep a warm vendor cache (BP-95), and it assumes the
+// bound account can still serve the turn. A leg that reached the account and
+// got NOTHING back (dropped socket, empty 5xx body) breaks that assumption:
+// staying put means the pool hands the same dead account back and the whole
+// channel gives up while its other accounts sit idle. Field 2026-11-11 20:53:
+// the conversation was pinned to one of six WorkBuddy accounts; it dropped
+// with a 5.2s EOF and the request cascaded to Trae, Qoder and Lobster while
+// five healthy accounts (5160/3039/4577/395/382 credits) were never tried —
+// the very next request was served by one of them.
+//
+// Only the binding is dropped: no account penalty, no cooldown, no change to
+// the cache-worthiness rules that decide whether staying is useful at all.
+// Callers must have first established the failure was not the payload's fault
+// (transport-level, nothing delivered).
+func (p *Pool) UnbindSession(channel, sessionKey string) {
+	if p == nil || sessionKey == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := channel + "|" + sessionKey
+	if b, ok := p.sessions[key]; ok {
+		delete(p.sessions, key)
+		log.Printf("pool: %s unbinding session %08x from account %s after a no-response failure",
+			channel, fnv32(sessionKey), b.accountID)
+	}
+}
+
+// fnv32 is a tiny stable hash for log lines (never prints the raw session key,
+// which is derived from the client's own conversation fingerprint).
+func fnv32(s string) uint32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(s))
+	return h.Sum32()
 }
 
 // pickLocked dispatches to the channel strategy. Callers must hold the lock.

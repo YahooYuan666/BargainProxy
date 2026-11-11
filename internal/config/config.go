@@ -97,6 +97,17 @@ type Config struct {
 	// ignored (they can never be a binding).
 	ChannelFirstByteWindows map[string]Duration `json:"channel_first_byte_windows"`
 
+	// ChannelMaxBodyBytes caps the WIRE size a channel can accept, per
+	// channel, e.g. {"lobster": 4194304}. The gateway estimates the request's
+	// byte size (ir.EstimateRequestBytes) and skips channels whose ceiling it
+	// exceeds before dispatching — a 6MB screenshot-laden history used to
+	// burn workbuddy's and trae's dispatch windows (both EOF on oversize
+	// bodies) before lobster's own 4MB gate answered in 10ms (BP-312).
+	// Only channels with a MEASURED ceiling belong here; an invented number
+	// would refuse requests the channel might have served. Unset channels are
+	// ungated. 0 = no gate for that channel.
+	ChannelMaxBodyBytes map[string]int64 `json:"channel_max_body_bytes"`
+
 	// Upstream watchdogs (ticket 27; applied at startup — restart to change):
 	//   RPCTimeout    total timeout for short billing/refresh/probe calls (default 120s);
 	//   HeaderTimeout time to first byte on chat streams (default 300s);
@@ -471,6 +482,14 @@ func Default() *Config {
 		// five-leg cascade at 5 minutes. AutoClaw keeps its own longer ceiling
 		// via channels.autoclaw.first_byte_window.
 		FirstByteWindow: Duration(60 * time.Second),
+		// BP-312: the only MEASURED wire ceiling is lobster's own 4MB gate
+		// (stream.go maxBodyBytes: 4.5MB survives, 5MB dies). Workbuddy and
+		// trae die on oversize bodies too (EOF) but their exact limits were
+		// never measured, so they stay ungated — an invented number would
+		// refuse requests the channel might have served.
+		ChannelMaxBodyBytes: map[string]int64{
+			"lobster": 4 << 20,
+		},
 		// One account per pool at a time: the anti-risk-control default
 		// (2026-10-20). Explicitly setting false restores multi-account
 		// concurrency within a pool.

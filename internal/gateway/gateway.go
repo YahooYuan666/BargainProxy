@@ -385,6 +385,9 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	emitted := func() bool { return firstEvent }
 	busyCount := 0
 	attempted := false
+	// BP-312: one byte-size proxy for the whole request, computed once — the
+	// per-channel wire-ceiling gate below consults it for every binding.
+	requestBytes := ir.EstimateRequestBytes(req)
 	// BP-309 no-response accounting: a leg that never received an HTTP
 	// response says nothing about its own account, but a streak of them
 	// across different channels says the egress is gone.
@@ -473,6 +476,27 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 			lastErr = uperr.New(uperr.ClassBadRequest, 400,
 				"autoclaw relay is text-only and cannot carry images; another channel is required")
 			continue
+		}
+		// BP-312 byte-budget gate: a channel with a MEASURED wire ceiling
+		// cannot take this request at all — dispatching it only buys a dead
+		// wait and, when the channel sits last, makes ITS error the final one.
+		// Field 2026-11-11 22:56: a screenshot-laden history (6MB wire body)
+		// burned workbuddy's and trae's dispatch windows on EOF before
+		// lobster's 4MB gate answered in 10ms. The estimate is a cheap proxy
+		// (text + image base64 + tools + thinking), deliberately BELOW the
+		// serialized size, so a borderline request still gets its attempt.
+		// Pinned channels are exempt: the caller asked for that channel's
+		// honest answer, and a 413 from the driver itself is exactly that.
+		if !pinned {
+			if ceiling := g.cfg.ChannelMaxBodyBytes[binding.Channel]; ceiling > 0 && int64(requestBytes) > ceiling {
+				lastErr = uperr.New(uperr.ClassBadRequest, 413,
+					"%s rejects request bodies over %d bytes (estimated %d bytes); another channel is required",
+					binding.Channel, ceiling, requestBytes)
+				tr.note(binding.Channel)
+				log.Printf("gateway: %s/%s skipped in pre-flight: estimated body %d bytes > %s wire ceiling %d bytes",
+					binding.Channel, req.Model, requestBytes, binding.Channel, ceiling)
+				continue
+			}
 		}
 		// Pre-flight availability gate (BP-64): do not queue on a channel
 		// that has nothing usable right now when another binding can serve.
@@ -626,6 +650,34 @@ func isNoResponseFailure(ue *uperr.Error) bool {
 		return true
 	}
 	return false
+}
+
+// isRepeatPenaltyFree reports whether a SECOND dispatch of the same account
+// within one binding would just repeat the same wall (BP-311).
+//
+// It covers the no-response family above plus the "answered with nothing
+// useful" transport failures: an upstream that returned 5xx with an EMPTY body
+// has proven the request cannot be served there right now, and the official
+// client's own remedy is to switch models/channels, not to resend. Field
+// 2026-11-11 20:54: lobster answered `empty response body (HTTP 500)` three
+// times in 6 seconds for the same account — 18s + 3.4s + 3.2s of a 49.5s
+// failure spent proving the same thing.
+//
+// Deliberately NOT extended to rate limits (soft_rate/model_rate): a short
+// upstream hold can legitimately clear, and a sticky conversation re-serving
+// the same account afterwards is the designed behaviour (TestQuotaExhausted-
+// AndRotation depends on it).
+func isRepeatPenaltyFree(ue *uperr.Error) bool {
+	if ue == nil {
+		return false
+	}
+	if isNoResponseFailure(ue) {
+		return true
+	}
+	if ue.Class != uperr.ClassTransport || ue.Status < 500 {
+		return false
+	}
+	return strings.Contains(strings.ToLower(ue.Message), "empty response body")
 }
 
 // markEgressDown arms the process-wide fast-fail window (BP-309).
@@ -900,12 +952,12 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			return nil, cerr
 		}
 		// BP-310: the pool handed back an account this binding already tried
-		// and failed on. Do not pay it twice — but ONLY when the previous
-		// failure was a no-response transport failure (status 0, nothing
-		// delivered): that is the case where a retry just repeats a timeout.
-		// Rate-limit classes keep the old behaviour, where a sticky session
-		// may legitimately re-serve the same account after a short hold.
-		if tried[lease.Account.ID] && isNoResponseFailure(lastUE) {
+		// and failed on. Do not pay it twice — the previous failure says a
+		// retry would meet the same wall (no response at all, or a 5xx with an
+		// empty body; BP-311 widened this from status-0 only). Rate-limit
+		// classes keep the old behaviour, where a sticky session may
+		// legitimately re-serve the same account after a short hold.
+		if tried[lease.Account.ID] && isRepeatPenaltyFree(lastUE) {
 			lease.Release()
 			if lastErr != nil {
 				log.Printf("gateway: %s has no untried account left (account %s already failed this leg); cascading",
@@ -1037,7 +1089,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 						started = time.Now()
 						resp, streamErr = drv.Stream(actx, retryCall, attemptEmit)
 					}
-				} else if (tr == nil || !tr.BadRequestResent) && req.Stream {
+				} else if (tr == nil || !tr.BadRequestResent) && req.Stream && ue.Status != 413 {
 					// BP-168: upstreams do emit LYING 400s. Field evidence
 					// 2026-10-28 23:46: Google's antigravity answered a generic
 					// INVALID_ARGUMENT to the 54th request of a healthy
@@ -1051,6 +1103,11 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 					// one gets through. Only while nothing reached the client
 					// (the outer guard) and only on streaming turns, where
 					// "no output yet" is meaningful.
+					//
+					// BP-312: a 413 (payload too large) is the opposite of
+					// flaky — the body cannot shrink by resending it. Field
+					// 2026-11-11 22:56: lobster's 4MB gate answered 413 and
+					// the guard re-sent the same 6MB body for another 413.
 					//
 					// The AttemptReset first: whatever the dead attempt left
 					// buffered (sentinel hold-back, protocol writer state)
@@ -1427,6 +1484,17 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		g.persistCreds(lease.Account)
 		lease.Release()
 		lastErr = streamErr
+		// BP-311: the bound account could not be reached at all. Stickiness is
+		// only worth keeping while the account can still serve the turn; hold
+		// it here and the pool hands the same dead account back, the binding
+		// gives up, and the channel's OTHER healthy accounts never get a turn
+		// (field 2026-11-11 20:53: the conversation was pinned to one of six
+		// WorkBuddy accounts; a 5.2s EOF sent the request cascading to Trae,
+		// Qoder and Lobster while five accounts with thousands of credits sat
+		// idle). Drop the binding, not the account: no cooldown, no penalty.
+		if isNoResponseFailure(ue) {
+			g.pool.UnbindSession(binding.Channel, req.SessionKey)
+		}
 		if !uperr.Rotatable(ue.Class) {
 			// Do not rotate accounts within THIS binding — but a downstream
 			// channel is a different upstream whose content inspection may
@@ -1703,6 +1771,12 @@ func DescribeError(err error) (status int, class string, message string) {
 	case uperr.ClassBadRequest:
 		if ue.Status == 404 {
 			return 404, ue.Class, ue.Message
+		}
+		// BP-312: a payload-too-large answer is its own HTTP semantic —
+		// rendering it as 400 hid the one fact ("the body is too big for this
+		// channel, not malformed") the client needed.
+		if ue.Status == 413 {
+			return 413, ue.Class, ue.Message
 		}
 		return 400, ue.Class, ue.Message
 	case uperr.ClassContentBlocked, uperr.ClassSentinel:

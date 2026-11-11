@@ -72,15 +72,21 @@ const preferredDefaultKey = "qfmodel"
 // exist when the desktop header family is on (channels.qoder.desktop_protocol),
 // and the live catalogue carries them in that mode.
 var DefaultModelMap = map[string]string{
-	"Qwen3.8-Max":       "qmodel_38max",
-	"Qwen3.8-Flash":     "qfmodel",
+	"Qwen3.8-Max":   "qmodel_38max",
+	"Qwen3.8-Flash": "qfmodel",
+	// BP-311: the live listing (qprobe -catalog, 2026-11-11) carries
+	// Qwen4-Max-Preview behind qmodel_latest — the id qmodel_latest used to
+	// point at Qwen3.7-Max before that family was pulled.
+	"Qwen4-Max-Preview": "qmodel_latest",
 	"DeepSeek-V4-Pro":   "dmodel",
 	"DeepSeek-Flash":    "dfmodel",
 	"GLM-5.3":           "gmodel",
 	"GLM-5.3-Flash":     "gfmodel",
 	"Kimi-K3.1-Pro":     "kmodel_latest",
 	"Kimi-K2.8-Preview": "kmodel",
-	"MiniMax-M2.7":      "mmodel",
+	// BP-311: the listing renamed this model; the same key (mmodel) now
+	// answers as MiniMax-M3.1-Flash.
+	"MiniMax-M3.1-Flash": "mmodel",
 }
 
 // defaultCatalog returns the static fallback catalogue.

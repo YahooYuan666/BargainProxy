@@ -2101,7 +2101,14 @@ func (d *Driver) Models(ctx context.Context) ([]string, error) {
 		// `kimi-k3.1` spelling is answered 11158 "service info not found",
 		// which reads like an account-type limit but is a name error.
 		"kimi-k2.6", "kimi-k2.7", "kimi-k3", "kimi-k3-1", "kimi-k3.1-pro", "minimax-m3",
-		"hy3", "hy3-preview", "gemini-3.5-flash",
+		"hy3", "hy3-preview",
+		// BP-311: the CN /v3/config catalogue (2026-11-11) names the Hy4 family
+		// as two separate ids — hy4std is the flagship, hy4free the limited-time
+		// free tier the desktop client shows at 0.00×. Older entries like
+		// step-5-preview / mimo-v2.6-pro / space-bunny are listed there too but
+		// have no route of their own yet.
+		"hy4std", "hy4free",
+		"gemini-3.5-flash",
 	}, nil
 }
 

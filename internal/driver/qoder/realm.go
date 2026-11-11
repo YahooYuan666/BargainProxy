@@ -78,14 +78,38 @@ func realmCfg(realm string) realmConfig {
 // feeds the BP-304 credits recast. The static fallback catalog never gates
 // (an intl account falling back to the CN static list would wrongly reject
 // intl-exclusive keys).
-func guardRealmModel(cat *ModelCatalog, key string, rc realmConfig) error {
-	if cat == nil || !cat.Live || key == "" {
+//
+// BP-311: the catalogue is keyed both ways — ModelMap maps DISPLAY name →
+// upstream key, while Caps/Off are keyed by the UPSTREAM key alone. The
+// caller passes the binding's upstream model, which in our route table is the
+// display name ("DeepSeek-Flash"), so looking only in Caps rejected every
+// configured model whenever the listing was live: field 2026-11-11 20:53, the
+// qoder leg answered 404 "not on this cn account's listing" for a model the
+// live catalogue serves, and the same miss hit Qwen3.8-Flash, GLM-5.3-Flash
+// and Qwen3.8-Max. Resolve the display name first, then check both spellings.
+func guardRealmModel(cat *ModelCatalog, model string, rc realmConfig) error {
+	if cat == nil || !cat.Live || model == "" {
 		return nil
 	}
-	if _, served := cat.Caps[key]; served || cat.Off[key] {
+	if servedByRealm(cat, model) {
+		return nil
+	}
+	if key := cat.ModelMap[model]; key != "" && servedByRealm(cat, key) {
 		return nil
 	}
 	return uperr.New(uperr.ClassNotFound, 404,
 		"qoder: model %q is not on this %s account's listing (wrong region binding?)",
-		key, rc.Name)
+		model, rc.Name)
+}
+
+// servedByRealm reports whether the catalogue names this id at all — as a
+// served model (Caps) or as a listing entry the upstream marked disabled (Off).
+func servedByRealm(cat *ModelCatalog, id string) bool {
+	if id == "" {
+		return false
+	}
+	if _, served := cat.Caps[id]; served {
+		return true
+	}
+	return cat.Off[id]
 }
