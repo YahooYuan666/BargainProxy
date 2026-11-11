@@ -52,6 +52,13 @@ echo [ok] gateway already listening on 127.0.0.1:13140
 goto done
 
 :startgw
+rem BP-310: Start-Process TRUNCATES the redirect target on every start, so a
+rem restart made before an incident is investigated destroys the per-leg
+rem detail (the 2026-11-11 16:1x lines were lost when the gateway restarted at
+rem 18:46). Keep ONE previous generation for post-mortems. The gateway is not
+rem running at this point (the port check above sent us here), so the file is
+rem not in use. Keep this block ASCII-only: cmd parses it in the OEM codepage.
+if exist "%ROOT%\logs\gateway.err.log" move /Y "%ROOT%\logs\gateway.err.log" "%ROOT%\logs\gateway.err.log.1" >nul 2>nul
 powershell -NoProfile -Command "Start-Process -FilePath '%ROOT%\bargainproxy.exe' -ArgumentList '-config','%ROOT%\config.json' -WorkingDirectory '%ROOT%' -WindowStyle Hidden -RedirectStandardOutput '%ROOT%\logs\gateway.log' -RedirectStandardError '%ROOT%\logs\gateway.err.log'"
 if errorlevel 1 goto failed
 

@@ -32,6 +32,13 @@ type Gateway struct {
 	// fbWindow is the panel-managed global first-byte ceiling (nanoseconds;
 	// 0 = fall back to config/default). Hot-updated, no restart needed.
 	fbWindow atomic.Int64
+	// egressDownUntil is the BP-309 fast-fail deadline (unix nanos; 0 =
+	// healthy). It is armed when ONE request proves several different
+	// channels cannot be reached at all, and cleared by the first answer
+	// that gets through. Process-wide on purpose: the local egress (Wi-Fi,
+	// VPN, proxy/TUN uplink) is shared by every route, so re-walking every
+	// channel on the next request cannot tell us anything new.
+	egressDownUntil atomic.Int64
 }
 
 // New builds the gateway.
@@ -161,6 +168,25 @@ const maxAccountAttempts = 3
 // every request wait the full queue timeout while a sibling channel is idle.
 const fallbackWait = 60 * time.Second
 
+// BP-309: how many consecutive legs with NO HTTP response (status 0, zero
+// bytes delivered) prove the problem is the local egress rather than one
+// vendor, and how long the process-wide fast-fail lasts.
+//
+// Three, not two: cascading past two failures is a real, observed remedy
+// (2026-11-09 17:03, deepseek: workbuddy and trae failed, qoder served the
+// turn). Three different hosts failing before their first byte is the
+// signature of a dead uplink — field 2026-11-11 16:15: Wi-Fi dropped, and
+// workbuddy→trae→qoder→lobster all failed with zero bytes while the user
+// saw only the last leg's "lobster: EOF".
+//
+// The window is deliberately short: it only needs to cover the client's
+// immediate retry storm, and it must not keep a recovered network out for
+// long. Every successful leg clears it.
+const (
+	egressStreakLimit = 3
+	egressDownWindow  = 20 * time.Second
+)
+
 // Execute runs one request end to end. emit receives stream events (may be
 // nil for non-streaming callers — the response is still aggregated).
 //
@@ -207,6 +233,19 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	// request-log row).
 	if hasPrefix && bareModel != "" {
 		req.Model = bareModel
+	}
+
+	// BP-309: a request that just proved several different channels cannot be
+	// reached did not learn a property of any ONE vendor — it learned that the
+	// local egress is down. Re-walking the whole route for the client's
+	// immediate retry pays every leg's timeout again and still ends with the
+	// last channel's error in the client's face. Fast-fail inside the short
+	// suspect window instead; a pinned channel is exempt because the caller
+	// explicitly asked for its honest answer.
+	if !pinned {
+		if wait, down := g.egressSuspect(time.Now()); down {
+			return nil, egressSuspectError(wait)
+		}
 	}
 
 	// Outbound normalization: merge the back-to-back assistant tool_calls
@@ -346,6 +385,12 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	emitted := func() bool { return firstEvent }
 	busyCount := 0
 	attempted := false
+	// BP-309 no-response accounting: a leg that never received an HTTP
+	// response says nothing about its own account, but a streak of them
+	// across different channels says the egress is gone.
+	dispatchedLegs := 0
+	noResponseLegs := 0
+	noResponseChannels := make([]string, 0, len(bindings))
 	for bi, binding := range bindings {
 		// The window is per binding: slow-to-first-byte channels (AutoClaw's
 		// sandbox relay) raise their own ceiling without making healthy quick
@@ -465,8 +510,11 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// waiting for a slot and cascaded without the upstream ever seeing it.
 		guardSeen := sentinelGuard(seen, g.cfg.Sentinels)
 		attempted = true
+		dispatchedLegs++
 		res, err := g.executeBinding(bctx, binding, req, guardSeen, win, bi > 0, emitted, tr, ledger)
 		if err == nil {
+			// BP-309: an answer — any answer — is proof the egress works.
+			g.egressDownUntil.Store(0)
 			return res, nil
 		}
 		lastErr = err
@@ -474,6 +522,20 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 			return nil, err // parent context done: client gone / shutdown
 		}
 		ue, ok := uperr.As(err)
+		// BP-309: count only legs that got NOTHING back (status 0) and
+		// delivered nothing to the client. A vendor 5xx/429/404 proves the
+		// network path works and breaks the streak.
+		if ok && !emitted() && isNoResponseFailure(ue) {
+			noResponseLegs++
+			noResponseChannels = append(noResponseChannels, binding.Channel)
+			if noResponseLegs >= egressStreakLimit && bi < len(bindings)-1 {
+				g.markEgressDown(noResponseChannels, time.Now())
+				return nil, egressDownError(noResponseChannels, len(bindings)-bi-1, err)
+			}
+		} else {
+			noResponseLegs = 0
+			noResponseChannels = noResponseChannels[:0]
+		}
 		if ok && !uperr.Rotatable(ue.Class) {
 			// Non-rotatable means "do not try another account of THIS channel",
 			// not "give up on every channel". A different channel is a
@@ -524,6 +586,14 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		return nil, uperr.New(uperr.ClassConcurrencyExceeded, 429,
 			"并行数量超发：模型 %s 的所有号池当前都在处理其他请求（同时只允许一个账号交互），请稍后重试", req.Model)
 	}
+	// BP-309: every dispatched leg got nothing back. Even when the route runs
+	// out before the streak limit, reporting only the LAST leg's error is the
+	// misattribution this ticket exists to end (lobster was blamed for a dead
+	// Wi-Fi). Summarize instead.
+	if attempted && dispatchedLegs >= 2 && noResponseLegs == dispatchedLegs {
+		g.markEgressDown(noResponseChannels, time.Now())
+		return nil, egressDownError(noResponseChannels, 0, lastErr)
+	}
 	return nil, lastErr
 }
 
@@ -537,6 +607,78 @@ func concurrencyError(channel, who string) *uperr.Error {
 	ue := uperr.New(uperr.ClassConcurrencyExceeded, 429, "%s；同时只允许一个账号交互", msg)
 	ue.Channel = channel
 	return ue
+}
+
+// isNoResponseFailure reports whether a leg ended before receiving ANY HTTP
+// response (status 0). That is the signature of a dead network path; an
+// upstream that answered at all — 5xx, 429, 404 — has proven the path works
+// and must break the streak.
+//
+// ClassUpstreamTimeout is included: a dial/DNS timeout also carries status 0.
+// Our own first-byte window arrives as ClassCanceled and is deliberately NOT
+// counted — a slow prefill is not an egress failure.
+func isNoResponseFailure(ue *uperr.Error) bool {
+	if ue == nil || ue.Status != 0 {
+		return false
+	}
+	switch ue.Class {
+	case uperr.ClassTransport, uperr.ClassTransportDead, uperr.ClassUpstreamTimeout:
+		return true
+	}
+	return false
+}
+
+// markEgressDown arms the process-wide fast-fail window (BP-309).
+func (g *Gateway) markEgressDown(channels []string, now time.Time) {
+	g.egressDownUntil.Store(now.Add(egressDownWindow).UnixNano())
+	log.Printf("gateway: egress suspect — %d consecutive legs got no HTTP response (%s); failing fast for %s",
+		len(channels), strings.Join(channels, "→"), egressDownWindow)
+}
+
+// egressSuspect reports the remaining fast-fail window, if any.
+func (g *Gateway) egressSuspect(now time.Time) (time.Duration, bool) {
+	until := g.egressDownUntil.Load()
+	if until <= 0 {
+		return 0, false
+	}
+	end := time.Unix(0, until)
+	if !now.Before(end) {
+		return 0, false
+	}
+	return end.Sub(now), true
+}
+
+// egressDownError renders the honest cross-channel failure: which channels
+// produced nothing, how many were left untried, and what the last leg said.
+func egressDownError(channels []string, remaining int, last error) *uperr.Error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "本地网络出口疑似中断：连续 %d 个渠道（%s）在收到任何 HTTP 响应之前失败",
+		len(channels), strings.Join(channels, "、"))
+	if remaining > 0 {
+		fmt.Fprintf(&b, "，已停止尝试其余 %d 个渠道", remaining)
+	} else {
+		b.WriteString("，该模型的渠道已全部试完")
+	}
+	if last != nil {
+		if ue, ok := uperr.As(last); ok {
+			fmt.Fprintf(&b, "；最后一次：%s（class=%s status=%d）", ue.Message, ue.Class, ue.Status)
+		} else {
+			fmt.Fprintf(&b, "；最后一次：%v", last)
+		}
+	}
+	b.WriteString("。请检查本机网络或 VPN 后重试")
+	return uperr.New(uperr.ClassEgressDown, 502, "%s", b.String())
+}
+
+// egressSuspectError is the fast-fail answer inside the BP-309 window; there
+// is no fresh evidence to quote, only the recent streak and the retry moment.
+func egressSuspectError(wait time.Duration) *uperr.Error {
+	secs := int(wait.Seconds() + 0.999)
+	if secs < 1 {
+		secs = 1
+	}
+	return uperr.New(uperr.ClassEgressDown, 502,
+		"本地网络出口疑似中断：最近一轮请求中连续多个渠道未收到任何 HTTP 响应；网关将在 %ds 后重新探测，请检查本机网络或 VPN 后重试", secs)
 }
 
 // estimatePromptTokens forwards to ir.EstimatePromptTokens (moved there for
@@ -704,11 +846,21 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		return nil, uperr.New(uperr.ClassInternal, 0, "channel %q driver not installed", binding.Channel)
 	}
 	var lastErr error
+	// lastUE is the classified form of lastErr; the BP-310 guard keys on it.
+	var lastUE *uperr.Error
 	// Attempt accounting is per binding ("leg"), not per account rotation:
 	// the question the log answers is "how many channels did this request
 	// pay before succeeding?" (BP-38). Account rotations inside one binding
 	// do not inflate the number.
 	tr.note(binding.Channel)
+	// BP-310: accounts this binding already paid for. A rotatable failure
+	// re-enters Acquire, and in a single-account pool (or when stickiness /
+	// recency hands the same account back) that used to dispatch the SAME
+	// account again — up to three identical transport timeouts per leg, which
+	// is most of why a dead egress took 44s to walk four channels on
+	// 2026-11-11. Rotation must mean "try a DIFFERENT account"; when the pool
+	// has none left, return the last failure and let the outer loop cascade.
+	tried := make(map[string]bool, maxAccountAttempts)
 	for attempt := 0; attempt < maxAccountAttempts; attempt++ {
 		// BP-129: a ceiling an upstream stated in a 400 binds this channel+model
 		// until it expires — later requests clamp upfront instead of paying the
@@ -747,6 +899,23 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			}
 			return nil, cerr
 		}
+		// BP-310: the pool handed back an account this binding already tried
+		// and failed on. Do not pay it twice — but ONLY when the previous
+		// failure was a no-response transport failure (status 0, nothing
+		// delivered): that is the case where a retry just repeats a timeout.
+		// Rate-limit classes keep the old behaviour, where a sticky session
+		// may legitimately re-serve the same account after a short hold.
+		if tried[lease.Account.ID] && isNoResponseFailure(lastUE) {
+			lease.Release()
+			if lastErr != nil {
+				log.Printf("gateway: %s has no untried account left (account %s already failed this leg); cascading",
+					binding.Channel, lease.Account.ID)
+				return nil, lastErr
+			}
+			return nil, uperr.New(uperr.ClassInternal, 0,
+				"no untried account left in %s", binding.Channel)
+		}
+		tried[lease.Account.ID] = true
 		call := driver.ChatCall{Account: lease.Account, UpstreamModel: binding.UpstreamModel, Request: req}
 		// Remember whose leg this is, so a failure can still be attributed.
 		if tr != nil {
@@ -1215,6 +1384,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		if !ok {
 			ue = uperr.New(uperr.ClassInternal, 0, "%v", streamErr)
 		}
+		lastUE = ue
 		// One line per failed leg: without it the log only shows the final
 		// channel's error, which is how "WorkBuddy died" rumors start. The
 		// window marker separates "our timer gave up" from an upstream error.
@@ -1545,6 +1715,11 @@ func DescribeError(err error) (status int, class string, message string) {
 		return 400, ue.Class, msg
 	case uperr.ClassTransport:
 		return 502, ue.Class, "upstream transport failure: " + ue.Message
+	case uperr.ClassEgressDown:
+		// BP-309: the message already names the channels that produced
+		// nothing and the last leg's error; keep it verbatim so the client and
+		// the panel stop blaming whichever channel happened to be last.
+		return 502, ue.Class, ue.Message
 	case uperr.ClassUpstreamTimeout:
 		// Distinguishable from "no available account": the client's remedy is
 		// to retry later, not to re-route — and the pool was not penalized

@@ -80,7 +80,20 @@ const (
 	// user requirement: "并行数量超发").
 	ClassConcurrencyExceeded = "concurrency_exceeded"
 	ClassSentinel            = "sentinel" // HTTP 200 body is a known rejection sentinel
-	ClassInternal            = "internal" // gateway bug or unclassified
+	// ClassEgressDown: several DIFFERENT channels failed before receiving any
+	// HTTP response at all, in one request. One dropped socket is a vendor
+	// edge; three in a row on different hosts is the local egress (Wi-Fi
+	// down, dead VPN/proxy, TUN tunnel with no uplink). The binding loop
+	// stops spending the remaining channels and says so, instead of walking
+	// the whole route and blaming whichever upstream happened to be last
+	// (BP-309, field 2026-11-11 16:15: Wi-Fi dropped; workbuddy→trae→qoder→lobster
+	// each failed with zero bytes and the user saw "lobster: EOF").
+	//
+	// Never reaches pool.ApplyResult (the loop synthesizes it), so it must
+	// not charge any account; Rotatable is false so a leg-level copy would
+	// also never be retried within its channel.
+	ClassEgressDown = "egress_down"
+	ClassInternal   = "internal" // gateway bug or unclassified
 )
 
 // Error is the normalized upstream failure.
@@ -181,7 +194,7 @@ func Rotatable(class string) bool {
 	switch class {
 	case ClassBadRequest, ClassContentBlocked, ClassSentinel, ClassUpstreamBusy,
 		ClassUpstreamTimeout, ClassCanceled, ClassNotFound, ClassEdgeBlock,
-		ClassTransportDead, ClassAccountRestricted:
+		ClassTransportDead, ClassAccountRestricted, ClassEgressDown:
 		return false
 	default:
 		return true
