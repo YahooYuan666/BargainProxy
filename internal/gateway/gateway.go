@@ -282,6 +282,13 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		}
 	}
 
+	// BP-313: fit an overweight request's images before the byte gate below
+	// sees it — oldest first, down to three quarters of the budget; images
+	// over the 2048px cap are resized wherever they sit, but the current
+	// turn's already-small images are never format-converted. Under-budget
+	// and pinned requests are not touched at all.
+	g.fitOverweightImages(req, pinned)
+
 	var lastErr error
 	// First-byte window: base from config, widened by context size. Large ZCode
 	// conversations can spend >8s in prefill before the first token; a fixed

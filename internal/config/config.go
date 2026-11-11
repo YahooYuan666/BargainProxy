@@ -108,6 +108,17 @@ type Config struct {
 	// ungated. 0 = no gate for that channel.
 	ChannelMaxBodyBytes map[string]int64 `json:"channel_max_body_bytes"`
 
+	// ImageBudgetBytes is the estimated WIRE size above which the gateway
+	// starts fitting a request's images (BP-313): the oldest images are
+	// downscaled to a 2048px long edge — or converted, opaque PNG → JPEG,
+	// only when that saves ≥20% — until the estimate drops to three quarters
+	// of this budget. Under-budget requests are byte-identical, the latest
+	// user message's images are never touched, and images that cannot be
+	// processed faithfully (EXIF orientation, ICC, animation) go as they
+	// came. 0 disables. Default 3MiB: above any text conversation, below the
+	// 4MB lobster ceiling that motivates it.
+	ImageBudgetBytes int64 `json:"image_budget_bytes"`
+
 	// Upstream watchdogs (ticket 27; applied at startup — restart to change):
 	//   RPCTimeout    total timeout for short billing/refresh/probe calls (default 120s);
 	//   HeaderTimeout time to first byte on chat streams (default 300s);
@@ -490,6 +501,8 @@ func Default() *Config {
 		ChannelMaxBodyBytes: map[string]int64{
 			"lobster": 4 << 20,
 		},
+		// BP-313: fit overweight requests' images above this estimate.
+		ImageBudgetBytes: 3 << 20,
 		// One account per pool at a time: the anti-risk-control default
 		// (2026-10-20). Explicitly setting false restores multi-account
 		// concurrency within a pool.
