@@ -1792,16 +1792,31 @@ func (p *Pool) setModelCooldownHard(a *model.Account, m string, resetAt time.Tim
 		a.ModelCooldowns = map[string]model.ModelCooldown{}
 	}
 	until := resetAt
-	// The 2h cap bounds OUR invented/guessed holds. An upstream-stated hard
+	// BP-314: a zero/expired reset resolves to the short bounded hold BEFORE
+	// the cap is applied. The cap branch starts from `until` and reads the zero
+	// value as "no constraint", so it used to set `until = now + cap` — the
+	// exact opposite of the short probe this path exists to schedule, while the
+	// 60s fallback below could never fire.
+	//
+	// Field 2026-11-12: Google answered a bare 429 RESOURCE_EXHAUSTED with NO
+	// retryDelay (asked for gemini-3.8-flash-high while Google had no capacity
+	// for it). parseQuotaReset returned the zero time, `until` stayed zero, and
+	// the cap branch set the hold to now+2h — so the model read
+	// "quota-exhausted until 18:29:56" for a capacity wobble that had nothing to
+	// do with this account's ledger (five_hour was at 100%), and the client was
+	// told "all accounts are cooling down or exhausted" with no retry for two
+	// hours. A hold built from an UNKNOWN boundary is our guess, so it stays
+	// short: one cheap upstream probe per minute picks up an early recovery.
+	if until.IsZero() || !until.After(now) {
+		until = now.Add(60 * time.Second)
+	}
+	// The cap bounds OUR invented/guessed holds. An upstream-stated hard
 	// window (ResetHard) is the quota bucket's own boundary and is honored
 	// as-is (BP-135); premature unblocking there just re-hits the same 429.
 	if cap := p.params.ModelRateHoldCap; cap > 0 && !resetHard {
-		if c := now.Add(cap); until.IsZero() || c.Before(until) {
+		if c := now.Add(cap); until.After(c) {
 			until = c
 		}
-	}
-	if until.IsZero() || !until.After(now) {
-		until = now.Add(60 * time.Second)
 	}
 	if prev, ok := a.ModelCooldowns[m]; ok {
 		if prev.Until.After(until) {

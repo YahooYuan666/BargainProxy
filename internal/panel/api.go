@@ -28,6 +28,11 @@ import (
 	"bargainproxy/internal/tasks"
 )
 
+// windowStaleAfter is how old a quota reading may be before the panel marks it
+// stale. The quota probe runs every 15 minutes, so anything past two missed
+// cycles means the number on screen is not describing the current state.
+const windowStaleAfter = 30 * time.Minute
+
 // TaskRunner is implemented by the task center (wired by main). Nil until
 // then: the task endpoints degrade to listing history.
 type TaskRunner interface {
@@ -95,6 +100,21 @@ type modelCoolView struct {
 type windowView struct {
 	RemainingFraction float64 `json:"remaining_fraction"`
 	ResetAt           string  `json:"reset_at,omitempty"`
+	// UpdatedAt is when the upstream reported this number. Without it a stale
+	// reading is indistinguishable from a fresh one, and the panel happily
+	// renders a percentage that describes a state hours old (BP-314).
+	//
+	// Field 2026-11-12: the quota probe had been failing for hours (TLS
+	// handshake timeout to both hosts, then EOF to oauth2), so the antigravity
+	// cards still showed the numbers fetched at 13:19 — five_hour=100%,
+	// weekly=95.6% — while the model was refusing service. Answering "is there
+	// quota left?" from that screen gave the wrong answer, and nothing on the
+	// screen said how old the number was.
+	UpdatedAt string `json:"updated_at,omitempty"`
+	// Stale is set by the panel (not by the driver) when UpdatedAt is older
+	// than the freshness bound, so a UI can mark the card instead of implying
+	// the reading is current.
+	Stale bool `json:"stale,omitempty"`
 }
 
 func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
@@ -136,11 +156,17 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 			}
 			if len(a.Windows) > 0 {
 				v.Windows = map[string]windowView{}
+				now := time.Now()
 				for k, win := range a.Windows {
-					v.Windows[k] = windowView{
+					wv := windowView{
 						RemainingFraction: win.RemainingFraction,
 						ResetAt:           win.ResetAt.Format(time.RFC3339),
 					}
+					if !win.UpdatedAt.IsZero() {
+						wv.UpdatedAt = win.UpdatedAt.Format(time.RFC3339)
+						wv.Stale = now.Sub(win.UpdatedAt) > windowStaleAfter
+					}
+					v.Windows[k] = wv
 				}
 			}
 			if !a.LastUsedAt.IsZero() {

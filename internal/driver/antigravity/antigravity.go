@@ -10,6 +10,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -217,6 +219,15 @@ func (d *Driver) resolveCreds(ctx context.Context, acc *model.Account) (*Creds, 
 				acc.CredsJSON = b
 				acc.CredsDirty = true
 			}
+			// BP-314: mirror it onto the account record as well. The creds blob
+			// and Account.ProjectID are two separate homes for the same fact:
+			// the driver reads the blob, while the panel and the accounts table's
+			// project_id column read the record. Writing only the blob left the
+			// column empty for every account (field 2026-11-12: all three read
+			// project_id=""), so the panel could not show which project an
+			// account was actually using, and a fresh process had to rediscover
+			// it on the first request.
+			acc.ProjectID = pid
 		}
 	}
 	return creds, project, nil
@@ -381,13 +392,28 @@ func (d *Driver) doStream(ctx context.Context, token, upstreamModel string, body
 	// exactly the reported shape: the Antigravity IDE answers in seconds while
 	// the gateway reports "upstream rate limited".
 	if (resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests) && len(hosts) > 1 {
-		// Server-side failure or quota wall on the primary: retry once on the
-		// fallback host.
+		// BP-314: a MODEL_CAPACITY_EXHAUSTED 503 must NOT fall through to the
+		// other host. That verdict is about Google's fleet for one model and is
+		// identical on both hosts; the prod host's ledger, however, has been
+		// drained for months (measured 2026-11-01 and again 2026-11-12: prod
+		// answers 429 RESOURCE_EXHAUSTED in ~300ms while daily answers 200 in
+		// ~1.1s), so retrying there replaces the honest "no capacity" with a
+		// misleading "quota exhausted" — which is how 2026-11-12's incident read
+		// as "no credits left" while five_hour was at 100%.
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
 		if cancelHost != nil {
 			cancelHost()
 		}
+		if isCapacityExhausted(strings.ToLower(string(raw))) {
+			return &http.Response{
+				StatusCode: resp.StatusCode,
+				Body:       io.NopCloser(bytes.NewReader(raw)),
+				Header:     http.Header{},
+			}, nil
+		}
+		// Server-side failure or quota wall on the primary: retry once on the
+		// fallback host.
 		u2 := fmt.Sprintf("%s/v1internal:streamGenerateContent?alt=sse", strings.TrimRight(hosts[1], "/"))
 		req2, rerr := http.NewRequestWithContext(ctx, http.MethodPost, u2, bytes.NewReader(body))
 		if rerr == nil {
@@ -666,15 +692,34 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 
 // loadCodeAssist discovers the Cloud AI Companion project id. The project id
 // feeds request construction, so a truncated read is an error, not a miss.
+//
+// BP-314: this request MUST carry the CLI User-Agent. Without it the upstream
+// answers 200 with an EMPTY cloudaicompanionProject (silently — no error, no
+// message), so project discovery "succeeded" with "" and every chat request
+// went out with no project at all. Measured 2026-11-12 20:5x, same token, same
+// host, one variable:
+//
+//	no UA  → cloudaicompanionProject: ""      (all 3 accounts, both hosts)
+//	with UA → cloudaicompanionProject: "aicode-consumers"
+//
+// AIClient2API does not hit this because its callApi sets the UA on EVERY
+// request uniformly (getAntigravityRequestUserAgent). We had the UA on chat and
+// on the quota probe but not here, which is why the DB project_id column was
+// empty for all three accounts and the request dump showed no project field.
 func (d *Driver) loadCodeAssist(ctx context.Context, accID, token string) (string, error) {
 	u := strings.TrimRight(d.cfg.BaseURL, "/") + "/v1internal:loadCodeAssist"
-	body := []byte(`{"metadata":{"pluginType":"GEMINI"}}`)
+	// AIClient2API sends {"metadata":{"ideType":"ANTIGRAVITY"}}; we sent
+	// {"pluginType":"GEMINI"} (copied from the Code Assist CLI path). Both
+	// shapes are accepted, but the IDE identity is the one the reference uses
+	// for this channel, so match it (BP-314).
+	body := []byte(`{"metadata":{"ideType":"ANTIGRAVITY"}}`)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("User-Agent", antigravityUA)
 	resp, err := d.rpc.Do(req)
 	if err != nil {
 		return "", err
@@ -1390,6 +1435,25 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 	}
 
 	inner := map[string]any{"contents": contents}
+	// BP-314: request.sessionId, a STABLE id derived from the first user text.
+	//
+	// AIClient2API (the project this driver was ported from, and the one whose
+	// behaviour is known to work against the real upstream) always sets it:
+	//
+	//	template.request.sessionId = generateStableSessionID(template);
+	//	// sha256(first user text) → first 8 bytes as uint64, & 0x7FFF… → "-" + n
+	//
+	// We never sent it at all. The upstream keys conversation continuity and
+	// prefix caching off this field, so omitting it made every request look
+	// like a brand-new session — the one structural difference left between our
+	// payload and the IDE's. It is stable ON PURPOSE: the same conversation
+	// prefix must yield the same id, otherwise the upstream's cache never hits.
+	//
+	// Image requests are stateless and skip it (image.go builds its own inner
+	// and does not call this function).
+	if sid := stableSessionID(contents); sid != "" {
+		inner["sessionId"] = sid
+	}
 	if len(sysParts) > 0 {
 		inner["systemInstruction"] = map[string]any{"parts": sysParts}
 	}
@@ -1508,6 +1572,30 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	switch {
 	case status == 401 || status == 403 && strings.Contains(lower, "credential"):
 		return uperr.New(uperr.ClassAuth, status, "antigravity: %s", truncate(body, 300))
+	case status >= 500 && isCapacityExhausted(lower):
+		// BP-314: "No capacity available for model <name> on the server"
+		// (503 UNAVAILABLE, details reason=MODEL_CAPACITY_EXHAUSTED) is a
+		// CAPACITY event on ONE model — not a sick account and not a quota wall.
+		//
+		// Field 2026-11-12 16:40: all three antigravity accounts answered this
+		// for gemini-3.8-flash-high inside the same second, while the SAME
+		// accounts answered gemini-3-flash / gemini-2.5-flash /
+		// claude-sonnet-4-6 / gemini-3.1-flash-image with 200 in ~1.1s, and
+		// retrieveUserQuotaSummary reported five_hour=100%, weekly=94%. The
+		// accounts were healthy; Google simply had no server for that model.
+		//
+		// ClassTransport was worse than useless here: it is ROTATABLE, so the
+		// gateway walked every account of the pool onto the same capacity wall
+		// (three upstream hits per request, each a fresh 503) and told the
+		// client "upstream transport failure" — a gateway bug — for what is
+		// really "wait, don't switch". ClassUpstreamBusy is that verdict: no
+		// account penalty, a short channel+model pause, and an honest
+		// 429/Retry-After to the client.
+		e := uperr.New(uperr.ClassUpstreamBusy, status, "antigravity: %s", truncate(body, 300))
+		if upstreamModel != "" {
+			e.Model = upstreamModel
+		}
+		return e
 	case status == 429 || strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "quota"):
 		reset := parseQuotaReset(text)
 		e := uperr.New(uperr.ClassSoftRate, status, "antigravity: %s", truncate(body, 300))
@@ -1553,6 +1641,51 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 	default:
 		return uperr.New(uperr.ClassInternal, status, "antigravity: %s", truncate(body, 300))
 	}
+}
+
+// isCapacityExhausted reports whether an upstream 5xx body says "the server
+// has no capacity for THIS MODEL" — Google's MODEL_CAPACITY_EXHAUSTED (503
+// UNAVAILABLE, "No capacity available for model <name> on the server") and the
+// same wording without the structured reason. Expects the lowercased body.
+//
+// Distinct from RESOURCE_EXHAUSTED, which is a QUOTA wall (429) and belongs to
+// the account's own ledger; this one is about Google's fleet and says nothing
+// about the account, the quota, or the request.
+func isCapacityExhausted(lower string) bool {
+	if strings.Contains(lower, "model_capacity_exhausted") {
+		return true
+	}
+	return strings.Contains(lower, "no capacity available")
+}
+
+// stableSessionID derives the upstream's request.sessionId from the FIRST
+// user text, exactly as AIClient2API's generateStableSessionID does:
+//
+//	hash  = sha256(firstUserText)              // the first text part of the
+//	n     = first 8 bytes, big-endian uint64   // first user-role content
+//	id    = "-" + (n & 0x7FFFFFFFFFFFFFFF)      // positive, dash-prefixed
+//
+// Stability is the point: the same conversation prefix must map to the same id
+// so the upstream can treat consecutive turns as one session (prefix cache and
+// conversation continuity). A random id — or none at all, which is what we did
+// before BP-314 — makes every turn look like a fresh conversation.
+//
+// Returns "" when there is no user text to hash (nothing to key on).
+func stableSessionID(contents []geminiContent) string {
+	for _, c := range contents {
+		if c.Role != "user" {
+			continue
+		}
+		for _, p := range c.Parts {
+			if p.Text == "" {
+				continue
+			}
+			sum := sha256.Sum256([]byte(p.Text))
+			n := binary.BigEndian.Uint64(sum[:8]) & 0x7FFFFFFFFFFFFFFF
+			return "-" + strconv.FormatUint(n, 10)
+		}
+	}
+	return ""
 }
 
 // isTOSViolation reports whether a 403 body is Google disabling the account

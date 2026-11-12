@@ -1819,6 +1819,21 @@ func DescribeError(err error) (status int, class string, message string) {
 		// behave the same way. When the upstream said how long the queue
 		// needs, say it (the header is attached by withRetryAfter from
 		// ResetAt/HoldUntil; the 5s default and 600s cap live there).
+		//
+		// BP-314: a MODEL_CAPACITY_EXHAUSTED wall is not a queue — Google has
+		// no server for that one model, and the wait is unknowable. Telling the
+		// user "queue is full, retry shortly" invites a retry loop against a
+		// wall that only clearing elsewhere fixes; the actionable advice is to
+		// switch models, which is what the same accounts demonstrably serve.
+		// (Field 2026-11-12: gemini-3.8-flash-* refused while gemini-3-flash,
+		// gemini-2.5-flash, claude-sonnet-4-6 and gemini-3.1-flash-image all
+		// answered 200 on the same accounts within the same second.)
+		if ue.Model != "" && ue.Status == 503 {
+			msg := fmt.Sprintf("no upstream capacity for model %s (not a quota problem — this account has quota, "+
+				"the upstream has no server for this model); switch models or retry later: %s",
+				ue.Model, ue.Message)
+			return 429, ue.Class, msg
+		}
 		if !ue.ResetAt.IsZero() {
 			if wait := time.Until(ue.ResetAt); wait > 0 {
 				return 429, ue.Class, fmt.Sprintf("upstream queue is full; retry in %s: %s",

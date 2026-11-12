@@ -1515,11 +1515,27 @@ function renderKpis(byChan){
     // → "50%") reads as nonsense to the operator.
     const avgOf = key => {
       const fracs = [];
+      let newest = null, anyStale = false, counted = 0;
       list.forEach(a => {
         const w = (a.windows || {})[key];
-        if (w && typeof w.remaining_fraction === 'number') fracs.push(w.remaining_fraction);
+        if (!w || typeof w.remaining_fraction !== 'number') return;
+        fracs.push(w.remaining_fraction);
+        counted++;
+        if (w.stale) anyStale = true;
+        if (w.updated_at) {
+          const t = new Date(w.updated_at);
+          if (!newest || t > newest) newest = t;
+        }
       });
-      return fracs.length ? fracs.reduce((x,y)=>x+y,0)/fracs.length : null;
+      // BP-314: a percentage with no timestamp invites quoting a reading that
+      // may be hours old as if it were current. Carry the newest read time (and
+      // the stale flag) alongside the number.
+      return {
+        v: fracs.length ? fracs.reduce((x,y)=>x+y,0)/fracs.length : null,
+        asOf: newest ? newest.toISOString() : null,
+        stale: anyStale,
+        counted,
+      };
     };
     const cls = v => v===null ? '' : (v<0.15?'bad':(v<0.4?'warn':'good'));
     const cards = [
@@ -1529,8 +1545,14 @@ function renderKpis(byChan){
       ['Claude 周窗', 'claude_weekly'],
     ];
     cards.forEach(([k, key]) => {
-      const v = avgOf(key);
-      rows.push({v: v===null ? '—' : (v*100).toFixed(1)+'%', k, cls: cls(v)});
+      const agg = avgOf(key);
+      const v = agg.v;
+      let label = k;
+      if (v !== null) {
+        if (agg.stale) label += ' · 读数过期';
+        else if (agg.asOf) label += ' · 读数 ' + fmtTime(agg.asOf);
+      }
+      rows.push({v: v===null ? '—' : (v*100).toFixed(1)+'%', k: label, cls: agg.stale ? 'warn' : cls(v)});
     });
   } else {
     // BP-135: every pool the account can actually pay with counts here —
@@ -1736,7 +1758,15 @@ function renderAccounts(){
       const winPct = (k, w) => {
         if (!w || typeof w.remaining_fraction !== 'number') return null;
         const pct = (w.remaining_fraction*100).toFixed(1);
-        return `<div class="small">${k}：${pct}%${w.reset_at ? ' <span class="muted">('+esc(fmtTime(w.reset_at))+')</span>' : ''}</div>`;
+        // BP-314: always show WHEN this number was read. The probe can fail for
+        // hours (TLS timeouts) and leave a reading that describes an old state;
+        // a bare "100%" then reads as "current", which is how a stale 13:19
+        // figure got quoted as today's quota while the model was refusing.
+        const stale = w.stale
+          ? ` <span class="warn" title="额度读数已过期：探测任务近期未成功，数字可能不代表当前状态">（读数过期）</span>`
+          : '';
+        const asOf = w.updated_at ? ` <span class="muted">读数 ${esc(fmtTime(w.updated_at))}</span>` : '';
+        return `<div class="small">${k}：${pct}%${w.reset_at ? ' <span class="muted">(重置 '+esc(fmtTime(w.reset_at))+')</span>' : ''}${asOf}${stale}</div>`;
       };
       quota = ['五小时', '每周', 'Claude 五小时', 'Claude 每周'].map((label, idx) => {
         const key = ['five_hour','weekly','claude_five_hour','claude_weekly'][idx];
