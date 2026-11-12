@@ -167,7 +167,16 @@ func ParseMessagesRequest(body []byte) (*ir.ChatRequest, error) {
 	// alternation; clients that diverged from it are normalized here so
 	// downstream channels never see double-user turns).
 	req.Messages = mergeAdjacent(req.Messages)
-	capToolResultImages(req.Messages, maxToolResultImages)
+	// BP-315: the tool-result image budget is NOT applied here any more. It
+	// came from AIClient2API's Gemini family (ClaudeConverter's
+	// toolResultImageBudget, which produces inlineData parts) while this entry
+	// serves EVERY protocol — including the OpenAI-shaped channels that never
+	// had that constraint. Capping here silently deleted 59 of 64 images from
+	// one real request (sess_1d74dbe9, 2026-11-12); the model, never told they
+	// were gone, re-ran the same contact-sheet command 28 times and reported
+	// contradictory readings of the same picture. The cap now lives in the
+	// antigravity driver — the only Gemini/Google-pool egress — together with
+	// the placeholder that tells the model what was dropped.
 	// Anthropic's tool_result block carries only tool_use_id — no name. Every
 	// downstream channel that re-emits Gemini functionResponse (antigravity)
 	// or a tool name needs it, and without it the driver fell back to the
@@ -424,12 +433,6 @@ func parseMessage(m WireMessage) ([]ir.Message, error) {
 	return out, nil
 }
 
-// maxToolResultImages bounds how many tool-result images one request may carry.
-// Images are expensive and a single tool round can return many; keeping the
-// most recent five matches AIClient2API's #718 budget while still giving the
-// model the latest screenshots (BP-70).
-const maxToolResultImages = 5
-
 // fillToolResultNames copies each assistant tool call's name onto the tool
 // message that answers it (BP-116). Anthropic's wire carries only the id on a
 // tool_result, so an IR tool message built from it has no ToolName; channels
@@ -463,35 +466,12 @@ func fillToolResultNames(msgs []ir.Message) {
 	}
 }
 
-// capToolResultImages keeps only the most recent max images across all tool
-// messages. Text blocks stay; only image parts are dropped.
-func capToolResultImages(msgs []ir.Message, max int) {
-	if max <= 0 {
-		return
-	}
-	kept := 0
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role != ir.RoleTool {
-			continue
-		}
-		parts := msgs[i].Content
-		out := make([]ir.ContentPart, 0, len(parts))
-		for j := len(parts) - 1; j >= 0; j-- {
-			p := parts[j]
-			if p.Kind == "image" {
-				if kept >= max {
-					continue
-				}
-				kept++
-			}
-			out = append(out, p)
-		}
-		for l, r := 0, len(out)-1; l < r; l, r = l+1, r-1 {
-			out[l], out[r] = out[r], out[l]
-		}
-		msgs[i].Content = out
-	}
-}
+// Tool-result images are NOT budgeted at this layer (BP-315). The five-image
+// cap that used to sit here came from AIClient2API's Gemini family
+// (ClaudeConverter's toolResultImageBudget, whose output is inlineData) while
+// this parser serves every protocol. It now lives in the antigravity driver —
+// the only egress whose wire nests images inside a functionResponse — next to
+// the placeholder that tells the model which images were omitted.
 
 // mergeAdjacent merges consecutive messages with the same role.
 func mergeAdjacent(in []ir.Message) []ir.Message {

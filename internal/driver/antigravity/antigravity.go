@@ -1086,6 +1086,53 @@ func upstreamModelName(model string) string {
 	return model
 }
 
+// maxToolResultImages bounds how many tool-result images one request may carry
+// on this egress. The number matches AIClient2API's #718 budget (BP-70) because
+// this driver is where that budget came from: the reference implementation is
+// ClaudeConverter, whose tool images become Gemini inlineData — the same shape
+// written here. Images are expensive and a single tool round can return many;
+// keeping the most recent ones still gives the model the latest screenshots.
+const maxToolResultImages = 5
+
+// toolImageOmitted is what the model reads where an over-budget image used to
+// be. AIClient2API uses the same wording ("[Earlier image omitted: too many
+// images in one request. Re-read the file if you need to see it again.]") and
+// the phrasing is the point: it says both that a picture existed and that the
+// model may re-fetch it, which is what stops the "I think I looked, but the
+// conclusion keeps shifting" loop (BP-315).
+const toolImageOmitted = "[Earlier image omitted: too many images in one request. Re-read the file if you need to see it again.]"
+
+// planToolImageBudget marks which tool-result images fall outside the budget.
+// Walks the history backwards so the MOST RECENT max images survive, and keys
+// the answer by {message index, image index within that message} — the caller
+// walks forward and needs to know per-image, not per-message, because one
+// result can carry several.
+func planToolImageBudget(msgs []ir.Message, max int) map[[2]int]bool {
+	dropped := map[[2]int]bool{}
+	if max <= 0 {
+		return dropped
+	}
+	kept := 0
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != ir.RoleTool {
+			continue
+		}
+		imgIdx := 0
+		for _, p := range msgs[i].Content {
+			if p.Kind != "image" || p.ImageB64 == "" {
+				continue
+			}
+			if kept >= max {
+				dropped[[2]int{i, imgIdx}] = true
+			} else {
+				kept++
+			}
+			imgIdx++
+		}
+	}
+	return dropped
+}
+
 // buildRequest assembles the v1internal payload. replay (may be nil) resolves
 // a real thought_signature for a replayed tool call — nil or a miss falls back
 // to the documented placeholder (BP-42/BP-44).
@@ -1098,7 +1145,23 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 		genConfig  = map[string]any{}
 		toolConfig map[string]any
 	)
-	for _, msg := range req.Messages {
+	// BP-315: the tool-result image budget belongs HERE, not in the shared
+	// Anthropic parser. It came from AIClient2API's ClaudeConverter, whose
+	// output is Gemini inlineData — this driver is the only egress that nests
+	// images inside a functionResponse (BP-273), so it is the only place the
+	// constraint is native. Applied at the protocol layer it silently deleted
+	// 59 of 64 images from a real request (sess_1d74dbe9, 2026-11-12) on a
+	// channel that never had that limit, and the model — never told they were
+	// gone — re-ran the same contact-sheet command 28 times and reported
+	// contradictory readings of the same picture.
+	//
+	// Omissions carry a placeholder instead of vanishing: the upstream does
+	// the same ("[Earlier image omitted: too many images in one request.
+	// Re-read the file if you need to see it again.]"), and the difference
+	// between "dropped silently" and "dropped and said so" is exactly the
+	// loop this ticket answers.
+	dropped := planToolImageBudget(req.Messages, maxToolResultImages)
+	for msgIdx, msg := range req.Messages {
 		switch msg.Role {
 		case ir.RoleSystem:
 			for _, p := range msg.Content {
@@ -1168,14 +1231,34 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 			// BP-273: images the client put in the tool result (screenshots)
 			// ride inside the functionResponse — the egress used to read only
 			// text, so the model silently never saw them.
+			// BP-315: past the budget the image becomes the omission
+			// placeholder instead of disappearing, so the model can tell
+			// "there was a picture I cannot see" from "there was no picture".
+			// The placeholder is a SIBLING of the functionResponse, not one of
+			// its nested parts: Google rejects a text field inside
+			// function_response.parts ("Unknown name \"text\" ... Cannot find
+			// field", live probe 2026-11-12 23:15) — only inlineData nests
+			// there (BP-273). AIClient2API does the same: its images and
+			// placeholders follow the functionResponse in the same parts
+			// array.
+			var omittedNotes []geminiPart
+			imgIdx := 0
 			for _, p := range msg.Content {
-				if p.Kind == "image" && p.ImageB64 != "" {
+				if p.Kind != "image" || p.ImageB64 == "" {
+					continue
+				}
+				if dropped[[2]int{msgIdx, imgIdx}] {
+					omittedNotes = append(omittedNotes, geminiPart{Text: toolImageOmitted})
+				} else {
 					fnResp.Parts = append(fnResp.Parts, geminiPart{InlineData: &geminiBlob{MIMEType: p.ImageMIME, Data: p.ImageB64}})
 				}
+				imgIdx++
 			}
+			parts := []geminiPart{{FunctionResp: fnResp}}
+			parts = append(parts, omittedNotes...)
 			contents = append(contents, geminiContent{
 				Role:  "user",
-				Parts: []geminiPart{{FunctionResp: fnResp}},
+				Parts: parts,
 			})
 		}
 	}

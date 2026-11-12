@@ -56,8 +56,13 @@ func TestParseToolResultKeepsImages(t *testing.T) {
 	}
 }
 
-// The budget keeps the most recent five images and never touches text.
-func TestToolResultImageBudget(t *testing.T) {
+// BP-315: this layer no longer applies the Gemini-family image budget. The
+// cap came from AIClient2API's ClaudeConverter (a Gemini inlineData budget)
+// and sat in ParseMessagesRequest, where it hit EVERY channel — including the
+// OpenAI-shaped ones (workbuddy/deepseek) that never had that constraint.
+// Real case 2026-11-12: 64 tool images in, 59 deleted here alone, and the
+// model was never told. The budget now lives in the antigravity driver.
+func TestParseKeepsEveryToolImage(t *testing.T) {
 	req, err := ParseMessagesRequest([]byte(toolResultBody(7, 2)))
 	if err != nil {
 		t.Fatalf("parse: %v", err)
@@ -76,15 +81,17 @@ func TestToolResultImageBudget(t *testing.T) {
 			}
 		}
 	}
-	if images != maxToolResultImages {
-		t.Fatalf("images = %d, want %d", images, maxToolResultImages)
+	if images != 7 {
+		t.Fatalf("images = %d, want 7 (the parser must not cap; the egress does)", images)
 	}
 	if texts != 2 {
-		t.Fatalf("texts = %d, want 2 (text must survive the cap)", texts)
+		t.Fatalf("texts = %d, want 2", texts)
 	}
 }
 
-func TestToolResultBudgetKeepsNewest(t *testing.T) {
+// BP-315: order and count are preserved end to end at this layer — the driver
+// that owns the budget decides which images to replace.
+func TestParsePreservesToolImageOrder(t *testing.T) {
 	body := `{"model":"m","max_tokens":10,"messages":[
 		{"role":"user","content":"go"},
 		{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"a","input":{}}]},
@@ -112,10 +119,9 @@ func TestToolResultBudgetKeepsNewest(t *testing.T) {
 			}
 		}
 	}
-	// Six images in, keep the newest five (OLD1 is dropped), order preserved.
-	want := []string{"OLD2", "OLD3", "OLD4", "NEW1", "NEW2"}
+	want := []string{"OLD1", "OLD2", "OLD3", "OLD4", "NEW1", "NEW2"}
 	if strings.Join(data, ",") != strings.Join(want, ",") {
-		t.Fatalf("kept = %v, want %v (newest first, order preserved)", data, want)
+		t.Fatalf("kept = %v, want %v (nothing dropped, order preserved)", data, want)
 	}
 }
 
