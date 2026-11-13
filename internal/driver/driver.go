@@ -67,10 +67,15 @@ type PackagesProber interface {
 	CreditPackages(ctx context.Context, acc *model.Account) ([]Package, error)
 }
 
-// ImagePart is one generated picture: base64 (no data: prefix) plus its MIME.
+// ImagePart is one generated picture: either inline base64 (no data: prefix)
+// or a hosted URL. URL entries carry the vendor's own expiry (workbuddy COS
+// links live ~24h) — the gateway surfaces the remaining lifetime in its
+// response so callers know to persist the bytes (BP-306).
 type ImagePart struct {
 	MIME string `json:"mime"`
-	B64  string `json:"b64"`
+	B64  string `json:"b64,omitempty"`
+	URL  string `json:"url,omitempty"`
+	Size string `json:"size,omitempty"` // vendor-reported WxH when it says so
 }
 
 // ImageResult is the outcome of one text-to-image upstream call. Images and
@@ -85,6 +90,21 @@ type ImageResult struct {
 // text prompt (optional capability; served through /v1/images/generations).
 type ImageGenerator interface {
 	GenerateImage(ctx context.Context, acc *model.Account, modelName, prompt string) (*ImageResult, error)
+}
+
+// VideoResult is one completed video generation: the vendor-hosted mp4 URLs
+// plus the upstream task id (queries are account-bound, so the gateway stores
+// the pairing — BP-306).
+type VideoResult struct {
+	TaskID string
+	URLs   []string
+	MIME   string
+}
+
+// VideoGenerator is implemented by drivers that can produce videos
+// (served through POST /v1/videos/generations).
+type VideoGenerator interface {
+	GenerateVideo(ctx context.Context, acc *model.Account, modelName, prompt, resolution string, duration int, aspectRatio, firstFrame, lastFrame string) (*VideoResult, error)
 }
 
 // Refresher refreshes credentials (OAuth / device tokens).

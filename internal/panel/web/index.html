@@ -171,6 +171,9 @@ tr:last-child td{border-bottom:none}
       <li><a href="#tiers" data-view="tiers">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 12.5h12M2 8h12M2 3.5h12"/><path d="M5 6v2.5M9 10.5V13"/></svg>
         模型与档位</a></li>
+      <li><a href="#media" data-view="media">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.5" y="4" width="8" height="8" rx="1.5"/><path d="M11 7l3-2v6l-3-2"/></svg>
+        媒体模型</a></li>
       <li><a href="#tasks" data-view="tasks">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.5" y="2.5" width="11" height="11" rx="2.4"/><path d="M5.5 8l1.8 1.8 3.4-3.6"/></svg>
         任务中心</a></li>
@@ -431,6 +434,18 @@ tr:last-child td{border-bottom:none}
     </section>
 
     <!-- ══ 模型与档位 ══ -->
+    <section class="view" id="view-media" hidden>
+      <div class="box">
+        <header><h3>生图 / 生视频模型（能力 · 参数 · 成本）</h3>
+          <span class="grow"></span>
+          <span class="note">数据 = /v1/media/models；画质 Elo 来自 Artificial Analysis（2026-11-10 快照）。厂商直链有时效（WorkBuddy 约 24h），展示不代表长期可用。</span></header>
+        <div class="tbl-wrap">
+          <table id="mediaModels"><thead><tr>
+            <th>模型</th><th>类型</th><th>渠道</th><th>画质</th><th>成本</th><th>参数范围</th><th>可用</th>
+          </tr></thead><tbody></tbody></table>
+        </div>
+      </div>
+    </section>
     <section class="view" id="view-tiers" hidden>
       <div class="box">
         <header><h3>国模（积分制渠道：WorkBuddy / Trae / ZCode / AutoClaw / Qoder / Lobster）</h3>
@@ -901,7 +916,8 @@ function toggleTheme(){ document.body.classList.toggle('light', document.getElem
 /* ── 视图切换 ── */
 // Channel hashes (#google/#workbuddy/#trae/#zcode) map onto the accounts
 // view; #google is the default landing view.
-const titles = {accounts:'账号池', google:'账号池', workbuddy:'账号池', trae:'账号池', zcode:'账号池', autoclaw:'账号池', qoder:'账号池', lobster:'账号池', tasks:'任务中心', usage:'用量统计', tiers:'模型与档位', packages:'国模积分情况', logs:'请求日志', guide:'使用指南', settings:'设置'};
+const titles = {
+  media: '媒体模型（生图 / 生视频）',accounts:'账号池', google:'账号池', workbuddy:'账号池', trae:'账号池', zcode:'账号池', autoclaw:'账号池', qoder:'账号池', lobster:'账号池', tasks:'任务中心', usage:'用量统计', tiers:'模型与档位', packages:'国模积分情况', logs:'请求日志', guide:'使用指南', settings:'设置'};
 const chanHashes = {google:'antigravity', workbuddy:'workbuddy', trae:'trae', zcode:'zcode', autoclaw:'autoclaw', qoder:'qoder', lobster:'lobster'};
 const chanNames = {antigravity:'Google（Antigravity）', workbuddy:'WorkBuddy', trae:'Trae CN', zcode:'ZCode', autoclaw:'AutoClaw', qoder:'Qoder', lobster:'LobsterAI（有道龙虾）', openaicompat:'OpenAI 兼容兜底'};
 function switchView(hash){
@@ -921,6 +937,7 @@ function switchView(hash){
   if (target === 'accounts'){ renderKpis(); renderAccounts(); renderModelLocks(); }
   if (target === 'usage') loadUsage();
   if (target === 'tiers') loadTiers();
+  if (target === 'media') loadMediaModels();
   if (target === 'packages') loadPackages();
   if (target === 'logs') loadLogs();
   if (target === 'tasks') loadTasks();
@@ -1097,6 +1114,41 @@ function tierCells(m, srcClass){
     <td>${unknown ? '<span class="muted">—</span>' : yesNo(m.tool_call)}</td>
     <td>${unknown ? '<span class="muted">—</span>' : yesNo(m.structured_output)}</td>`;
 }
+async function loadMediaModels(){
+  let models;
+  try {
+    const r = await fetch('/v1/media/models');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    models = (await r.json()).data || [];
+  } catch (e) {
+    document.querySelector('#mediaModels tbody').innerHTML =
+      '<tr><td colspan="7" class="note">能力清单不可用：' + e.message + '（网关 /v1/media/models）</td></tr>';
+    return;
+  }
+  const esc = t => String(t == null ? '' : t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  const rows = models.map(m => {
+    const q = m.quality ? ('Elo ' + m.quality.elo + '（第' + m.quality.rank + '）') : '无数据';
+    const ch = (m.channels || []).join(' / ');
+    const ps = (m.params || []).map(p => {
+      if (!p.supported) return '';
+      let v = p.name;
+      if (p.values && p.values.length) v += ': ' + p.values.join(' / ');
+      else if (p.min != null || p.max != null) v += ': ' + (p.min ?? '') + '~' + (p.max ?? '');
+      return '<div>' + esc(v) + '</div>';
+    }).filter(Boolean).join('');
+    const unsupported = (m.params || []).filter(p => !p.supported && p.name !== 'aspect_ratio' || (!p.supported && p.name === 'aspect_ratio' && m.kind === 'image'))
+      .map(p => p.name);
+    const no = unsupported.length ? '<div class="note">不支持: ' + esc(unsupported.join(', ')) + '</div>' : '';
+    return '<tr><td><b>' + esc(m.display_name) + '</b><div class="note">' + esc(m.id) + '</div></td>' +
+      '<td>' + (m.kind === 'image' ? '图' : '视频') + '</td>' +
+      '<td>' + esc(ch) + '</td><td>' + esc(q) + '</td>' +
+      '<td>' + esc(m.pricing || '') + '</td>' +
+      '<td>' + ps + no + '</td>' +
+      '<td>' + (m.available ? '✅' : (m.requires_browser ? '需浏览器（未接）' : '无账号')) + '</td></tr>';
+  });
+  document.querySelector('#mediaModels tbody').innerHTML = rows.join('');
+}
+
 async function loadTiers(){
   try {
     const d = await api('tiers?sort=' + tierSort());

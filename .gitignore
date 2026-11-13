@@ -18,6 +18,12 @@
 /*.exe.bak-*
 
 # 工作台草稿、内部流程与调研资料（保留在本地，不随源码发布）
+#
+# !! 重要：以下路径 git 从不记账，磁盘上是唯一副本 —— 删了就没了 !!
+# 2026-11-09 事故：迁移前清理磁盘时 .scratch/ 被当成可删的临时目录清掉，
+# 丢了 BP-01..BP-294 全部票面（.scratch/bargainproxy/issues/，199 个文件），
+# 而 workflow-state.md 的审批绑定正指向这些文件。已从旧机恢复。
+# 清空间或换机之前，先跑：scripts\backup-local.cmd
 /.scratch/
 /research/
 /specs/

@@ -53,6 +53,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", s.auth(s.handleChatCompletions))
 	mux.HandleFunc("POST /v1/images/generations", s.auth(s.handleImages))
 	mux.HandleFunc("GET /v1/models", s.auth(s.handleModels))
+	mux.HandleFunc("GET /v1/media/models", s.auth(s.handleMediaModels))
+	mux.HandleFunc("POST /v1/videos/generations", s.auth(s.handleVideoGenerations))
+	mux.HandleFunc("GET /v1/videos/generations/{id}", s.auth(s.handleVideoTask))
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.MountProtocols(mux)
 	if s.panel != nil && s.panel.Enabled() {

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/media"
 	"bargainproxy/internal/model"
 	"bargainproxy/internal/uperr"
 )
@@ -28,6 +29,16 @@ const imageChannel = model.ChannelAntigravity
 
 // ImageGenAvailable reports whether image generation can be served: the
 // channel has a driver implementing driver.ImageGenerator.
+// ChannelAlive reports whether a channel currently has an enabled driver and
+// at least one importable account — the availability signal behind
+// GET /v1/media/models (BP-306 P1).
+func (g *Gateway) ChannelAlive(channel string) bool {
+	if _, ok := g.drivers[channel]; !ok {
+		return false
+	}
+	return g.pool.HasAccounts(channel)
+}
+
 func (g *Gateway) ImageGenAvailable() bool {
 	_, ok := g.drivers[imageChannel].(driver.ImageGenerator)
 	return ok
@@ -118,6 +129,90 @@ func (g *Gateway) generateOneImage(ctx context.Context, ig driver.ImageGenerator
 // used to point callers at the images endpoint instead of a route miss.
 func imageRequested(modelName string) bool {
 	return strings.EqualFold(strings.TrimSpace(modelName), model.ImageGenModel)
+}
+
+// GenerateImagesModel is the BP-306 multi-channel entry: resolve a canonical
+// media model to a channel, then reuse the antigravity path's account
+// rotation. size/refs arrive pre-validated against the catalog (the server
+// layer owns enum checks; the gateway owns clamping).
+func (g *Gateway) GenerateImagesModel(ctx context.Context, modelID, preferred, prompt string, n int, size, aspectRatio string, watermark *bool, refs []string) (*ImageOutcome, error) {
+	m, ok := media.ByID(modelID)
+	if !ok || m.Kind != "image" {
+		return nil, uperr.New(uperr.ClassNotFound, 404,
+			"unknown image model %q — see GET /v1/media/models", modelID)
+	}
+	channel, upstream, ok := media.Route(m, preferred)
+	if !ok {
+		return nil, uperr.New(uperr.ClassModelUnavailable, 501,
+			"model %s has no servable channel yet", m.ID)
+	}
+	ig, ok := g.drivers[channel].(driver.ImageGenerator)
+	if !ok {
+		return nil, uperr.New(uperr.ClassModelUnavailable, 501,
+			"channel %s does not implement image generation", channel)
+	}
+	if !g.pool.HasAccounts(channel) {
+		ue := uperr.New(uperr.ClassQuotaExhausted, 429,
+			"no account on channel %s; import one first", channel)
+		ue.Channel = channel
+		return nil, ue
+	}
+	out := &ImageOutcome{}
+	for i := 0; i < n; i++ {
+		call, err := g.generateOneImageOn(ctx, channel, ig, upstream, prompt, size, aspectRatio, watermark, refs)
+		out.Attempts += call.Attempts
+		if err != nil {
+			return out, err
+		}
+		out.Images = append(out.Images, call.Images...)
+		out.Account = call.Account
+	}
+	return out, nil
+}
+
+// generateOneImageOn is generateOneImage generalized over channel/upstream.
+func (g *Gateway) generateOneImageOn(ctx context.Context, channel string, ig driver.ImageGenerator, upstreamModel, prompt, size, aspectRatio string, watermark *bool, refs []string) (*imageCall, error) {
+	calls := &imageCall{}
+	for attempt := 1; attempt <= maxAccountAttempts; attempt++ {
+		calls.Attempts = attempt
+		lease, err := g.pool.Acquire(ctx, channel, upstreamModel, "")
+		if err != nil {
+			return calls, g.classifyPoolError(err, channel, upstreamModel)
+		}
+		var res *driver.ImageResult
+		var gerr error
+		if full, ok := ig.(interface {
+			GenerateImageFull(context.Context, *model.Account, string, string, int, string, string, *bool, []string) (*driver.ImageResult, error)
+		}); ok {
+			res, gerr = full.GenerateImageFull(ctx, lease.Account, upstreamModel, prompt, 1, size, aspectRatio, watermark, refs)
+		} else {
+			res, gerr = ig.GenerateImage(ctx, lease.Account, upstreamModel, prompt)
+		}
+		if gerr == nil {
+			lease.Release()
+			calls.Images = res.Images
+			calls.Account = lease.Account
+			return calls, nil
+		}
+		ue, ok := uperr.As(gerr)
+		if ok {
+			if ue.Model == "" {
+				ue.Model = upstreamModel
+			}
+			g.pool.ApplyResult(lease.Account, upstreamModel, ue)
+		}
+		lease.Release()
+		log.Printf("gateway: image attempt %d/%d failed on %s (%s): %v",
+			attempt, maxAccountAttempts, lease.Account.Nickname, channel, gerr)
+		if ctx.Err() != nil {
+			return calls, gerr
+		}
+		if !ok || !uperr.Rotatable(ue.Class) {
+			return calls, gerr
+		}
+	}
+	return calls, uperr.New(uperr.ClassQuotaExhausted, 429,
+		"every %s account failed the image request (%d attempts)", channel, maxAccountAttempts)
 }
 
 // imageModelGate returns a redirect error when the chat model is the image

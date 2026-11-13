@@ -106,8 +106,10 @@ func TestImagesHappyPathShapes(t *testing.T) {
 	}
 	data, _ = out["data"].([]any)
 	first, _ = data[0].(map[string]any)
-	if !strings.HasPrefix(first["url"].(string), "data:image/jpeg;base64,") {
-		t.Fatalf("url = %v", first["url"])
+	// BP-306: url format forwards the vendor URL; a driver that returned only
+	// inline base64 (this mock) falls back to b64_json instead of a data: URI.
+	if first["b64_json"] != "aW1nLWJ5dGVz" {
+		t.Fatalf("expected b64 fallback for a URL request without vendor URLs: %v", first)
 	}
 }
 
@@ -128,7 +130,7 @@ func TestImagesValidation(t *testing.T) {
 	}
 
 	code, body := post(`{"model":"dall-e-3","prompt":"x"}`)
-	if code != http.StatusBadRequest || !strings.Contains(body, "gemini-3.1-flash-image") {
+	if code != http.StatusNotFound || !strings.Contains(body, "/v1/media/models") {
 		t.Fatalf("unknown model: %d %s", code, body)
 	}
 	code, body = post(`{"model":"gemini-3.1-flash-image"}`)
