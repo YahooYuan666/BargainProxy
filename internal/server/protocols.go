@@ -541,6 +541,18 @@ func logResult(row *model.RequestLog, result *gateway.Result, start time.Time) {
 	}
 	row.ToolsDeclared = result.ToolsDeclared
 	row.Effort = result.Effort
+	// BP-323: 反应时间 must mean "how long until the upstream started
+	// answering". Every ingress measures its own TTFB off the first event it
+	// FORWARDS, and since reasoning is held back until the answer begins that
+	// measurement is really "wait for the answer" — field 2026-11-13 21:46
+	// logged a 24.5s request as ttfb=22.1s with 559 output tokens, so the
+	// reasoning sat in neither the TTFB nor (via duration-ttfb) the generation
+	// window. The gateway's own measurement is taken before anything is held,
+	// so it is the honest one; the ingress value stays as the fallback for
+	// legs that produced no content event at all.
+	if result.UpstreamTTFBKnown {
+		row.TTFBMs = int(result.UpstreamTTFB.Milliseconds())
+	}
 	if result.Degraded != "" {
 		row.Degraded = result.Degraded
 	}

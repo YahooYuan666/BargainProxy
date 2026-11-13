@@ -100,6 +100,13 @@ func (l *streamLedger) record(ev ir.StreamEvent) {
 		// would permanently disqualify the continuation for a LATER attempt
 		// that legitimately streamed prose and then dropped.
 		l.sawTool = false
+		// BP-323: the failed attempt's reasoning goes with it. Reasoning is now
+		// HELD until the answer starts, so a reset can arrive with thinking in
+		// the ledger and nothing delivered — the one combination that did not
+		// exist when this branch was written. Keeping it would let a dead
+		// attempt's reasoning drive the length-continuation signal ("thinking
+		// dominates the answer") for a turn the client never saw.
+		l.thinking.Reset()
 	case ir.EvToolRestart:
 		// BP-139: the continuation explicitly REDOES the interrupted tool
 		// call (fresh, complete arguments) instead of splicing half-JSON —
@@ -142,8 +149,18 @@ func (l *streamLedger) canContinue(class string, segs int) bool {
 	if segs >= continueMaxSegments {
 		return false
 	}
-	if l.text.Len() == 0 && l.thinking.Len() == 0 {
-		return false // nothing on the wire to anchor on
+	// BP-323: reasoning alone is NOT an anchor. A continuation replays the
+	// answer text the client saw as an assistant turn; with zero text it
+	// replays nothing and merely re-asks the model. Field 2026-11-13 19:45: a
+	// workbuddy global account dropped three times (21s of thinking, then two
+	// ~5s drops, the last before the response headers) while five healthy
+	// accounts of the same channel sat idle; both continuation segments logged
+	// "0 chars replayed" and the turn died. With no text the cross-channel
+	// cascade is strictly better — one call, and it can land on an account
+	// that works. The thinking is dropped with it (it was never delivered, see
+	// the BP-323 hold in gateway.go), so nothing is duplicated.
+	if l.text.Len() == 0 {
+		return false
 	}
 	// BP-139: a sawTool cut no longer disqualifies the continuation. The
 	// partial arguments are DISCARDED (writers retire the buffered fragment,

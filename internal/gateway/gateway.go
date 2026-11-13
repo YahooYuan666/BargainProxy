@@ -66,6 +66,16 @@ type Result struct {
 	// and fell back to "high", and with nothing in the log there was no way to
 	// notice which of the client's choice and the gateway's rewrite won.
 	Effort string
+	// UpstreamTTFB is the wait for the upstream's first stream event, measured
+	// from the request entering the gateway. It is the honest 反应时间 now that
+	// reasoning is held back (BP-323): the ingress's own first-forwarded-event
+	// time would report the wait for the ANSWER. Zero when no leg produced a
+	// content event (the caller then keeps its own measurement).
+	UpstreamTTFB time.Duration
+	// UpstreamTTFBKnown distinguishes a real zero (a very fast first byte)
+	// from "no leg produced a content event", which must fall back to the
+	// ingress's own measurement.
+	UpstreamTTFBKnown bool
 }
 
 // Trace records how a request was attempted across bindings, so the request
@@ -92,6 +102,31 @@ type Trace struct {
 	// per request: a second FreeUsageLimitError inside the same turn falls
 	// through to the pool's normal handling instead of stacking holds.
 	SharedRateRodeOut bool
+	// UpstreamTTFB is when the upstream's FIRST stream event arrived, which is
+	// what the panel's 反应时间 column is supposed to show (BP-323).
+	//
+	// The ingress measures TTFB off the first event it forwards, and since
+	// BP-323 reasoning is held back until the answer starts — so that
+	// measurement would report "wait for the answer" and divide the token rate
+	// by a window that no longer contains the thinking. Field 2026-11-13 21:46:
+	// a 24.5s request logged ttfb=22.1s with 559 output tokens, i.e. the
+	// reasoning was inside neither the TTFB nor the generation window. The
+	// gateway therefore records the true upstream first-byte separately and
+	// the ingress prefers it when set.
+	UpstreamTTFB time.Duration
+	upstreamTTFB bool
+}
+
+// noteUpstreamFirstByte records the upstream's first stream event once per
+// request. Later legs (account rotation, cascade, continuation) do not
+// overwrite it: 反应时间 answers "how long until the upstream started
+// answering", and the answer is the earliest one.
+func (t *Trace) noteUpstreamFirstByte(d time.Duration) {
+	if t == nil || t.upstreamTTFB {
+		return
+	}
+	t.upstreamTTFB = true
+	t.UpstreamTTFB = d
 }
 
 // BP-221 tunables: how long one shared-lane hold lasts and how many times a
@@ -200,6 +235,11 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	if req.Stream && emit == nil {
 		return nil, fmt.Errorf("gateway: stream requested but no emitter")
 	}
+	// BP-323: the reference point for the upstream's true first byte. The
+	// ingress times its own TTFB from the first event it FORWARDS, which since
+	// the reasoning hold is "the answer started", not "the upstream started
+	// talking"; the panel's 反应时间 wants the latter.
+	requestStart := time.Now()
 	// The image model has no chat route on purpose (chat cannot carry image
 	// parts back); point the caller at the images endpoint instead of a bare
 	// "model not found" (BP-186).
@@ -332,7 +372,45 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	// scrubber per client request, covering every driver's tool stream.
 	crArgs := &crTidy{}
 	firstEvent := false
+	// BP-323: reasoning is HELD until the first answer byte arrives.
+	//
+	// Why: a turn whose stream dies after 21s of thinking and before any text
+	// has delivered nothing the client can act on, yet the old rule counted
+	// reasoning as "the client has seen part of the answer" — which closed
+	// BOTH escape hatches at once. No account rotation within the channel, no
+	// cascade to the next channel, and a same-account continuation with an
+	// empty replay ("0 chars replayed") that just re-asked the model. Field
+	// 2026-11-13 19:45: one workbuddy global account dropped three times while
+	// five healthy accounts of the same channel sat idle, and the turn died.
+	//
+	// Holding reasoning costs the client nothing it was promised: the deltas
+	// are released, in order and unchanged, the moment the answer starts (or
+	// at the turn's end, for a thinking-only answer). The client keeps seeing
+	// liveness through the SSE keepalive, which never travels through this
+	// emitter (see server/keepalive.go) — so a silent prefill still cannot
+	// trip the client's own watchdog.
+	//
+	// Dropped on EvAttemptReset: a retry reuses this stream and the dead
+	// attempt's reasoning belongs to a model call that no longer exists.
+	var heldThinking []ir.StreamEvent
+	releaseThinking := func() error {
+		for _, ev := range heldThinking {
+			if err := emit(ev); err != nil {
+				return err
+			}
+		}
+		heldThinking = nil
+		return nil
+	}
 	seen := func(ev ir.StreamEvent) error {
+		// BP-323: the upstream's real first byte, recorded before anything is
+		// held back. Only CONTENT events count: usage/terminal frames are
+		// bookkeeping, and an upstream that sends them and nothing else has
+		// not started answering (BP-118).
+		switch ev.Kind {
+		case ir.EvText, ir.EvThinking, ir.EvThinkingSignature, ir.EvToolStart, ir.EvToolArgs:
+			tr.noteUpstreamFirstByte(time.Since(requestStart))
+		}
 		switch ev.Kind {
 		case ir.EvToolArgs:
 			ev.Delta = crArgs.write(ev.Delta)
@@ -342,6 +420,38 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 			crArgs.flush()
 		}
 		ledger.record(ev)
+		// BP-323: the hold itself. Reasoning (and its signature delta) is
+		// buffered here and released by the first event that proves the turn
+		// has an answer — text, a tool call, or the terminal. Everything the
+		// client would have seen it still sees, in the same order; only the
+		// moment moves.
+		//
+		// Releasing on a TOOL event (not just on text) keeps the Anthropic
+		// block order legal: thinking must precede the tool_use blocks, and a
+		// turn that thinks and then calls a tool never writes text.
+		switch ev.Kind {
+		case ir.EvThinking, ir.EvThinkingSignature:
+			if ev.Delta != "" {
+				heldThinking = append(heldThinking, ev)
+			}
+			return nil
+		case ir.EvAttemptReset:
+			// The reasoning belongs to a dead model call; the client never
+			// saw it, so it is dropped rather than replayed by the next
+			// attempt (which produces its own).
+			heldThinking = nil
+		case ir.EvText, ir.EvToolStart, ir.EvToolArgs, ir.EvDone:
+			if len(heldThinking) > 0 {
+				if err := releaseThinking(); err != nil {
+					return err
+				}
+				// The client now holds reasoning: it HAS seen part of the
+				// answer, so a retry would duplicate a block it can read. This
+				// is the pre-BP-323 rule, restored exactly for the case it was
+				// written for.
+				firstEvent = true
+			}
+		}
 		// Only CLIENT-VISIBLE content counts as "the client has seen part of
 		// the answer" (BP-118). Usage and the terminal event are bookkeeping:
 		// an upstream that sends usage (or an empty done) and then dies has
@@ -356,7 +466,11 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// escape hatches shut, while the same conversation answered 200 on the
 		// same channel seconds before and after.
 		switch ev.Kind {
-		case ir.EvText, ir.EvThinking:
+		case ir.EvText:
+			// BP-323: text is what "the client has seen part of the answer"
+			// means. Reasoning never reaches this switch — the hold above
+			// returns before it, and the hold's release is what sets this flag
+			// when reasoning actually goes out.
 			firstEvent = true
 		case ir.EvToolStart, ir.EvToolArgs:
 			// Tool deltas count as delivered ONLY on protocols that stream
@@ -1431,7 +1545,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			for i := range resp.Message.ToolCalls {
 				resp.Message.ToolCalls[i].Arguments = dropLoneCR(resp.Message.ToolCalls[i].Arguments)
 			}
-			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts, ToolsDeclared: len(req.Tools), Effort: effortSent}
+			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts, ToolsDeclared: len(req.Tools), Effort: effortSent, UpstreamTTFB: tr.UpstreamTTFB, UpstreamTTFBKnown: tr.upstreamTTFB}
 			if degraded {
 				res.Degraded = binding.Channel
 			}
@@ -1895,6 +2009,15 @@ func TrimModelName(s string) string {
 	return s
 }
 
+// BareModel strips the "channel:<name>:" debug prefix for logging (the
+// request-log row records the bare model name plus the actual channel).
+func BareModel(s string) string {
+	if bare, _, has := router.ParseChannelPrefix(s); has && bare != "" {
+		return bare
+	}
+	return s
+}
+
 // rekeyCooldownModel (BP-319): model-scoped cooldowns are keyed by ue.Model,
 // and drivers fill it with the UPSTREAM model spelling while the pick loop
 // checks the DISPLAY spelling the client sent (Acquire receives req.Model).
@@ -1913,13 +2036,4 @@ func rekeyCooldownModel(ue *uperr.Error, upstreamModel, display string) {
 		return
 	}
 	ue.Model = display
-}
-
-// BareModel strips the "channel:<name>:" debug prefix for logging (the
-// request-log row records the bare model name plus the actual channel).
-func BareModel(s string) string {
-	if bare, _, has := router.ParseChannelPrefix(s); has && bare != "" {
-		return bare
-	}
-	return s
 }
