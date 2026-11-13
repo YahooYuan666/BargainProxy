@@ -35,10 +35,16 @@
 // known. Past it the answer stays truncated and the cap says so in the log —
 // "burned our own cap" must not read like an upstream fault.
 //
-// Scope: workbuddy only, prose only. Other channels bill thinking separately
-// (raising or continuing there would rewrite the client's own semantics);
-// a length cut inside a tool call is the BP-139 redo shape and needs its own
-// evidence before it earns a slot.
+// Scope: workbuddy (the three signals above) and — since BP-317 — trae, on a
+// DIFFERENT trigger: trae's SOLO upstream cuts a segment at a per-model
+// output cap and reports finish_reason:"stop" (traework2api-panel fe0b0cdb,
+// field-measured 2026-11-10: deepseek-v4.1-flash cuts at exactly 32000,
+// glm-5.3__max at 16000, with or without a client max_tokens). The cut is
+// disguised as a clean end; the trigger is "stop + pure prose + output >= the
+// model's measured cap". Other channels bill thinking separately (raising or
+// continuing there would rewrite the client's own semantics); a length cut
+// inside a tool call is the BP-139 redo shape and needs its own evidence
+// before it earns a slot.
 package gateway
 
 import (
@@ -102,12 +108,35 @@ func effortFloor(req *ir.ChatRequest) int {
 	return 0
 }
 
-// lengthContinuationPlan decides whether a finish=length turn with a partial
-// prose answer continues on the same account. It returns the rewritten
-// request (thinking off, raised budget inherited) and a human reason for the
-// log.
-func lengthContinuationPlan(channel string, req *ir.ChatRequest, ledger *streamLedger, resp *ir.ChatResponse) (*ir.ChatRequest, string, bool) {
-	if channel != model.ChannelWorkBuddy || req == nil || resp == nil {
+// traeCutCaps: per-model single-segment output caps on the trae SOLO
+// upstream, measured in the field (traework2api-panel fe0b0cdb, 2026-11-10).
+// The upstream cuts at the cap and reports finish_reason:"stop" — the
+// truncation is disguised as a clean end, with or without a client
+// max_tokens. ONLY measured caps go in the table (no guessing); the plateau
+// WARN inside traeCutContinuationPlan grows it from live traffic. Keys are
+// the trae UPSTREAM model names (config model_routes upstream_model).
+var traeCutCaps = map[string]int{
+	"deepseek-v4.1-flash": 32000,
+}
+
+// traeCutPlateau: the smallest output at which an exact multiple of 1000 is
+// treated as a suspected cap (twp fe0b0cdb's capPlateau — natural endings
+// almost never land exactly on a round thousand).
+const traeCutPlateau = 8000
+
+// lengthContinuationPlan decides whether a finished turn with a partial prose
+// answer continues on the same account. channel picks the trigger family:
+// workbuddy = finish=length signals 1-3, trae = the disguised-cut cap table
+// (BP-317). It returns the rewritten request (thinking off, raised budget
+// inherited) and a human reason for the log.
+func lengthContinuationPlan(channel, upstreamModel string, req *ir.ChatRequest, ledger *streamLedger, resp *ir.ChatResponse) (*ir.ChatRequest, string, bool) {
+	if req == nil || resp == nil || ledger == nil {
+		return nil, "", false
+	}
+	if channel == model.ChannelTrae {
+		return traeCutContinuationPlan(upstreamModel, req, ledger, resp)
+	}
+	if channel != model.ChannelWorkBuddy {
 		return nil, "", false
 	}
 	if resp.StopReason != ir.StopLength {
@@ -186,6 +215,69 @@ func lengthContinuationPlan(channel string, req *ir.ChatRequest, ledger *streamL
 	return contReq, why, true
 }
 
+// traeCutContinuationPlan (BP-317) is the trae twin of the length path: the
+// upstream cuts a segment at a per-model output cap while reporting
+// finish_reason:"stop" (traework2api-panel fe0b0cdb field data). Trigger:
+// stop + pure prose + cumulative output >= the model's measured cap. Every
+// gate is fail-closed; the plateau WARN below is the table's growth mechanism,
+// not a rescue.
+func traeCutContinuationPlan(upstreamModel string, req *ir.ChatRequest, ledger *streamLedger, resp *ir.ChatResponse) (*ir.ChatRequest, string, bool) {
+	if resp == nil || ledger == nil {
+		return nil, "", false
+	}
+	if resp.StopReason != ir.StopEnd {
+		// An honest finish=length on trae has no measured mechanism yet — the
+		// workbuddy signals (shared thinking budget, raised floors) do not
+		// transfer, and inventing one here would rewrite the client's own
+		// semantics. Leave it truncated.
+		return nil, "", false
+	}
+	if ledger.sawTool || ledger.text.Len() == 0 {
+		return nil, "", false
+	}
+	out := ledger.usage.OutputTokens
+	name := strings.ToLower(strings.TrimSpace(upstreamModel))
+	cap, known := traeCutCaps[name]
+	if !known || out < cap {
+		// Plateau detector (twp fe0b0cdb): the upstream cuts on round
+		// thousand-token boundaries; a natural ending almost never lands
+		// exactly there. An ending at a plateau below the registered cap is
+		// the same smell with a smaller number.
+		if out >= traeCutPlateau && out%1000 == 0 {
+			log.Printf("WARN: gateway: trae output %d on %q ends cleanly on stop — suspected unregistered cut cap (if confirmed in the field, add it to traeCutCaps)", out, upstreamModel)
+		}
+		return nil, "", false
+	}
+	// Same cumulative spending gate as the workbuddy path: a continuation may
+	// not push the turn past floor × 4 (or the 32768 default).
+	floor := effortFloor(req)
+	capTokens := defaultContinueTotalCap
+	if floor > 0 {
+		capTokens = floor * continueTotalCapRatio
+	}
+	if ledger.usage.OutputTokens >= capTokens {
+		log.Printf("gateway: trae cumulative output %d reached the continuation cap %d (floor %d × %d) — leaving the answer truncated at the cut cap",
+			ledger.usage.OutputTokens, capTokens, floor, continueTotalCapRatio)
+		return nil, "", false
+	}
+	contReq := continuationRequest(req, ledger, false)
+	contReq.Thinking = &ir.ThinkingConfig{Enabled: false}
+	if req.Thinking != nil {
+		// Keep Include semantics but disable the thinking itself (BP-112 same
+		// shape): the whole segment budget goes to prose, so a re-cut lands
+		// on prose length, not thinking.
+		contReq.Thinking.Include = req.Thinking.Include
+	}
+	contReq.RequestedEffort = ""
+	if contReq.MaxTokens < cap {
+		// The client's budget (if any) may be smaller than the model's own
+		// cap — carrying it would re-cut the segment early. The cap is the
+		// smallest budget that survives one full segment with thinking off.
+		contReq.MaxTokens = cap
+	}
+	return contReq, fmt.Sprintf("output %d hit the trae cut cap %d (upstream reports it as stop)", out, cap), true
+}
+
 // runLengthContinuation drives the same-account continuation loop and returns
 // the merged response. Every segment splices into the client stream through
 // emit; the terminal stays held until executeBinding releases it.
@@ -196,7 +288,7 @@ func runLengthContinuation(actx context.Context, binding router.Binding, lease *
 		if actx.Err() != nil {
 			break
 		}
-		log.Printf("gateway: %s finish=length with a partial answer (%s) — continuing on the same account with thinking disabled (segment %d, %d chars so far)",
+		log.Printf("gateway: %s turn cut mid-answer (%s) — continuing on the same account with thinking disabled (segment %d, %d chars so far)",
 			binding.Channel, why, seg, ledger.text.Len())
 		contResp, cerr := drv.Stream(actx, driver.ChatCall{
 			Account: lease.Account, UpstreamModel: binding.UpstreamModel,
@@ -215,7 +307,7 @@ func runLengthContinuation(actx context.Context, binding router.Binding, lease *
 		if contResp.StopReason != ir.StopLength {
 			break
 		}
-		next, nextWhy, ok := lengthContinuationPlan(binding.Channel, client, ledger, resp)
+		next, nextWhy, ok := lengthContinuationPlan(binding.Channel, binding.UpstreamModel, client, ledger, resp)
 		if !ok {
 			break
 		}

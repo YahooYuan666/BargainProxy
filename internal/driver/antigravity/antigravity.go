@@ -6,7 +6,6 @@
 package antigravity
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -26,6 +25,7 @@ import (
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/streamx"
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
@@ -475,7 +475,7 @@ func (c *cancelOnClose) Close() error {
 // parseSSE consumes the Gemini SSE stream, emitting IR events and building
 // the aggregated response.
 func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := bufio.NewScanner(r)
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), maxSSELine)
 
 	out := &ir.ChatResponse{

@@ -46,6 +46,13 @@ func cleanGeminiSchema(v any) any {
 }
 
 func cleanGeminiSchemaMap(in map[string]any) map[string]any {
+	// BP-321: rewrite the union/tuple shapes FIRST — the allow-list below
+	// would otherwise silently drop them (anyOf/oneOf/prefixItems/const are
+	// not in the set), amputating the constraints the model is meant to act
+	// on. Everything the rewrite produces stays inside the allow-list.
+	if rw, ok := rewriteGeminiShapes(in).(map[string]any); ok {
+		in = rw
+	}
 	out := make(map[string]any, len(in))
 	for k, v := range in {
 		if !geminiSchemaAllowedKeys[k] {

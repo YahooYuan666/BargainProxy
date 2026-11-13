@@ -5,7 +5,6 @@
 package opencodezen
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -21,6 +20,7 @@ import (
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/streamx"
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
@@ -501,7 +501,7 @@ func (d *Driver) chatOnce(ctx context.Context, wire []byte, emit driver.Emit) (*
 // parseSSE converts the OpenAI-style chunk stream into IR events, dropping
 // tool calls made to injected gate tools.
 func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := bufio.NewScanner(r)
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
@@ -511,8 +511,7 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 		stop       ir.StopReason
 		gotUsage   bool
 		terminated bool
-		toolAcc    = map[int]*ir.ToolCall{}
-		toolOrder  []int
+		toolFolder = streamx.NewToolFolder() // BP-320: id 分流+起始顺序重编号
 		gateOnly   = true // no real (non-gate) tool seen yet
 	)
 	for sc.Scan() {
@@ -583,19 +582,20 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 				if isGateToolName(tc.Function.Name) {
 					continue // our injected stub: never surface it
 				}
-				acc, ok := toolAcc[tc.Index]
-				if !ok {
-					acc = &ir.ToolCall{ID: tc.ID, Name: tc.Function.Name}
-					toolAcc[tc.Index] = acc
-					toolOrder = append(toolOrder, tc.Index)
-					if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: tc.Index,
-						ToolCall: &ir.ToolCall{ID: acc.ID, Name: acc.Name}}); err != nil {
+				// BP-320: fragment routing goes through the shared folder — a NEW
+				// id at a used index opens a new call (upstream glue: qoder 0.2.65
+				// #930, magpie 835439eb), and every call is renumbered from 0 in
+				// start order so downstream index-keyed writers never see two
+				// calls on one index.
+				fr := toolFolder.Add(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
+				if fr.Started {
+					if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: fr.Slot,
+						ToolCall: &ir.ToolCall{ID: fr.ID, Name: fr.Name}}); err != nil {
 						return nil, err
 					}
 				}
 				if tc.Function.Arguments != "" {
-					acc.Arguments += tc.Function.Arguments
-					if err := emit(ir.StreamEvent{Kind: ir.EvToolArgs, ToolIndex: tc.Index, Delta: tc.Function.Arguments}); err != nil {
+					if err := emit(ir.StreamEvent{Kind: ir.EvToolArgs, ToolIndex: fr.Slot, Delta: tc.Function.Arguments}); err != nil {
 						return nil, err
 					}
 				}
@@ -640,8 +640,8 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 	// connection survives.
 	httpx.Drain(r)
 
-	for _, idx := range toolOrder {
-		out.Message.ToolCalls = append(out.Message.ToolCalls, *toolAcc[idx])
+	for _, c := range toolFolder.List() {
+		out.Message.ToolCalls = append(out.Message.ToolCalls, ir.ToolCall{ID: c.ID, Name: c.Name, Arguments: c.Args})
 	}
 	if len(out.Message.ToolCalls) > 0 && stop == ir.StopEnd {
 		stop = ir.StopToolUse
@@ -649,7 +649,7 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 	if stop == "" {
 		stop = ir.StopEnd
 	}
-	if textBuf.Len() == 0 && thinkBuf.Len() == 0 && len(toolOrder) == 0 {
+	if textBuf.Len() == 0 && thinkBuf.Len() == 0 && len(toolFolder.List()) == 0 {
 		log.Printf("opencodezen: empty completion (model unknown at parse site; check upstream)")
 	}
 	out.Message.Content = []ir.ContentPart{{Kind: "text", Text: textBuf.String()}}
@@ -928,7 +928,7 @@ type responsesEvent struct {
 // as the authoritative fallback (used only when no delta carried the call, so
 // nothing is duplicated).
 func parseResponsesSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := bufio.NewScanner(r)
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Message: ir.Message{Role: ir.RoleAssistant}}
 	var (

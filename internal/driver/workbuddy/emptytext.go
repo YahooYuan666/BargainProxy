@@ -23,6 +23,12 @@ import (
 // for the model to read anyway.
 const emptyTextFill = " "
 
+// toolImageCarrier introduces the images a tool returned, once they have been
+// moved onto a user turn (BP-308). Chinese deliberately: it rides a real user
+// message on domestic channels, and a bare English label there reads as the
+// client talking rather than the gateway annotating.
+const toolImageCarrier = "（工具返回的图片如下）"
+
 // padSniffedString repairs string content the upstream would sniff into a
 // parts array. Returns s unchanged when the sniff does not fire or no part
 // needs padding — the zero-impact guarantee for ordinary requests.

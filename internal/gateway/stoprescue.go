@@ -1,32 +1,37 @@
-// Stop-shaped rescues (BP-302 narration, BP-303 tool-only): turns that ended
-// finish=stop with PROSE the upstream considered complete, but that a client
-// reads as "it stopped mid-thought". No length, no transport error, no
-// empty reply — every existing rescue is blind to these.
+// Stop-shaped rescue (BP-302 narration): a turn that ended finish=stop with
+// PROSE the upstream considered complete, but that a client reads as "it
+// stopped mid-thought" — the tail is a colon, comma, ellipsis, dash, unclosed
+// code fence, or just no sentence-final punctuation, on a TOOL-CLASS request
+// (tools declared AND tool turns in the history; roleplay clients end prose
+// on colons as normal style and must not be touched). One continuation whose
+// nudge names the lead-in ("you stopped on a preview sentence"); its text
+// splices into the same stream. Misfire cost: one prefix-cache-hit upstream
+// call; runs ONLY on workbuddy (same domain as the length continuation).
 //
-// Two shapes, one rescue slot each per request (misakano c2003af + 1037397):
+// BP-316: the tool-only half (BP-303, misakano 1037397) is REMOVED. It was
+// built for Codex's "says one sentence and stops" (BP-293); Codex is no
+// longer a served client (user, 2026-11-13: 「codex 我放弃了」), and its
+// real-world harm is on record: ZCode's normal shape — a short confirmation
+// right after every tool result — is exactly the tool-only trigger, so a
+// model that had FINISHED got pushed into another tool call and the turn
+// never ended (sess_1d74dbe9: 105 rounds of "blind and unable to stop",
+// together with the BP-70 image cap BP-315 already fixed). Narration keeps
+// running and gains the five field-tested gates misakano shipped after its
+// own runaway (e8df35b6+92dadae3+baf9155d+79ba3d62, 2026-11-10/11):
 //
-//   - narration (c2003af): the answer stops on a LEAD-IN — tail is a colon,
-//     comma, ellipsis, dash, unclosed code fence, or just no sentence-final
-//     punctuation — on a TOOL-CLASS request (tools declared AND tool turns in
-//     the history; roleplay clients end prose on colons as normal style and
-//     must not be touched). One continuation whose nudge names the lead-in
-//     ("you stopped on a preview sentence"), its text splices into the same
-//     stream.
-//   - tool-only (1037397): the answer is one glanceable sentence (≤240B) and
-//     the LAST history message is a tool result — the model just read tool
-//     output and should have acted. One continuation that asks it to ACT;
-//     its text/thinking are DISCARDED (the client never sees them), and it is
-//     adopted only if it produced tool calls — otherwise the original answer
-//     and terminal stand, byte-for-byte what the client would have seen
-//     unwired. This is the gateway-side remedy for the Codex "says one
-//     sentence and stops" case (BP-293: the upstream honestly ended the turn;
-//     misakano's field evidence: 38 of 156 same-shape samples end on a full
-//     stop, so the adoption gate — tool calls only — keeps normal short
-//     replies untouched).
-//
-// Both misfires cost one prefix-cache-hit upstream call; both run ONLY on
-// workbuddy (same domain as the length continuation: this is that upstream's
-// turn-ending behavior, and other channels bill thinking separately).
+//   - user-yield gate: a question tail or "please confirm" wording is a
+//     DELIBERATE stop — continuing once got an agent's draft email sent to
+//     the whole staff (misakano issue #209, two incidents);
+//   - text-embedded tool-call markup, by completeness: a COMPLETE DSML/XML
+//     block is executed by the client, so continuing would fabricate a
+//     second call; a TRUNCATED block must be completed (25 of 76 narration
+//     triggers in 40 minutes were such false positives on deepseek);
+//   - structural closers (</summary>/</details>/</analysis>) and '&' count
+//     as finished;
+//   - 400B length gate on punctuation-type tails: an agent's "notes + list"
+//     nearly always ends on a colon, so an unbounded rescue fired every
+//     turn; structurally open tails (unclosed fence, truncated markup) are
+//     exempt — those are genuinely unfinished at any length.
 package gateway
 
 import (
@@ -40,29 +45,127 @@ import (
 // believes the task is already done and repeats its conclusion.
 const narrationNudge = "你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要道歉或解释。"
 
-// toolOnlyNudge (misakano 1037397) — must say "stop explaining", or the model
-// writes another summary whose text this rescue would discard, wasting the
-// call.
-const toolOnlyNudge = "继续执行下一步。需要查看文件、执行命令或使用工具时，直接调用工具，不要再用文字解释或重复已有结论。如果确实已经全部完成，请只回复 DONE。"
+// narrationMaxBytes: a lead-in sentence measured 40~200B in the field;
+// beyond 400B a "stopped on a colon" tail is almost certainly normal
+// formatting (misakano 79ba3d62). Structurally open tails bypass this — see
+// narrationTailStructurallyOpen.
+const narrationMaxBytes = 400
 
-// toolOnlyMaxBytes: prose longer than this is not "one sentence" — normal
-// short replies run <60 chars, the field's lead-in-then-stop samples 40~200.
-const toolOnlyMaxBytes = 240
+// userYieldMarkers: prose that hands the turn back to the user. The gate
+// must be independent of narrationTailSuspends — a question tail reads as
+// sentence-final there, but it is the model ASKING, not stopping mid-thought.
+var userYieldMarkers = []string{
+	"请确认", "确认后", "等你确认", "待你确认", "等你回复",
+	"是否需要", "需不需要", "要不要我", "要不要", "你希望", "请告知",
+	"让我知道", "请你确认", "你确认后", "确认无误", "可以吗", "行吗", "好吗",
+}
 
-// toolOnlyMinPrompt: in a short session a one-line reply is normal (Q&A,
-// greetings); only a LONG session makes it anomalous. Without a usage
-// reading there is no way to tell — do not rescue.
-const toolOnlyMinPrompt = 20000
+var userYieldMarkersEN = []string{
+	"please confirm", "let me know", "should i ", "do you want", "would you like",
+	"awaiting your", "waiting for your", "confirm before", "shall i ",
+}
+
+// toolCallMarkupMarkers: tool calls the model wrote as PLAIN TEXT. DSML is
+// DeepSeek's own wire format leaking into prose (both full- and half-width
+// pipe spellings seen in the field); the XML/antml shapes come from prompts
+// that teach the call format.
+var toolCallMarkupMarkers = []string{
+	"｜｜DSML｜｜", "|DSML|",
+	"</function_calls>", "<function_calls>",
+	"antml:invoke", "<invoke name=",
+	"</tool_calls>", "<tool_calls>",
+}
+
+// markupState grades text-embedded tool-call markup by completeness; the two
+// states need OPPOSITE rescue decisions (misakano 92dadae3 — "DSML 修了又像
+// 没修" came from treating them alike).
+type markupState int
+
+const (
+	markupNone     markupState = iota // no tool-call markup at all
+	markupComplete                    // block closed: the client will execute it
+	markupPartial                     // block cut mid-way: prose ends on half a marker
+)
+
+// toolCallMarkupState grades the markup in text. A block is complete when
+// the trimmed text ends on the closer the format ends with ("</function_calls>",
+// "</tool_calls>", or DSML's "</｜｜DSML｜｜ calls>"); anything else that merely
+// contains a marker is a truncated call.
+func toolCallMarkupState(text string) markupState {
+	if text == "" {
+		return markupNone
+	}
+	found := false
+	for _, m := range toolCallMarkupMarkers {
+		if strings.Contains(text, m) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return markupNone
+	}
+	t := strings.TrimRight(text, " \t\r\n")
+	switch {
+	case strings.HasSuffix(t, "</function_calls>"), strings.HasSuffix(t, "</tool_calls>"):
+		return markupComplete
+	case strings.HasSuffix(t, "calls>") && strings.Contains(t, "DSML"):
+		return markupComplete
+	}
+	return markupPartial
+}
+
+// textYieldsToUser reports whether the prose hands the turn back to the user:
+// a question tail, or explicit "please confirm" wording (CN and EN).
+func textYieldsToUser(text string) bool {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return false
+	}
+	if strings.HasSuffix(t, "？") || strings.HasSuffix(t, "?") {
+		return true
+	}
+	for _, m := range userYieldMarkers {
+		if strings.Contains(t, m) {
+			return true
+		}
+	}
+	low := strings.ToLower(t)
+	for _, m := range userYieldMarkersEN {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// narrationTailStructurallyOpen: the tail is structurally unfinished — a
+// truncated tool-call marker or an unclosed code fence. Such tails are
+// genuinely incomplete at ANY length, so the length gate does not apply.
+func narrationTailStructurallyOpen(text string) bool {
+	if toolCallMarkupState(text) == markupPartial {
+		return true
+	}
+	return strings.Count(strings.TrimRight(text, " \t\r\n"), "```")%2 == 1
+}
 
 // narrationTailSuspends reports whether the prose ends mid-thought. Only
-// structural markers count, never semantics: colon/comma/ellipsis/dash/open
-// bracket (something must follow), an unclosed ``` fence, and — as the
-// catch-all — no sentence-final punctuation at all (English narration like
-// "Reading the mutation script" ends bare).
+// structural markers count, never semantics.
 func narrationTailSuspends(text string) bool {
+	switch toolCallMarkupState(text) {
+	case markupComplete:
+		return false // client executes the block; continuing fabricates a second call
+	case markupPartial:
+		return true // client sees half a marker; the block must be completed
+	}
 	t := strings.TrimRight(text, " \t\r\n")
 	if t == "" {
 		return false
+	}
+	for _, closer := range []string{"</summary>", "</details>", "</analysis>"} {
+		if strings.HasSuffix(t, closer) {
+			return false
+		}
 	}
 	if strings.Count(t, "```")%2 == 1 {
 		return true
@@ -72,8 +175,9 @@ func narrationTailSuspends(text string) bool {
 	if strings.ContainsRune("：:，,、—–…（(【[", last) {
 		return true
 	}
-	// Sentence-final punctuation and closing brackets: a finished thought.
-	if strings.ContainsRune("。.!！?？\"'”’）)》】]}`*~", last) {
+	// Sentence-final punctuation, closing brackets and '&' (RP clients end
+	// turns on &&happy&&-style tags): a finished thought.
+	if strings.ContainsRune("。.!！?？\"'”’））》】]}`*~&", last) {
 		return false
 	}
 	return true
@@ -96,35 +200,25 @@ func toolClassRequest(req *ir.ChatRequest) (declared, toolTurn bool) {
 	return declared, false
 }
 
-// lastMessageIsToolResult: the strongest structural signal of an agent loop —
-// each tool execution re-requests with the tool output last. Chat/roleplay
-// turns end on user or assistant messages instead.
-func lastMessageIsToolResult(req *ir.ChatRequest) bool {
-	if req == nil || len(req.Messages) == 0 {
-		return false
-	}
-	last := req.Messages[len(req.Messages)-1]
-	return last.Role == ir.RoleTool || last.ToolCallID != ""
-}
-
-// stopRescuePlan decides whether a finished stop-turn earns ONE rescue
-// segment, and of which kind. kind is "narration" or "toolonly". tried is the
-// once-per-request flag; narration is checked first because a suspending tail
-// gets the better remedy (its text splices; tool-only's text is discarded).
-func stopRescuePlan(channel string, req *ir.ChatRequest, ledger *streamLedger, resp *ir.ChatResponse, tried bool) (contReq *ir.ChatRequest, kind, why string, ok bool) {
+// stopRescuePlan decides whether a finished stop-turn earns ONE narration
+// rescue segment. tried is the once-per-request flag. Every gate is
+// fail-closed: when in doubt, the original answer stands (a misfire costs
+// one upstream call; a wrong "continue" can execute tools the model never
+// meant to run).
+func stopRescuePlan(channel string, req *ir.ChatRequest, ledger *streamLedger, resp *ir.ChatResponse, tried bool) (contReq *ir.ChatRequest, why string, ok bool) {
 	if channel != model.ChannelWorkBuddy || req == nil || resp == nil || ledger == nil || tried {
-		return nil, "", "", false
+		return nil, "", false
 	}
 	if resp.StopReason != ir.StopEnd {
-		return nil, "", "", false
+		return nil, "", false
 	}
 	if ledger.sawTool || len(resp.Message.ToolCalls) > 0 {
 		// A tool turn ended normally — nothing to rescue.
-		return nil, "", "", false
+		return nil, "", false
 	}
 	text := ledger.text.String()
 	if text == "" {
-		return nil, "", "", false
+		return nil, "", false
 	}
 	// Same cumulative spending gate as the length path (floor × 4, default
 	// 32768): a rescue may not push the turn past it.
@@ -133,26 +227,26 @@ func stopRescuePlan(channel string, req *ir.ChatRequest, ledger *streamLedger, r
 		capTokens = f * continueTotalCapRatio
 	}
 	if ledger.usage.OutputTokens >= capTokens {
-		return nil, "", "", false
+		return nil, "", false
 	}
 	declared, toolTurn := toolClassRequest(req)
 	if !declared || !toolTurn {
-		return nil, "", "", false
+		return nil, "", false
 	}
-	if narrationTailSuspends(text) {
-		return continuationRequestNudge(req, ledger, narrationNudge),
-			"narration", "the answer stopped on a lead-in sentence", true
+	// The model is waiting for the user's decision — a deliberate stop.
+	// Continuing would take the action for them (misakano #209).
+	if textYieldsToUser(text) {
+		return nil, "", false
 	}
-	if len(text) > toolOnlyMaxBytes {
-		return nil, "", "", false
+	// Punctuation-type tails longer than a real lead-in are normal
+	// formatting, not a cut-off thought. Structurally open tails (unclosed
+	// fence, truncated marker) skip this gate — see above.
+	if !narrationTailStructurallyOpen(text) && len(text) > narrationMaxBytes {
+		return nil, "", false
 	}
-	if !lastMessageIsToolResult(req) {
-		return nil, "", "", false
+	if !narrationTailSuspends(text) {
+		return nil, "", false
 	}
-	if ledger.usage.InputTokens < toolOnlyMinPrompt {
-		// Unknown or short prompt: a one-line reply is normal there.
-		return nil, "", "", false
-	}
-	return continuationRequestNudge(req, ledger, toolOnlyNudge),
-		"toolonly", "one-line answer right after a tool result", true
+	return continuationRequestNudge(req, ledger, narrationNudge),
+		"the answer stopped on a lead-in sentence", true
 }

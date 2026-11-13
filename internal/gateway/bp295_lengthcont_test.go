@@ -36,12 +36,18 @@ type lcCall struct {
 }
 
 type lcFake struct {
-	mu    sync.Mutex
-	calls []lcCall
-	steps []func(n int, call driver.ChatCall) ([]ir.StreamEvent, *ir.ChatResponse, error)
+	mu      sync.Mutex
+	calls   []lcCall
+	steps   []func(n int, call driver.ChatCall) ([]ir.StreamEvent, *ir.ChatResponse, error)
+	channel string // "" = workbuddy（BP-317 的 trae 用例显式设 "trae"）
 }
 
-func (d *lcFake) Channel() string                          { return model.ChannelWorkBuddy }
+func (d *lcFake) Channel() string {
+	if d.channel != "" {
+		return d.channel
+	}
+	return model.ChannelWorkBuddy
+}
 func (d *lcFake) Models(context.Context) ([]string, error) { return []string{"m"}, nil }
 
 func (d *lcFake) Stream(ctx context.Context, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
@@ -70,22 +76,29 @@ type lcResult struct {
 
 func runLC(t *testing.T, drv *lcFake, req *ir.ChatRequest) (*ir.ChatResponse, *lcResult) {
 	t.Helper()
+	return runLCC(t, drv, req, model.ChannelWorkBuddy, "m")
+}
+
+// runLCC 是 runLC 的参数化版（BP-317：trae 渠道的 cap 续写用例需要指定渠道与
+// 上游模型名）；workbuddy 路径与原 harness 逐字节一致。
+func runLCC(t *testing.T, drv *lcFake, req *ir.ChatRequest, channel, upstream string) (*ir.ChatResponse, *lcResult) {
+	t.Helper()
 	cfg := config.Default()
 	cfg.Store = "memory"
 	cfg.DataDir = t.TempDir()
 	cfg.Models = []config.ModelBinding{
-		{Canonical: "m", Channel: model.ChannelWorkBuddy, UpstreamModel: "m"},
-		// 尾位陪跑 binding：workbuddy 非末位时首字窗口才武装（末位 win=0），
+		{Canonical: "m", Channel: channel, UpstreamModel: upstream},
+		// 尾位陪跑 binding：渠道非末位时首字窗口才武装（末位 win=0），
 		// 救援/续写「必须跑在 cancel() 之前」的回归靠它才打得到。
 		{Canonical: "m", Channel: model.ChannelQoder, UpstreamModel: "m"},
 	}
 	st := store.NewMemory()
-	p := pool.New(pool.Params{MaxQueueWait: 2 * time.Second}, map[string]int{model.ChannelWorkBuddy: 1, model.ChannelQoder: 1},
+	p := pool.New(pool.Params{MaxQueueWait: 2 * time.Second}, map[string]int{channel: 1, model.ChannelQoder: 1},
 		func(acc *model.Account) { _ = st.SaveAccount(acc) })
-	p.Upsert(&model.Account{ID: "acct-1", Channel: model.ChannelWorkBuddy, CredsJSON: []byte(`{}`)})
-	// qoder 池也必须有账号，否则该 binding 被剔除、workbuddy 退回末位（win=0）。
+	p.Upsert(&model.Account{ID: "acct-1", Channel: channel, CredsJSON: []byte(`{}`)})
+	// qoder 池也必须有账号，否则该 binding 被剔除、主渠道退回末位（win=0）。
 	p.Upsert(&model.Account{ID: "acct-q", Channel: model.ChannelQoder, CredsJSON: []byte(`{}`)})
-	g := New(cfg, p, router.New(cfg), map[string]driver.Driver{model.ChannelWorkBuddy: drv, model.ChannelQoder: &lcFake{}}, st)
+	g := New(cfg, p, router.New(cfg), map[string]driver.Driver{channel: drv, model.ChannelQoder: &lcFake{}}, st)
 
 	res := &lcResult{}
 	out, err := g.Execute(context.Background(), req, func(ev ir.StreamEvent) error {

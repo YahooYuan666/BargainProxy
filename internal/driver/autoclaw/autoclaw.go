@@ -11,7 +11,6 @@
 package autoclaw
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -31,6 +30,7 @@ import (
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/streamx"
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
@@ -1358,6 +1358,11 @@ func buildBodyNeutral(call driver.ChatCall) ([]byte, string, error) {
 // It deliberately makes no identity claim at all.
 const neutralSystemLine = "You are a helpful assistant. Please answer the user's question."
 
+// toolImageCarrier introduces the images a tool returned, once they have been
+// moved onto a user turn (BP-308). Chinese deliberately: it rides a real user
+// message on a domestic channel.
+const toolImageCarrier = "（工具返回的图片如下）"
+
 // refusedIdentities are the product names the CN managed gateway's channel
 // check refuses when they appear as a second-person identity claim.
 //
@@ -1393,6 +1398,13 @@ var refusedIdentities = []string{
 // "the GLM-x model" form.
 var glmOpeningRe = regexp.MustCompile(`(?i)this conversation is powered by GLM-([\w.-]+)`)
 
+// dshBareMaskRe (BP-322): the bare "DeepSeek Harness" name in ANY context —
+// the CN gateway 406s while the name sits anywhere in system text, identity
+// line included (plugins#924; twa #195 measures the workbuddy-side twin as a
+// 11128). Word-boundary escapes are deliberately avoided so the pattern needs
+// no backslashes.
+var dshBareMaskRe = regexp.MustCompile(`(?i)DeepSeek[ ][ ]*Harness`)
+
 // identityRewrites are the identity lines the gateway accepts once REWORDED
 // (BP-230, plugins autoclaw 0.2.13 acb85ed8): rewriting keeps the agent's
 // name — which the rest of its prompt refers back to — where deleting the
@@ -1415,6 +1427,12 @@ var identityRewrites = []struct {
 	// introduce itself as AutoClaw, it took any rule sharing that sentence
 	// down with it.
 	{regexp.MustCompile(`(?i)You are ZCode\b`), "You are the ZCode agent"},
+	// BP-322 (twa #195, plugins#924): the DeepSeek Harness identity sentence
+	// gets the neutral "local coding harness" wording; the bare name is
+	// masked separately below. The GLM casing rule normalizes "powered by
+	// the glm-5.3-flash model" to the accepted GLM-x form.
+	{regexp.MustCompile(`(?i)You are an AI agent,?[ ]+powered by DeepSeek[ ]+Harness\.?`), "You are an AI agent powered by a local coding harness."},
+	{regexp.MustCompile(`(?i)(powered by[ ]+)the (?:model[ ]+)?GLM-([A-Za-z0-9.\-]+)`), "${1}the GLM-$2 model"},
 }
 
 // refusedIdentityClaim reports whether text carries a second-person identity
@@ -1437,6 +1455,11 @@ func scrubRefusedIdentity(text string) string {
 	for _, r := range identityRewrites {
 		text = r.re.ReplaceAllString(text, r.to)
 	}
+	// BP-322 (plugins#924, five-send field replay): the edge refuses the NAME
+	// "DeepSeek Harness" anywhere in system text, not only on the identity
+	// line — masking that line alone still 406s. Every surviving occurrence
+	// degrades to "DeepSeek".
+	text = dshBareMaskRe.ReplaceAllString(text, "DeepSeek")
 	lower := strings.ToLower(text)
 	if !strings.Contains(lower, "you are") {
 		return text
@@ -1509,12 +1532,44 @@ func buildBodyWith(call driver.ChatCall, scrubIdentity bool) ([]byte, string, er
 		req = &clone
 	}
 	var messages []map[string]any
+	// BP-308: images a tool returned (the Read tool's picture) have no slot in
+	// an OpenAI tool message, whose content must be a plain string. Dropping
+	// them made the model answer "the read returned no image data" — a blank
+	// result with no error anywhere. Park them and re-attach to the next user
+	// turn as ordinary multimodal parts.
+	var pendingToolImages []map[string]any
+	flushToolImages := func() {
+		if len(pendingToolImages) == 0 {
+			return
+		}
+		parts := append([]map[string]any{{"type": "text", "text": toolImageCarrier}}, pendingToolImages...)
+		messages = append(messages, map[string]any{"role": string(ir.RoleUser), "content": parts})
+		pendingToolImages = nil
+	}
 	for _, m := range req.Messages {
 		wire := map[string]any{"role": string(m.Role)}
 		if m.Role == ir.RoleTool {
 			wire["content"] = ir.TextOf(m.Content)
+			for _, p := range m.Content {
+				if p.Kind == "image" && p.ImageB64 != "" {
+					mime := p.ImageMIME
+					if mime == "" {
+						mime = "image/png"
+					}
+					pendingToolImages = append(pendingToolImages, map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
+					})
+				}
+			}
 		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
 			wire["content"] = m.Content[0].Text
+			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
+				wire["content"] = append(append([]map[string]any{
+					{"type": "text", "text": toolImageCarrier},
+				}, pendingToolImages...), map[string]any{"type": "text", "text": m.Content[0].Text})
+				pendingToolImages = nil
+			}
 		} else if len(m.Content) > 0 {
 			var parts []map[string]any
 			for _, p := range m.Content {
@@ -1529,6 +1584,12 @@ func buildBodyWith(call driver.ChatCall, scrubIdentity bool) ([]byte, string, er
 				}
 			}
 			wire["content"] = parts
+			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
+				wire["content"] = append(append([]map[string]any{
+					{"type": "text", "text": toolImageCarrier},
+				}, pendingToolImages...), parts...)
+				pendingToolImages = nil
+			}
 		} else {
 			// BP-160: the CN gateway's parser throws 500 {"message":"parse
 			// response failed"} on a message with a null/missing content
@@ -1558,6 +1619,8 @@ func buildBodyWith(call driver.ChatCall, scrubIdentity bool) ([]byte, string, er
 		}
 		messages = append(messages, wire)
 	}
+	// A trailing tool result has no following user turn to carry its images.
+	flushToolImages()
 	body := map[string]any{"messages": messages, "stream": true}
 	if req.Temperature != nil {
 		body["temperature"] = *req.Temperature
@@ -1633,14 +1696,13 @@ func agentTarget(m string) bool {
 // --- SSE (OpenAI shape) ---
 
 func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := bufio.NewScanner(r)
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
 		textBuf    strings.Builder
 		thinkBuf   strings.Builder
-		tools      = map[int]*ir.ToolCall{}
-		toolOrder  []int
+		toolFolder = streamx.NewToolFolder() // BP-320: id 分流+起始顺序重编号
 		usage      ir.Usage
 		stop       ir.StopReason
 		gotUsage   bool
@@ -1713,18 +1775,19 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				}
 			}
 			for _, tc := range ch.Delta.ToolCalls {
-				acc, ok := tools[tc.Index]
-				if !ok {
-					acc = &ir.ToolCall{ID: tc.ID, Name: tc.Function.Name}
-					tools[tc.Index] = acc
-					toolOrder = append(toolOrder, tc.Index)
-					if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: tc.Index, ToolCall: &ir.ToolCall{ID: acc.ID, Name: acc.Name}}); err != nil {
+				// BP-320: fragment routing goes through the shared folder — a NEW
+				// id at a used index opens a new call (upstream glue: qoder 0.2.65
+				// #930, magpie 835439eb), and every call is renumbered from 0 in
+				// start order so downstream index-keyed writers never see two
+				// calls on one index.
+				fr := toolFolder.Add(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
+				if fr.Started {
+					if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: fr.Slot, ToolCall: &ir.ToolCall{ID: fr.ID, Name: fr.Name}}); err != nil {
 						return nil, err
 					}
 				}
 				if tc.Function.Arguments != "" {
-					acc.Arguments += tc.Function.Arguments
-					if err := emit(ir.StreamEvent{Kind: ir.EvToolArgs, ToolIndex: tc.Index, Delta: tc.Function.Arguments}); err != nil {
+					if err := emit(ir.StreamEvent{Kind: ir.EvToolArgs, ToolIndex: fr.Slot, Delta: tc.Function.Arguments}); err != nil {
 						return nil, err
 					}
 				}
@@ -1767,8 +1830,8 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 	// connection survives.
 	httpx.Drain(r)
 
-	for _, idx := range toolOrder {
-		out.Message.ToolCalls = append(out.Message.ToolCalls, *tools[idx])
+	for _, c := range toolFolder.List() {
+		out.Message.ToolCalls = append(out.Message.ToolCalls, ir.ToolCall{ID: c.ID, Name: c.Name, Arguments: c.Args})
 	}
 	if len(out.Message.ToolCalls) > 0 && stop == ir.StopEnd {
 		stop = ir.StopToolUse

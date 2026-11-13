@@ -1328,48 +1328,29 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				log.Printf("gateway: starved-thinking rescue failed (%v); returning the original answer", rerr)
 			}
 		}
-		// BP-302/303 stop-shaped rescues (misakano c2003af + 1037397): the
-		// turn ended stop with prose the upstream called complete, but that
-		// reads as "stopped mid-thought" — a lead-in tail (narration) or a
-		// one-liner right after a tool result (tool-only). ONE segment per
-		// request; the tool-only segment's prose is discarded and the segment
-		// adopted only when it produces tool calls (BP-293's gateway-side
-		// remedy). See stoprescue.go for every gate.
-		if scReq, kind, why, ok := stopRescuePlan(binding.Channel, req, ledger, resp, stopRescueTried); ok {
+		// BP-302 stop-shaped rescue (misakano c2003af): the turn ended stop
+		// with prose the upstream called complete, but that reads as "stopped
+		// mid-thought" — a lead-in tail on a tool-class request. ONE segment
+		// per request; its text splices into the same stream. BP-316 removed
+		// the BP-303 tool-only half (built for Codex, no longer served; its
+		// field harm — pushing finished ZCode turns into extra tool calls —
+		// is sess_1d74dbe9) and added the field gates around narration. See
+		// stoprescue.go for every gate.
+		if scReq, why, ok := stopRescuePlan(binding.Channel, req, ledger, resp, stopRescueTried); ok {
 			stopRescueTried = true
-			segEmit := attemptEmit
-			if kind == "toolonly" {
-				// Discard the rescue's prose/thinking everywhere: the client
-				// sees nothing unless the segment actually acts.
-				segEmit = func(ev ir.StreamEvent) error {
-					if ev.Kind == ir.EvText || ev.Kind == ir.EvThinking {
-						return nil
-					}
-					return attemptEmit(ev)
-				}
-			}
-			log.Printf("gateway: %s turn ended stop but looks unfinished (%s) — trying one %s rescue segment on the same account",
-				binding.Channel, why, kind)
+			log.Printf("gateway: %s turn ended stop but looks unfinished (%s) — trying one narration rescue segment on the same account",
+				binding.Channel, why)
 			rescResp, rerr := drv.Stream(actx, driver.ChatCall{
 				Account: lease.Account, UpstreamModel: binding.UpstreamModel,
 				Request: scReq,
-			}, segEmit)
+			}, attemptEmit)
 			switch {
 			case rerr != nil:
-				log.Printf("gateway: %s %s rescue failed (%v); the original answer stands", binding.Channel, kind, rerr)
+				log.Printf("gateway: %s narration rescue failed (%v); the original answer stands", binding.Channel, rerr)
 			case rescResp == nil:
-				log.Printf("gateway: %s %s rescue returned nothing; the original answer stands", binding.Channel, kind)
-			case kind == "narration", len(rescResp.Message.ToolCalls) > 0, ledger.sawTool:
-				if kind == "toolonly" {
-					log.Printf("gateway: %s tool-only rescue produced tool calls — adopted", binding.Channel)
-				}
-				resp = mergedResponse(ledger, rescResp)
+				log.Printf("gateway: %s narration rescue returned nothing; the original answer stands", binding.Channel)
 			default:
-				// Rollback: the rescue only talked. The client has seen
-				// nothing extra (the prose was filtered), so the original
-				// answer and terminal stand byte-for-byte.
-				log.Printf("gateway: %s tool-only rescue produced no tool calls (%d B prose discarded) — rolled back to the original answer",
-					binding.Channel, len(ledger.text.String()))
+				resp = mergedResponse(ledger, rescResp)
 			}
 		}
 		// BP-295 length continuation: a finish=length turn with a PARTIAL prose
@@ -1377,7 +1358,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		// shared budget) continues on the same account with thinking off —
 		// misakano 2b9b773/34a3ae6/29db878/e54c6e0/562d0d8. Pure client limits
 		// stay truncated: that length is the client's own semantics.
-		if contReq, why, ok := lengthContinuationPlan(binding.Channel, req, ledger, resp); ok {
+		if contReq, why, ok := lengthContinuationPlan(binding.Channel, binding.UpstreamModel, req, ledger, resp); ok {
 			resp = runLengthContinuation(actx, binding, lease, contReq, req, ledger, resp, drv, attemptEmit, why)
 		}
 		if cancel != nil {
@@ -1480,6 +1461,14 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		log.Printf("gateway: %s account %s (%s) leg failed after %s: class=%s status=%d%s: %.160s",
 			binding.Channel, lease.Account.ID, lease.Account.Nickname,
 			elapsed.Round(time.Millisecond), ue.Class, ue.Status, winNote, ue.Message)
+		// BP-319: model-scoped cooldowns are keyed by ue.Model, and drivers
+		// fill it with the UPSTREAM spelling while the pick loop checks the
+		// DISPLAY spelling the client sent — with alias routes (BP-218) the
+		// two differ, so a cooled model stayed pickable through its alias.
+		// An error that names a DIFFERENT model (autoclaw 810000 naming
+		// zai_auto, BP-116) keeps its own spelling: that wall is scoped to
+		// the named model, not to this request's.
+		rekeyCooldownModel(ue, binding.UpstreamModel, req.Model)
 		g.pool.ApplyResult(lease.Account, req.Model, ue)
 		if ue.Class == uperr.ClassAccountRestricted {
 			// Say out loud that an account just left routing: otherwise the
@@ -1891,6 +1880,26 @@ func TrimModelName(s string) string {
 		s = s[:200]
 	}
 	return s
+}
+
+// rekeyCooldownModel (BP-319): model-scoped cooldowns are keyed by ue.Model,
+// and drivers fill it with the UPSTREAM model spelling while the pick loop
+// checks the DISPLAY spelling the client sent (Acquire receives req.Model).
+// With alias routes (BP-218) the two spellings differ, so a wall written under
+// the upstream name never blocked the alias: the cooled model stayed pickable
+// and re-hit the same 429. When the error names THIS leg's upstream model,
+// rekey the wall to the display name so it lands where the pick loop looks.
+// An error naming a DIFFERENT model (autoclaw 810000 naming zai_auto, BP-116)
+// keeps its own spelling — that wall is scoped to the named model, and the
+// gateway must not bleed it onto the request's model.
+func rekeyCooldownModel(ue *uperr.Error, upstreamModel, display string) {
+	if ue == nil || ue.Model == "" || display == "" || upstreamModel == "" {
+		return
+	}
+	if ue.Model != upstreamModel || display == ue.Model {
+		return
+	}
+	ue.Model = display
 }
 
 // BareModel strips the "channel:<name>:" debug prefix for logging (the

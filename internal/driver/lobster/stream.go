@@ -13,7 +13,6 @@
 package lobster
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -24,6 +23,7 @@ import (
 	"time"
 
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/streamx"
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/uperr"
@@ -104,15 +104,48 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 func (d *Driver) buildBody(ctx context.Context, call driver.ChatCall, c *Creds) ([]byte, error) {
 	req := call.Request
 	messages := make([]map[string]any, 0, len(req.Messages))
+	// BP-308: images a tool returned (the Read tool's picture) have no slot in
+	// an OpenAI tool message, whose content must be a plain string. Dropping
+	// them made the model answer "the read returned no image data" — a blank
+	// result with no error anywhere. Park them and re-attach to the next user
+	// turn as ordinary multimodal parts.
+	var pendingToolImages []map[string]any
+	flushToolImages := func() {
+		if len(pendingToolImages) == 0 {
+			return
+		}
+		parts := append([]map[string]any{{"type": "text", "text": toolImageCarrier}}, pendingToolImages...)
+		messages = append(messages, map[string]any{"role": string(ir.RoleUser), "content": parts})
+		pendingToolImages = nil
+	}
 	for _, m := range req.Messages {
 		wire := map[string]any{"role": string(m.Role)}
 		switch {
 		case m.Role == ir.RoleTool:
 			// Tool results are plain strings; image parts in a tool message
-			// would be rejected (BP-70 lesson from workbuddy).
+			// would be rejected (BP-70 lesson from workbuddy). BP-308 carries
+			// those images on a user turn instead of losing them.
 			wire["content"] = ir.TextOf(m.Content)
+			for _, p := range m.Content {
+				if p.Kind == "image" && p.ImageB64 != "" {
+					mime := p.ImageMIME
+					if mime == "" {
+						mime = "image/png"
+					}
+					pendingToolImages = append(pendingToolImages, map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
+					})
+				}
+			}
 		case len(m.Content) == 1 && m.Content[0].Kind == "text":
 			wire["content"] = m.Content[0].Text
+			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
+				wire["content"] = append(append([]map[string]any{
+					{"type": "text", "text": toolImageCarrier},
+				}, pendingToolImages...), map[string]any{"type": "text", "text": m.Content[0].Text})
+				pendingToolImages = nil
+			}
 		case len(m.Content) > 0:
 			parts := make([]map[string]any, 0, len(m.Content))
 			for _, p := range m.Content {
@@ -129,6 +162,12 @@ func (d *Driver) buildBody(ctx context.Context, call driver.ChatCall, c *Creds) 
 				}
 			}
 			wire["content"] = parts
+			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
+				wire["content"] = append(append([]map[string]any{
+					{"type": "text", "text": toolImageCarrier},
+				}, pendingToolImages...), parts...)
+				pendingToolImages = nil
+			}
 		}
 		if len(m.ToolCalls) > 0 {
 			tcs := make([]map[string]any, 0, len(m.ToolCalls))
@@ -153,6 +192,8 @@ func (d *Driver) buildBody(ctx context.Context, call driver.ChatCall, c *Creds) 
 		}
 		messages = append(messages, wire)
 	}
+	// A trailing tool result has no following user turn to carry its images.
+	flushToolImages()
 	body := map[string]any{
 		"model":    call.UpstreamModel,
 		"messages": messages,
@@ -217,6 +258,11 @@ const (
 	optionsField   = "lobsterai_options"
 	optionsVersion = 1
 )
+
+// toolImageCarrier introduces the images a tool returned, once they have been
+// moved onto a user turn (BP-308). Chinese deliberately: it rides a real user
+// message on a domestic channel.
+const toolImageCarrier = "（工具返回的图片如下）"
 
 // Hard upstream ceilings probed on 2026-10-24 (BP-103). The proxy returns an
 // empty 500 after 17-67s for requests over either limit, so both are gated
@@ -290,7 +336,7 @@ func isKimiK3(model string) bool {
 
 // parseStream consumes the upstream SSE stream.
 func parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := bufio.NewScanner(r)
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 
 	out := &ir.ChatResponse{
@@ -301,8 +347,7 @@ func parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit dr
 	var (
 		textBuf    strings.Builder
 		thinkBuf   strings.Builder
-		tools      = map[int]*ir.ToolCall{}
-		toolOrder  []int
+		toolFolder = streamx.NewToolFolder() // BP-320: id 分流+起始顺序重编号
 		usage      ir.Usage
 		stop       ir.StopReason
 		gotUsage   bool
@@ -386,28 +431,22 @@ func parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit dr
 				}
 			}
 			for _, tc := range ch.Delta.ToolCalls {
-				acc, ok := tools[tc.Index]
-				if !ok {
-					acc = &ir.ToolCall{ID: tc.ID, Name: tc.Function.Name}
-					tools[tc.Index] = acc
-					toolOrder = append(toolOrder, tc.Index)
+				// BP-320: fragment routing goes through the shared folder — a NEW
+				// id at a used index opens a new call (upstream glue: qoder 0.2.65
+				// #930, magpie 835439eb); a late id/name for an open call fills it
+				// instead of splitting. Renumbered from 0 in start order.
+				fr := toolFolder.Add(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
+				if fr.Started {
 					if err := emit(ir.StreamEvent{
-						Kind: ir.EvToolStart, ToolIndex: tc.Index,
-						ToolCall: &ir.ToolCall{ID: acc.ID, Name: acc.Name},
+						Kind: ir.EvToolStart, ToolIndex: fr.Slot,
+						ToolCall: &ir.ToolCall{ID: fr.ID, Name: fr.Name},
 					}); err != nil {
 						return err
 					}
 				}
-				if acc.ID == "" && tc.ID != "" {
-					acc.ID = tc.ID
-				}
-				if acc.Name == "" && tc.Function.Name != "" {
-					acc.Name = tc.Function.Name
-				}
 				if tc.Function.Arguments != "" {
-					acc.Arguments += tc.Function.Arguments
 					if err := emit(ir.StreamEvent{
-						Kind: ir.EvToolArgs, ToolIndex: tc.Index, Delta: tc.Function.Arguments,
+						Kind: ir.EvToolArgs, ToolIndex: fr.Slot, Delta: tc.Function.Arguments,
 					}); err != nil {
 						return err
 					}
@@ -499,8 +538,8 @@ func parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit dr
 	// connection survives.
 	httpx.Drain(r)
 
-	for _, idx := range toolOrder {
-		out.Message.ToolCalls = append(out.Message.ToolCalls, *tools[idx])
+	for _, c := range toolFolder.List() {
+		out.Message.ToolCalls = append(out.Message.ToolCalls, ir.ToolCall{ID: c.ID, Name: c.Name, Arguments: c.Args})
 	}
 	if len(out.Message.ToolCalls) > 0 && (stop == ir.StopEnd || stop == "") {
 		stop = ir.StopToolUse

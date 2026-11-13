@@ -9,7 +9,6 @@
 package zcode
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -29,6 +28,7 @@ import (
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/streamx"
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
@@ -556,7 +556,7 @@ func anthropicToolChoice(choice any, name string, disableParallel bool) map[stri
 
 // parseAnthropicSSE consumes the Anthropic-shaped upstream stream.
 func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := bufio.NewScanner(r)
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (

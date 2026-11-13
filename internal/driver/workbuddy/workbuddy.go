@@ -10,7 +10,6 @@
 package workbuddy
 
 import (
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -30,6 +29,7 @@ import (
 
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/streamx"
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
@@ -276,6 +276,19 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 					resp, err = r2, nil
 				}
 			}
+			// BP-322 rung: the bare brand word anywhere in system/assistant
+			// text trips the edge (twa #195 / plugins#924) — the comma only
+			// fixes the opener LINE. Mask the name and resend once, on top of
+			// the comma (that rung already failed, so both rewrites together
+			// are the minimal body that can clear it).
+			if err != nil {
+				if mb, berr := d.buildBodyOpts(call, creds, bodyOpts{commaOpeners: true, maskDshBrand: true}); berr == nil && !bytes.Equal(mb, body) {
+					log.Printf("workbuddy: 11128 channel refusal; resending with the DeepSeek Harness brand masked")
+					if r2, jerr := d.postChat(ctx, creds, call, mb, chatCompletionsPath); jerr == nil {
+						resp, err = r2, nil
+					}
+				}
+			}
 			// Rung 1 before rung 2 (upstream e4dd458c): cutting the text at
 			// sentence boundaries keeps it in the system slot, so the agent's
 			// instructions keep system-level priority. Only when there is
@@ -396,6 +409,7 @@ type bodyOpts struct {
 	systemAsUser bool
 	splitSystem  bool // 11128 rung 1: cut the system at sentence boundaries
 	commaOpeners bool // BP-227: set the opener comma regardless of the cache
+	maskDshBrand bool // BP-322: mask the "DeepSeek Harness" name anywhere in system/assistant text
 }
 
 func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts) ([]byte, error) {
@@ -415,6 +429,21 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 	}
 	// Rebuild the message array with prompt replacement applied.
 	messages := make([]map[string]any, 0, len(req.Messages))
+	// BP-308: images returned BY A TOOL (the Read tool's picture) cannot ride
+	// an OpenAI tool message, whose content must be a plain string. They used
+	// to be dropped outright, and the model answered "the read returned no
+	// image data" — a blank read with no error anywhere (2026-11-11 report).
+	// Park them here and re-attach them to the next user turn as ordinary
+	// multimodal parts, which is the shape this upstream does accept.
+	var pendingToolImages []map[string]any
+	flushToolImages := func() {
+		if len(pendingToolImages) == 0 {
+			return
+		}
+		parts := append([]map[string]any{{"type": "text", "text": toolImageCarrier}}, pendingToolImages...)
+		messages = append(messages, map[string]any{"role": string(ir.RoleUser), "content": parts})
+		pendingToolImages = nil
+	}
 	for _, m := range req.Messages {
 		if m.Role == ir.RoleTool && badIDs[m.ToolCallID] {
 			continue
@@ -427,8 +456,28 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 			// block (scraped form JSON) dies at the upstream with 11151 — pad
 			// before it leaves.
 			wire["content"] = padSniffedString(ir.TextOf(m.Content))
+			for _, p := range m.Content {
+				if p.Kind == "image" && p.ImageB64 != "" {
+					mime := p.ImageMIME
+					if mime == "" {
+						mime = "image/png"
+					}
+					pendingToolImages = append(pendingToolImages, map[string]any{
+						"type":      "image_url",
+						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
+					})
+				}
+			}
 		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
 			wire["content"] = padSniffedString(m.Content[0].Text)
+			// A tool's images attach to this user turn, in front of its text,
+			// so the model meets them as ordinary multimodal input.
+			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
+				wire["content"] = append(append([]map[string]any{
+					{"type": "text", "text": toolImageCarrier},
+				}, pendingToolImages...), map[string]any{"type": "text", "text": m.Content[0].Text})
+				pendingToolImages = nil
+			}
 		} else {
 			var parts []map[string]any
 			for _, p := range m.Content {
@@ -450,6 +499,14 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 				}
 			}
 			wire["content"] = parts
+		}
+		if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
+			if parts, ok := wire["content"].([]map[string]any); ok {
+				wire["content"] = append(append([]map[string]any{
+					{"type": "text", "text": toolImageCarrier},
+				}, pendingToolImages...), parts...)
+				pendingToolImages = nil
+			}
 		}
 		if len(m.ToolCalls) > 0 {
 			var tcs []map[string]any
@@ -489,6 +546,10 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 		}
 		messages = append(messages, wire)
 	}
+	// A trailing tool result (the common shape: the client asks, the tool
+	// answers, and this request ends there) has no following user turn to
+	// carry its images — attach them on their own user turn.
+	flushToolImages()
 
 	mode := strings.ToLower(d.cfg.PromptMode)
 	if mode == "" {
@@ -536,6 +597,16 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 		if split, ok := prompt.SplitSystem(messages); ok {
 			messages = split
 		}
+	}
+	// BP-322: the 11128 edge refuses the NAME "DeepSeek Harness" anywhere in
+	// system/assistant text (twa #195 三期, plugins#924 — five-send replay:
+	// masking the identity line alone still 400s; masking EVERY occurrence
+	// passes). The identity sentence gets the neutral "local coding harness"
+	// wording, every other occurrence degrades to "DeepSeek". Applied on the
+	// mask rung only — masking every request unconditionally would rewrite
+	// prompts the edge never refused.
+	if opts.maskDshBrand {
+		maskDshBrand(messages)
 	}
 	// BP-227: a system whose opener line the 11128 check already refused
 	// gets the comma set BEFORE the first byte — the cache spares later
@@ -783,7 +854,7 @@ func sessionFromReq(req *ir.ChatRequest) string {
 
 // parseStream consumes the upstream SSE stream.
 func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := bufio.NewScanner(r)
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 
 	out := &ir.ChatResponse{
@@ -794,8 +865,7 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 	var (
 		textBuf    strings.Builder
 		thinkBuf   strings.Builder
-		toolAcc    = map[int]*ir.ToolCall{}
-		toolOrder  []int
+		toolFolder = streamx.NewToolFolder() // BP-320: id 分流 + 起始顺序重编号
 		usage      ir.Usage
 		stop       ir.StopReason
 		gotUsage   bool
@@ -891,18 +961,19 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 				}
 			}
 			for _, tc := range ch.Delta.ToolCalls {
-				acc, ok := toolAcc[tc.Index]
-				if !ok {
-					acc = &ir.ToolCall{ID: tc.ID, Name: tc.Function.Name}
-					toolAcc[tc.Index] = acc
-					toolOrder = append(toolOrder, tc.Index)
-					if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: tc.Index, ToolCall: &ir.ToolCall{ID: acc.ID, Name: acc.Name}}); err != nil {
+				// BP-320: fragment routing goes through the shared folder — a NEW
+				// id at a used index opens a new call (upstream glue: qoder 0.2.65
+				// #930, magpie 835439eb), and every call is renumbered from 0 in
+				// start order so downstream index-keyed writers never see two
+				// calls on one index.
+				fr := toolFolder.Add(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
+				if fr.Started {
+					if err := emit(ir.StreamEvent{Kind: ir.EvToolStart, ToolIndex: fr.Slot, ToolCall: &ir.ToolCall{ID: fr.ID, Name: fr.Name}}); err != nil {
 						return nil, err
 					}
 				}
 				if tc.Function.Arguments != "" {
-					acc.Arguments += tc.Function.Arguments
-					if err := emit(ir.StreamEvent{Kind: ir.EvToolArgs, ToolIndex: tc.Index, Delta: tc.Function.Arguments}); err != nil {
+					if err := emit(ir.StreamEvent{Kind: ir.EvToolArgs, ToolIndex: fr.Slot, Delta: tc.Function.Arguments}); err != nil {
 						return nil, err
 					}
 				}
@@ -974,8 +1045,8 @@ func (d *Driver) parseStream(ctx context.Context, r io.Reader, call driver.ChatC
 		}
 	}
 
-	for _, idx := range toolOrder {
-		out.Message.ToolCalls = append(out.Message.ToolCalls, *toolAcc[idx])
+	for _, c := range toolFolder.List() {
+		out.Message.ToolCalls = append(out.Message.ToolCalls, ir.ToolCall{ID: c.ID, Name: c.Name, Arguments: c.Args})
 	}
 	if len(out.Message.ToolCalls) > 0 && stop == ir.StopEnd {
 		stop = ir.StopToolUse
@@ -1044,6 +1115,64 @@ func commaOpeners(messages []map[string]any) {
 			}
 		}
 	}
+}
+
+// dshIdentityRe is the DeepSeek Harness identity sentence (twa #195,
+// plugins#924): "You are an AI agent,? powered by DeepSeek Harness." — the
+// comma before "powered by" is optional. Rewritten to the neutral wording.
+var dshIdentityRe = regexp.MustCompile(`(?i)You are an AI agent,?\s+powered by DeepSeek\s+Harness\.?`)
+
+// dshBareRe: the bare brand name in ANY other context — the edge refuses the
+// name wherever it appears, not only on the identity line (#924: five-send
+// replay with the identity line alone rewritten still 400s).
+var dshBareRe = regexp.MustCompile(`(?i)\bDeepSeek\s+Harness\b`)
+
+// maskDshBrand masks the DeepSeek Harness name in the wire messages
+// WorkBuddy reads — system and assistant messages only (the edge inspects
+// those; user text and tool arguments are never touched).
+func maskDshBrand(messages []map[string]any) {
+	for _, m := range messages {
+		role, _ := m["role"].(string)
+		if role != "system" && role != "assistant" {
+			continue
+		}
+		switch c := m["content"].(type) {
+		case string:
+			if ns := maskDshText(c); ns != c {
+				m["content"] = ns
+			}
+		case []map[string]any:
+			for _, p := range c {
+				if t, ok := p["text"].(string); ok {
+					if ns := maskDshText(t); ns != t {
+						p["text"] = ns
+					}
+				}
+			}
+		}
+	}
+}
+
+// maskDshText applies the two DSH rewrites to one text block: the identity
+// sentence becomes the neutral "local coding harness" wording, every other
+// occurrence degrades to "DeepSeek" (twa #195: 残留自检 — the regexes are
+// global and case-insensitive, so a surviving occurrence would mean a new
+// spelling; the WARN below is that tripwire).
+func maskDshText(text string) string {
+	out := dshIdentityRe.ReplaceAllString(text, "You are an AI agent powered by a local coding harness.")
+	out = dshBareRe.ReplaceAllString(out, "DeepSeek")
+	if out != text && dshBareRe.MatchString(out) {
+		i := dshBareRe.FindStringIndex(out)
+		lo, hi := i[0]-80, i[1]+80
+		if lo < 0 {
+			lo = 0
+		}
+		if hi > len(out) {
+			hi = len(out)
+		}
+		log.Printf("WARN: workbuddy: DeepSeek Harness residue after masking: %.200q", out[lo:hi])
+	}
+	return out
 }
 
 // systemKeyOfReq hashes the request's own system text — the identity the

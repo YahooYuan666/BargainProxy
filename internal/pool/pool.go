@@ -1347,6 +1347,12 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		a.BreakerFails = 0
 		if a.ModelCooldowns != nil {
 			delete(a.ModelCooldowns, model)
+			// BP-319: the wall lives under both spellings when an alias route
+			// is in play — clear both, or the panel would show a stale
+			// per-model cooldown on a spelling the account no longer answers.
+			if upstreamErr.Model != "" && upstreamErr.Model != model {
+				delete(a.ModelCooldowns, upstreamErr.Model)
+			}
 		}
 		p.noteRestrictedLocked(a.Channel, now, model)
 	case uperr.ClassEdgeBlock:
@@ -1433,6 +1439,10 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 			a.ConsecutiveFails++
 		}
 	}
+	// BP-319: the display↔upstream spelling reconciliation lives at the
+	// GATEWAY's ApplyResult call site (it holds both names; the pool cannot
+	// tell an alias from an upstream-named DIFFERENT model — the autoclaw
+	// 810000 wall on zai_auto must not bleed onto the request's model).
 	a.UpdatedAt = now
 	p.changedLocked(a)
 }
