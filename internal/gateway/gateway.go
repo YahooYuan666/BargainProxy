@@ -263,6 +263,19 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		req.Messages = repaired
 	}
 
+	// Compaction turns are pure text tasks, but the client still declares its
+	// full toolset on them. A model holding 88 callable tools will call one,
+	// and the client's compaction runner rejects the entire turn for it —
+	// throwing away a complete summary and never retrying (BP-307). Strip the
+	// declarations so there is nothing to call. Runs before routing: the tool
+	// count no longer influences any downstream decision, and the request log
+	// then records the tools that actually left.
+	if isCompactionRequest(req) {
+		if stripToolsForCompaction(req) {
+			log.Printf("gateway: compaction request — stripped tool declarations before dispatch")
+		}
+	}
+
 	// Output ceiling (BP-99): cap max_tokens at the model's real limit before
 	// any driver sees it. Too large a value gets a 400 from some upstreams and
 	// a SILENT truncation from others — and a silent truncation is the worse
