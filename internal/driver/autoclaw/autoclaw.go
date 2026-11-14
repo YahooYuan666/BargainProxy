@@ -1475,6 +1475,13 @@ var identityRewrites = []struct {
 	// introduce itself as AutoClaw, it took any rule sharing that sentence
 	// down with it.
 	{regexp.MustCompile(`(?i)You are ZCode\b`), "You are the ZCode agent"},
+	// BP-325 (plugins #1094, author-verified 2026-11-13): ZCode's SUBAGENT
+	// template opens "You are an agent for ZCode CLI. Given the user's
+	// message, …" — the rule above anchors on "You are ZCode", so the infix
+	// "an agent for" leaks the line and the gate 406s it (371 ms repro on
+	// 0.2.22, 200 after the reword). Same reword-not-delete rule; only the
+	// article changes, so "ZCode CLI" and the rest of the sentence survive.
+	{regexp.MustCompile(`(?i)You are an agent for ZCode\b`), "You are an agent for the ZCode"},
 	// BP-322 (twa #195, plugins#924): the DeepSeek Harness identity sentence
 	// gets the neutral "local coding harness" wording; the bare name is
 	// masked separately below. The GLM casing rule normalizes "powered by

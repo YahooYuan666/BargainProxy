@@ -388,3 +388,23 @@ func Test406FallsThroughToNeutralWhenNothingToStrip(t *testing.T) {
 		t.Fatalf("second attempt system = %q, want the neutral line (hop 3)", systems[1])
 	}
 }
+
+// TestZCodeSubagentOpenerIsReworded pins the BP-325 community-verified rule
+// (plugins #1094): ZCode's SUBAGENT template line "You are an agent for ZCode
+// CLI. …" does not match the "You are ZCode" anchor, leaked verbatim, and the
+// CN gate 406s it (author repro: 371 ms, tries=1). The reword only adds the
+// article; the rest of the sentence must survive untouched.
+func TestZCodeSubagentOpenerIsReworded(t *testing.T) {
+	const tail = " Given the user's message, you should use the tools available to complete the task."
+	cases := map[string]string{
+		"You are an agent for ZCode CLI." + tail: "You are an agent for the ZCode CLI." + tail,
+		"you are an agent for zcode cli." + tail: "You are an agent for the ZCode cli." + tail,
+		"You are an agent for ZCode." + tail:     "You are an agent for the ZCode." + tail,
+		"You are ZCode, an interactive agent":    "You are the ZCode agent, an interactive agent", // old rule intact
+	}
+	for in, want := range cases {
+		if got := scrubRefusedIdentity(in); got != want {
+			t.Errorf("scrub(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
