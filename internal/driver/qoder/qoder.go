@@ -395,12 +395,12 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	reqID := "chatcmpl-" + newUUID()[:24]
 	created := time.Now().Unix()
 	var (
-		textBuf   strings.Builder
-		thinkBuf  strings.Builder
+		textBuf    strings.Builder
+		thinkBuf   strings.Builder
 		toolFolder = streamx.NewToolFolder() // BP-320: id 分流+起始顺序重编号
-		emitted   bool
-		emitErr   error
-		usageObj  *usage
+		emitted    bool
+		emitErr    error
+		usageObj   *usage
 	)
 	acc := newStreamAccumulator(reqID, created, display, toolsEnabled, func(chunk string) {
 		if emitErr != nil {
@@ -467,7 +467,7 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 		}
 	})
 
-	sc := streamx.NewSplitScanner(streamBody) // BP-318: 粘帧 data 行在行级拆成多次 Scan
+	sc := streamx.NewSplitScanner(streamBody) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	sawDone := false
 	for sc.Scan() {
@@ -1865,40 +1865,20 @@ func (d *Driver) CatalogMap(ctx context.Context, acc *model.Account) (map[string
 }
 
 // QuotaRaw fetches the raw quota document (diagnostics / future panel detail).
+//
+// BP-324: this used to be a SECOND copy of the quota fetch with the pre-fix
+// logic (COSY session token), so the panel's 刷新额度 and the diagnostics
+// probes kept answering 401 TOKEN_EXPIRE on intl while probe_all (fetchUsageDoc)
+// was fixed. The two implementations are now one: fetchUsageDoc owns the
+// per-realm host and token choice.
 func (d *Driver) QuotaRaw(ctx context.Context, acc *model.Account) (map[string]any, error) {
 	rt, err := d.runtimeFor(acc)
 	if err != nil {
 		return nil, err
 	}
-	if err := d.ensureFreshSession(ctx, rt); err != nil {
+	doc, err := d.fetchUsageDoc(ctx, rt)
+	if err != nil {
 		return nil, qoderError(err)
-	}
-	rt.mu.Lock()
-	tok := rt.securityOauth
-	rt.mu.Unlock()
-	if tok == "" {
-		if tok, err = d.openBearer(ctx, rt); err != nil {
-			return nil, qoderError(err)
-		}
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.openAPIBase()+quotaPath, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+tok)
-	resp, err := d.rpc.Do(req)
-	if err != nil {
-		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "qoder: %v", err)
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode != http.StatusOK {
-		return nil, classifyQoder(resp.StatusCode, string(raw))
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, uperr.New(uperr.ClassTransport, 0, "qoder: quota decode: %v", err)
 	}
 	return doc, nil
 }
@@ -1920,21 +1900,69 @@ func (d *Driver) Probe(ctx context.Context, acc *model.Account) (*driver.ProbeRe
 }
 
 // fetchUsageDoc pulls the quota document (probe + BP-304 recast share it).
+//
+// BP-324 (2026-11-14), two stacked defects found and fixed:
+//  1. the HOST was realm-blind — d.openAPIBase() is the CN-constant domain, so
+//     an intl probe carried its intl-issued token to the CN host, which
+//     answers 401 TOKEN_EXPIRE "token is not active" for a token it never
+//     issued (hourly probe_all failures since BP-305 onboarding);
+//  2. the intl host's endpoint is proven (live, openapi.qoder.sh) to accept
+//     the jobToken-exchange bearer (jt-) the check-in path uses — 200 with the
+//     full document — so intl authenticates with that bearer directly. CN
+//     keeps the COSY session token, which has always worked there; a 401 on
+//     any realm falls back to the bearer once before giving up.
 func (d *Driver) fetchUsageDoc(ctx context.Context, rt *runtime) (map[string]any, error) {
-	if err := d.ensureFreshSession(ctx, rt); err != nil {
-		return nil, err
-	}
-	rt.mu.Lock()
-	tok := rt.securityOauth
-	rt.mu.Unlock()
-	if tok == "" {
+	var tok string
+	if rt.realm.Name == "intl" {
+		// BP-324: intl quota needs NO COSY session at all (PAT → jt- → quota,
+		// measured live). Skipping ensureFreshSession keeps the probe off the
+		// flaky api3 bootstrap entirely; the chat path bootstraps on its own
+		// when a session is actually needed.
 		t, err := d.openBearer(ctx, rt)
 		if err != nil {
+			log.Printf("qoder: intl quota bearer exchange failed: %v", err)
 			return nil, err
 		}
 		tok = t
+	} else {
+		if err := d.ensureFreshSession(ctx, rt); err != nil {
+			log.Printf("qoder: quota session bootstrap failed (realm=%s): %v", rt.realm.Name, err)
+			return nil, err
+		}
+		rt.mu.Lock()
+		tok = rt.securityOauth
+		rt.mu.Unlock()
+		if tok == "" {
+			t, err := d.openBearer(ctx, rt)
+			if err != nil {
+				return nil, err
+			}
+			tok = t
+		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.openAPIBase()+quotaPath, nil)
+	doc, err := d.quotaDocFor(ctx, rt, tok)
+	if err != nil {
+		if ue, ok := uperr.As(err); ok && ue.Status == http.StatusUnauthorized {
+			// The session token lapsed (CN) or the bearer expired mid-flight:
+			// one bearer retry before giving up.
+			log.Printf("qoder: quota GET 401 (realm=%s), retrying with the exchange bearer", rt.realm.Name)
+			t, berr := d.openBearer(ctx, rt)
+			if berr != nil {
+				return nil, err
+			}
+			doc, err = d.quotaDocFor(ctx, rt, t)
+		}
+	}
+	return doc, err
+}
+
+// quotaDocFor performs one authenticated GET of the quota document. The host
+// is the runtime's REALM host (BP-305): the old call used d.openAPIBase() —
+// the CN-constant domain — so intl probes carried an intl-issued token to the
+// CN host, which answers 401 TOKEN_EXPIRE "token is not active" for a token
+// it never issued. This was the last remaining d.* base call site.
+func (d *Driver) quotaDocFor(ctx context.Context, rt *runtime, tok string) (map[string]any, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rt.openAPIBase()+quotaPath, nil)
 	if err != nil {
 		return nil, err
 	}
