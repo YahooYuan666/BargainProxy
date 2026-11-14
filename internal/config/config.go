@@ -140,6 +140,7 @@ type ChannelSettings struct {
 	OpenAICompat OpenAICompatSettings `json:"openaicompat"`
 	OpenCodeZen  OpenCodeZenSettings  `json:"opencodezen"`
 	Lobster      LobsterSettings      `json:"lobster"`
+	AIStudio     AIStudioSettings     `json:"aistudio"`
 }
 
 // AntigravitySettings configures the Google Cloud Code Assist channel.
@@ -379,6 +380,17 @@ type LobsterSettings struct {
 	ClientCapabilities string `json:"client_capabilities"`
 }
 
+// AIStudioSettings configures the Google AI Studio (Gemini API) channel —
+// the official generativelanguage endpoint with per-key free-tier quota
+// (BP-326). No client disguise is needed: the API takes a plain API key.
+// Free-tier content is used by Google for product improvement (the paid tier
+// is not) — the panel guide carries that warning.
+type AIStudioSettings struct {
+	Enabled     bool   `json:"enabled"`
+	BaseURL     string `json:"base_url"` // default https://generativelanguage.googleapis.com/v1beta
+	MaxInFlight int    `json:"max_in_flight"`
+}
+
 // ModelBinding binds one canonical model to one channel's native model id.
 type ModelBinding struct {
 	Canonical     string `json:"canonical"`      // e.g. "glm-5.3"
@@ -480,6 +492,15 @@ func Default() *Config {
 				MaxInFlight:        2,
 				ClientVersion:      "2026.9.23",
 				ClientCapabilities: "kimi-k3-agentic-v1,thinking-level-control-v1",
+			},
+			AIStudio: AIStudioSettings{
+				// Enabled by default so the panel offers the key form; the
+				// channel takes no traffic until a model binding exists — an
+				// enabled-but-unbound pool is inert, not noisy (lobster
+				// precedent).
+				Enabled:     true,
+				BaseURL:     "https://generativelanguage.googleapis.com/v1beta",
+				MaxInFlight: 2,
 			},
 		},
 		MaxQueueWait: Duration(120 * time.Second),
@@ -661,6 +682,12 @@ func applyDefaults(cfg *Config) {
 	}
 	if ch.Lobster.ClientCapabilities == "" {
 		ch.Lobster.ClientCapabilities = dch.Lobster.ClientCapabilities
+	}
+	if ch.AIStudio.BaseURL == "" {
+		ch.AIStudio.BaseURL = dch.AIStudio.BaseURL
+	}
+	if ch.AIStudio.MaxInFlight <= 0 {
+		ch.AIStudio.MaxInFlight = dch.AIStudio.MaxInFlight
 	}
 	if cfg.MaxQueueWait <= 0 {
 		cfg.MaxQueueWait = d.MaxQueueWait

@@ -20,6 +20,7 @@ import (
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/cryptox"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/aistudio"
 	"bargainproxy/internal/driver/antigravity"
 	"bargainproxy/internal/driver/autoclaw"
 	"bargainproxy/internal/driver/lobster"
@@ -121,6 +122,7 @@ func main() {
 		model.ChannelOpenAICompat: 4,
 		model.ChannelOpenCodeZen:  2,
 		model.ChannelLobster:      cfg.Channels.Lobster.MaxInFlight,
+		model.ChannelAIStudio:     cfg.Channels.AIStudio.MaxInFlight,
 	}
 	var p *pool.Pool
 	onChange := func(acc *model.Account) {
@@ -205,6 +207,12 @@ func main() {
 		if err := st.SaveAccount(def); err != nil {
 			log.Printf("compat default reconciliation failed: %v", err)
 		}
+	}
+	if cfg.Channels.AIStudio.Enabled {
+		// No synthetic account: aistudio is strictly per-key (the free-tier
+		// quota belongs to each key), so the pool stays empty until keys are
+		// imported from the panel or scripts/akadd. An unbound pool is inert.
+		drivers[model.ChannelAIStudio] = aistudio.New(cfg.Channels.AIStudio, nil)
 	}
 
 	// Router + gateway.

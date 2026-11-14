@@ -66,6 +66,13 @@ const (
 	// stream, and its thinking gears ride a private `lobsterai_options`
 	// field rather than reasoning_effort (BP-98).
 	ChannelLobster = "lobster"
+	// ChannelAIStudio is Google AI Studio's official Gemini API
+	// (generativelanguage.googleapis.com v1beta): per-key free-tier quota,
+	// x-goog-api-key auth, no client disguise. The official plane of the
+	// Gemini 4 family — the free tier serves gemini-4-hydrogen only
+	// (Carbon/Argon are paid-only; the catalog still lists them, which is why
+	// this channel exposes a fixed allow-list instead of echoing ListModels).
+	ChannelAIStudio = "aistudio"
 )
 
 // ImageGenModel is the canonical text-to-image model, served only through

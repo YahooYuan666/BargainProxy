@@ -1544,7 +1544,7 @@ func (s *Scheduler) probeAll(ctx context.Context, accountID string) (string, err
 	channels := []string{
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae,
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
-		model.ChannelOpenAICompat, model.ChannelLobster,
+		model.ChannelOpenAICompat, model.ChannelLobster, model.ChannelAIStudio,
 	}
 	probed, failed, skipped, rested := 0, 0, 0, 0
 	var firstErr error

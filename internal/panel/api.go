@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -125,6 +126,7 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae,
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
 		model.ChannelOpenAICompat, model.ChannelOpenCodeZen, model.ChannelLobster,
+		model.ChannelAIStudio,
 	} {
 		for _, a := range pl.AccountsLocked(ch) {
 			v := accountView{
@@ -302,6 +304,13 @@ func (p *Panel) handleImport(w http.ResponseWriter, r *http.Request) {
 	}
 	p.gw.Pool().Upsert(acc)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": acc.ID, "channel": acc.Channel})
+}
+
+// NormalizeImportForTools exposes credential normalization to operator tools
+// (scripts/akadd) so offline enrollment produces accounts byte-identical to
+// the panel's own import path — same stable-ID rule, same CredsJSON shape.
+func NormalizeImportForTools(channel string, raw []byte, label string) (*model.Account, error) {
+	return normalizeImport(channel, json.RawMessage(raw), label)
 }
 
 // normalizeImport converts a pasted credential blob into a canonical account.
@@ -517,6 +526,31 @@ func normalizeImport(channel string, raw json.RawMessage, label string) (*model.
 			Nickname: firstNonEmpty(label, strOf(m["name"]), "qoder"), CredsJSON: creds,
 			Realm: qoderpkg.NormalizeRealm(strOf(m["realm"])),
 		}, nil
+	case model.ChannelAIStudio:
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("aistudio creds: %w", err)
+		}
+		key := ""
+		if v, ok := m["api_key"].(string); ok {
+			key = strings.TrimSpace(v)
+		}
+		if key == "" {
+			if v, ok := m["key"].(string); ok {
+				key = strings.TrimSpace(v)
+			}
+		}
+		if key == "" {
+			return nil, fmt.Errorf("aistudio: api_key required")
+		}
+		// Stable identity: the key itself is the upstream identity (hashed —
+		// the raw key never lands in the ID), so re-importing the same key
+		// updates the existing row instead of duplicating it.
+		creds, _ := json.Marshal(map[string]string{"api_key": key})
+		return &model.Account{
+			ID: model.ChannelAIStudio + ":" + shortHash(key), Channel: channel,
+			Nickname: firstNonEmpty(label, "aistudio"), CredsJSON: creds,
+		}, nil
 	case model.ChannelLobster:
 		var m map[string]any
 		if err := json.Unmarshal(raw, &m); err != nil {
@@ -687,6 +721,7 @@ func (p *Panel) findAccount(id string) *model.Account {
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae,
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
 		model.ChannelOpenAICompat, model.ChannelOpenCodeZen, model.ChannelLobster,
+		model.ChannelAIStudio,
 	} {
 		for _, a := range pl.AccountsLocked(ch) {
 			if a.ID == id {
