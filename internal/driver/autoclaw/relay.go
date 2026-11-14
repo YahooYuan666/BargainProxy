@@ -11,7 +11,6 @@
 package autoclaw
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	crand "crypto/rand"
@@ -28,6 +27,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/streamx"
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/uperr"
@@ -224,7 +224,7 @@ func (d *Driver) openRelayEvents(ctx context.Context, cr *Creds, endpoint string
 
 // convertRelay turns the agent event stream into IR events.
 func (d *Driver) convertRelay(ctx context.Context, r io.Reader, runID, sessionKey string, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := bufio.NewScanner(r)
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
