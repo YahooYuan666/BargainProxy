@@ -16,13 +16,15 @@ import (
 	"bargainproxy/internal/model"
 )
 
-// Test406RetryFallsBackToNeutralSystem pins the last-resort path against a
-// server that answers 406 twice and then accepts.
+// Test406RetryFallsBackToNeutralSystem pins the last-resort path (BP-325 hop 3)
+// against a server that answers 406 twice and then accepts.
 //
 // Since the production body is ALREADY scrubbed, a 406 means the refused claim
-// named a product the marker list does not know. Resending the same body would
-// earn the same 406, so the retry must change something structural: the system
-// slot drops to a neutral line. The conversation itself is preserved.
+// named a wording the marker list does not know. BP-325 inserted a middle hop
+// (every identity sentence stripped) before the neutral line, so the neutral
+// hop only fires when the strip EITHER changed nothing OR was still refused —
+// here the server refuses the strip too, so the third call must carry the
+// neutral system line. The conversation itself is preserved.
 func Test406RetryFallsBackToNeutralSystem(t *testing.T) {
 	var calls int32
 	var bodies []map[string]any
@@ -31,7 +33,7 @@ func Test406RetryFallsBackToNeutralSystem(t *testing.T) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		bodies = append(bodies, body)
-		if n == 1 {
+		if n <= 2 {
 			w.WriteHeader(http.StatusNotAcceptable)
 			return
 		}
@@ -66,12 +68,21 @@ func Test406RetryFallsBackToNeutralSystem(t *testing.T) {
 	if _, err := d.Stream(context.Background(), call, func(ir.StreamEvent) error { return nil }); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	if got := atomic.LoadInt32(&calls); got != 2 {
-		t.Fatalf("upstream calls = %d, want 2 (original + neutral retry)", got)
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("upstream calls = %d, want 3 (original + strip retry + neutral retry)", got)
 	}
-	// The second body must be structurally different: a neutral system line and
+	// The middle body must already be free of the unknown identity (hop 2).
+	mid, _ := bodies[1]["messages"].([]any)
+	if len(mid) >= 1 {
+		if m0, _ := mid[0].(map[string]any); m0 != nil {
+			if s, _ := m0["content"].(string); strings.Contains(s, "SuperAgent 9000") {
+				t.Fatalf("hop 2 resent the refused identity: %q", s)
+			}
+		}
+	}
+	// The third body must be structurally different: a neutral system line and
 	// no trace of the unknown identity.
-	msgs, _ := bodies[1]["messages"].([]any)
+	msgs, _ := bodies[2]["messages"].([]any)
 	if len(msgs) < 2 {
 		t.Fatalf("resent body has %d messages", len(msgs))
 	}

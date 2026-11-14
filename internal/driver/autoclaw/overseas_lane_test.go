@@ -47,12 +47,12 @@ func TestOverseasLaneUsesTheOneXContract(t *testing.T) {
 	}
 	// The OpenAI SDK family the Electron client adds to every official call.
 	for k, want := range map[string]string{
-		"X-Stainless-Lang":              "js",
-		"X-Stainless-Package-Version":   overseasSDKVersion,
-		"X-Stainless-Runtime":           "node",
-		"X-Stainless-Runtime-Version":   overseasNodeVersion,
-		"X-Stainless-Retry-Count":       "0",
-		"X-Stainless-Timeout":           "600",
+		"X-Stainless-Lang":            "js",
+		"X-Stainless-Package-Version": overseasSDKVersion,
+		"X-Stainless-Runtime":         "node",
+		"X-Stainless-Runtime-Version": overseasNodeVersion,
+		"X-Stainless-Retry-Count":     "0",
+		"X-Stainless-Timeout":         "600",
 	} {
 		if got := h.Get(k); got != want {
 			t.Errorf("%s = %q, want %q", k, got, want)

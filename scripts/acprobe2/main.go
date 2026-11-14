@@ -49,6 +49,7 @@ type creds struct {
 func main() {
 	dsn := flag.String("dsn", "postgres://bargainproxy@127.0.0.1:55432/bargainproxy", "database dsn")
 	keyFile := flag.String("key", "data/master.key", "master key file")
+	uid := flag.String("uid", "", "account uid to load (default: first non-disabled row)")
 	secret := flag.String("secret", "", "app secret (default: read from config.json)")
 	cfgPath := flag.String("config", "config.json", "config.json for the app secret")
 	variant := flag.String("variant", "baseline", "header/body variant name (see variants())")
@@ -79,7 +80,7 @@ func main() {
 		log.Fatal("no app secret: pass -secret or have channels.autoclaw.app_secret in config.json")
 	}
 
-	c, err := loadCreds(*dsn, *keyFile)
+	c, err := loadCreds(*dsn, *keyFile, *uid)
 	if err != nil {
 		log.Fatalf("creds: %v", err)
 	}
@@ -402,8 +403,10 @@ func padHistory(msgs []any, padTokens int) []any {
 	return msgs
 }
 
-// loadCreds reads the autoclaw account row and decrypts it.
-func loadCreds(dsn, keyFile string) (*creds, error) {
+// loadCreds reads the autoclaw account row and decrypts it. With uid set it
+// loads that exact account; otherwise the first non-disabled row (historic
+// behaviour).
+func loadCreds(dsn, keyFile, uid string) (*creds, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	conn, err := pgx.Connect(ctx, dsn)
@@ -412,8 +415,14 @@ func loadCreds(dsn, keyFile string) (*creds, error) {
 	}
 	defer conn.Close(ctx)
 	var enc string
-	if err := conn.QueryRow(ctx,
-		"SELECT creds_enc FROM accounts WHERE channel='autoclaw' AND disabled=false LIMIT 1").Scan(&enc); err != nil {
+	if uid != "" {
+		err = conn.QueryRow(ctx,
+			"SELECT creds_enc FROM accounts WHERE channel='autoclaw' AND disabled=false AND uid=$1", uid).Scan(&enc)
+	} else {
+		err = conn.QueryRow(ctx,
+			"SELECT creds_enc FROM accounts WHERE channel='autoclaw' AND disabled=false LIMIT 1").Scan(&enc)
+	}
+	if err != nil {
 		return nil, err
 	}
 	key, err := cryptox.LoadOrCreateKey(keyFile)

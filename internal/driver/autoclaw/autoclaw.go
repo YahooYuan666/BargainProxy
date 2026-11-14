@@ -820,13 +820,42 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		// slot drops to a neutral line. The caller's agent instructions are
 		// lost for this one attempt — that is the price of not failing outright.
 		if ue, ok := uperr.As(err); ok && ue.Status == http.StatusNotAcceptable {
-			if neutral, _, mErr := buildBodyNeutral(call); mErr == nil {
-				log.Printf("autoclaw: 406 channel refusal; resending with a neutral system prompt (the identity scrub did not cover it)")
-				if resp2, err2 := d.chatManaged(ctx, cr, neutral, modelID); err2 == nil {
+			// BP-325: capture the refused post-scrub system text — the 406 body
+			// is always empty, so the dump is the only way to learn WHAT wording
+			// the gate rejected and extend refusedIdentities/identityRewrites
+			// with evidence instead of guesses (parity: the community plugin's
+			// dump406 / AUTOCLAW_406_DUMP_DIR).
+			d.dump406(body)
+			// Hop 2 (BP-325): strip EVERY identity sentence, keeping the rest of
+			// the prompt — an unknown claim wording no longer costs the caller
+			// their whole system prompt. Hop 3 stays the neutral line.
+			if stripped, _, mErr := buildBodyNoIdentity(call); mErr == nil && !bytes.Equal(stripped, body) {
+				log.Printf("autoclaw: 406 channel refusal; resending with all identity sentences stripped (BP-325 hop 2)")
+				if resp2, err2 := d.chatManaged(ctx, cr, stripped, modelID); err2 == nil {
 					resp, err = resp2, nil
+				} else if ue2, ok2 := uperr.As(err2); ok2 && ue2.Status == http.StatusNotAcceptable {
+					if neutral, _, mErr := buildBodyNeutral(call); mErr == nil {
+						log.Printf("autoclaw: 406 persisted after identity strip; resending with a neutral system prompt (hop 3)")
+						if resp3, err3 := d.chatManaged(ctx, cr, neutral, modelID); err3 == nil {
+							resp, err = resp3, nil
+						} else {
+							err = err3
+							log.Printf("autoclaw: managed gateway unavailable after the neutral-system retry: %v", err)
+						}
+					}
 				} else {
 					err = err2
-					log.Printf("autoclaw: managed gateway unavailable after the neutral-system retry: %v", err)
+					log.Printf("autoclaw: managed gateway unavailable after the identity-strip retry: %v", err)
+				}
+			} else {
+				if neutral, _, mErr := buildBodyNeutral(call); mErr == nil {
+					log.Printf("autoclaw: 406 channel refusal; resending with a neutral system prompt (the identity scrub did not cover it)")
+					if resp2, err2 := d.chatManaged(ctx, cr, neutral, modelID); err2 == nil {
+						resp, err = resp2, nil
+					} else {
+						err = err2
+						log.Printf("autoclaw: managed gateway unavailable after the neutral-system retry: %v", err)
+					}
 				}
 			}
 		}
@@ -1354,6 +1383,25 @@ func buildBodyNeutral(call driver.ChatCall) ([]byte, string, error) {
 	return buildBodyWith(driver.ChatCall{Account: call.Account, UpstreamModel: call.UpstreamModel, Request: &clone}, false)
 }
 
+// buildBodyNoIdentity is the MIDDLE fallback (BP-325, 2026-11-14): the
+// caller's system prompt with EVERY second-person identity sentence removed —
+// not only claims naming a known-refused product.
+//
+// Why a middle hop at all: buildBodyNeutral replaces the whole system slot,
+// so on 2026-11-14 (a wording the refusedIdentities list did not know) every
+// autoclaw turn ran with the caller's agent instructions gone — 62 requests,
+// 62 neutral resends. The field matrix says the trigger is always a "you are"
+// claim, so dropping those sentences wholesale removes every possible claim
+// while keeping the tool policy, tone and task-management instructions that
+// actually drive behaviour. Used only after the scrubbed body is STILL
+// refused; the neutral body stays the last resort.
+func buildBodyNoIdentity(call driver.ChatCall) ([]byte, string, error) {
+	req := call.Request
+	clone := *req
+	clone.Messages = scrubAllIdentity(req.Messages)
+	return buildBodyWith(driver.ChatCall{Account: call.Account, UpstreamModel: call.UpstreamModel, Request: &clone}, false)
+}
+
 // neutralSystemLine is what the last-resort attempt sends in the system slot.
 // It deliberately makes no identity claim at all.
 const neutralSystemLine = "You are a helpful assistant. Please answer the user's question."
@@ -1432,7 +1480,15 @@ var identityRewrites = []struct {
 	// masked separately below. The GLM casing rule normalizes "powered by
 	// the glm-5.3-flash model" to the accepted GLM-x form.
 	{regexp.MustCompile(`(?i)You are an AI agent,?[ ]+powered by DeepSeek[ ]+Harness\.?`), "You are an AI agent powered by a local coding harness."},
-	{regexp.MustCompile(`(?i)(powered by[ ]+)the (?:model[ ]+)?GLM-([A-Za-z0-9.\-]+)`), "${1}the GLM-$2 model"},
+	{regexp.MustCompile(`(?i)(powered by[ ]+)the (?:model[ ]+)?GLM-([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*)`), "${1}the GLM-$2 model"},
+	// BP-325 (2026-11-14): ZCode 3.18.2 qualifies the model with its provider
+	// pool — "You are powered by the model named
+	// account:bigmodel-start-plan/GLM-5.3-Flash." The BP-322 rule above needs
+	// "powered by the GLM-…" adjacency, which the "named account:…/" infix
+	// breaks, so the bare model id survived in system text. Reword to the same
+	// accepted "the GLM-x model" form BP-322 measured. The capture excludes a
+	// trailing sentence period.
+	{regexp.MustCompile(`(?i)You are powered by the model named \S*?GLM-([A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*)`), "You are powered by the GLM-$1 model"},
 }
 
 // refusedIdentityClaim reports whether text carries a second-person identity
@@ -1503,6 +1559,43 @@ func stripClaimSentence(text, name string) string {
 			}
 		}
 		start = i + 1
+	}
+	out := strings.Join(kept, "")
+	return strings.TrimSpace(out)
+}
+
+// stripAllIdentitySentences removes every sentence that asserts a second-person
+// identity ("you are …"), regardless of which product it names — the BP-325
+// middle fallback for a 406 whose wording refusedIdentities does not cover.
+// The sentence splitter and terminator handling match stripClaimSentence so
+// both hops behave identically on the same text.
+func stripAllIdentitySentences(text string) string {
+	var kept []string
+	start := 0
+	changed := false
+	for i := 0; i <= len(text); i++ {
+		if i < len(text) {
+			switch text[i] {
+			case '.', '!', '?', '\n':
+			default:
+				continue
+			}
+		}
+		sentence := text[start:i]
+		low := strings.ToLower(sentence)
+		if strings.Contains(low, "you are") {
+			changed = true
+			start = i + 1
+			continue
+		}
+		kept = append(kept, sentence)
+		if i < len(text) {
+			kept = append(kept, string(text[i]))
+		}
+		start = i + 1
+	}
+	if !changed {
+		return text
 	}
 	out := strings.Join(kept, "")
 	return strings.TrimSpace(out)
@@ -1669,6 +1762,27 @@ func scrubMessages(messages []ir.Message) []ir.Message {
 		}
 		text := ir.TextOf(m.Content)
 		cleaned := scrubRefusedIdentity(text)
+		if cleaned == text {
+			out = append(out, m)
+			continue
+		}
+		m.Content = []ir.ContentPart{{Kind: "text", Text: cleaned}}
+		out = append(out, m)
+	}
+	return out
+}
+
+// scrubAllIdentity is scrubMessages with the harsher per-message scrub
+// (BP-325): after the known rewrites, EVERY remaining "you are" sentence goes.
+func scrubAllIdentity(messages []ir.Message) []ir.Message {
+	out := make([]ir.Message, 0, len(messages))
+	for _, m := range messages {
+		if m.Role != ir.RoleSystem {
+			out = append(out, m)
+			continue
+		}
+		text := ir.TextOf(m.Content)
+		cleaned := stripAllIdentitySentences(scrubRefusedIdentity(text))
 		if cleaned == text {
 			out = append(out, m)
 			continue

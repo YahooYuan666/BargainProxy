@@ -1,12 +1,19 @@
 package autoclaw
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
+	"bargainproxy/internal/config"
 	"bargainproxy/internal/driver"
 	"bargainproxy/internal/ir"
+	"bargainproxy/internal/model"
 	"bargainproxy/internal/uperr"
 )
 
@@ -205,5 +212,179 @@ func TestBalanceWordingStaysAccountWide(t *testing.T) {
 	}
 	if e.Model != "" {
 		t.Fatalf("a wording-only balance error got scoped to %q; the account's balance is shared", e.Model)
+	}
+}
+
+// TestGLMPoolQualifiedOpenerIsReworded pins BP-325: ZCode 3.18.2 qualifies the
+// model with its provider pool ("You are powered by the model named
+// account:bigmodel-start-plan/GLM-5.3-Flash."), which the BP-322 GLM rule
+// misses ("powered by the GLM-…" adjacency is broken by "named account:…/").
+// The bare model id must not survive the scrub; the reworded form is the same
+// "the GLM-x model" wording BP-322 measured as accepted.
+func TestGLMPoolQualifiedOpenerIsReworded(t *testing.T) {
+	cases := map[string]string{
+		"You are powered by the model named account:bigmodel-start-plan/GLM-5.3-Flash.": "You are powered by the GLM-5.3-Flash model.",
+		"You are powered by the model named account:my-pool/glm-5.3-flash.":             "You are powered by the GLM-5.3-flash model.",
+	}
+	for in, want := range cases {
+		if got := scrubRefusedIdentity(in); got != want {
+			t.Errorf("scrub(%q) = %q, want %q", in, got, want)
+		}
+	}
+	// The plain BP-322 form must still be handled by the older rule.
+	if got := scrubRefusedIdentity("You are powered by the model GLM-5.3-Flash."); got != "You are powered by the GLM-5.3-Flash model." {
+		t.Errorf("BP-322 form regressed: %q", got)
+	}
+}
+
+// TestStripAllIdentitySentences pins the BP-325 hop-2 text scrub: every
+// "you are" sentence goes, everything else survives byte for byte, and text
+// without any identity claim comes back untouched (so the hop can be skipped).
+func TestStripAllIdentitySentences(t *testing.T) {
+	const kept = "## Tools\nPrefer dedicated tools over shell. Tone: concise."
+	cases := map[string]string{
+		"You are ZCode, an interactive agent. " + kept: kept,
+		"you are Claude Code. " + kept:                 kept,
+		"You are Codex. You are Cline. " + kept:        kept,
+		"P1. You are Windsurf. P2. " + kept:            "P1. P2. " + kept,
+		kept:                                           kept, // no claims → unchanged
+		"You are a helpful assistant.":                 "",   // even the neutral line is a claim
+	}
+	for in, want := range cases {
+		if got := stripAllIdentitySentences(in); got != want {
+			t.Errorf("strip(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Test406FallbackStripsIdentityBeforeNeutral pins the BP-325 chain: hop 1
+// (surgical scrub) refused → hop 2 keeps the caller's non-identity
+// instructions (the neutral hop used to throw ALL of them away — 62 requests
+// on 2026-11-14 ran with no agent instructions at all). Only a second refusal
+// escalates to the neutral system line.
+func Test406FallbackStripsIdentityBeforeNeutral(t *testing.T) {
+	type attempt struct {
+		system string
+	}
+	var attempts []attempt
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sys := ""
+		if msgs, ok := body["messages"].([]any); ok && len(msgs) > 0 {
+			if first, ok := msgs[0].(map[string]any); ok {
+				sys, _ = first["content"].(string)
+			}
+		}
+		calls++
+		attempts = append(attempts, attempt{system: sys})
+		if calls == 1 {
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	oldDir := dump406Dir
+	dump406Dir = dir
+	defer func() { dump406Dir = oldDir }()
+
+	const instructions = "Tone: be concise. Prefer dedicated tools over shell."
+	req := &ir.ChatRequest{
+		Model: "glm-5.3-flash",
+		Messages: []ir.Message{
+			{Role: ir.RoleSystem, Content: []ir.ContentPart{{Kind: "text",
+				Text: "You are SomeNewAgent, a coding assistant. " + instructions}}},
+			{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}},
+		},
+		Stream: true,
+	}
+	d := New(config.AutoClawSettings{Enabled: true, UserAPIBase: srv.URL, AppSecret: "test-secret"}, nil)
+	call := driver.ChatCall{
+		Account:       &model.Account{ID: "autoclaw:u1", CredsJSON: testCreds()},
+		UpstreamModel: "glm-5.3-flash",
+		Request:       req,
+	}
+	_, err := d.Stream(context.Background(), call, func(ev ir.StreamEvent) error { return nil })
+	if err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("attempts = %d, want 2 (hop 2 must serve, not hop 3)", len(attempts))
+	}
+	second := attempts[1].system
+	if strings.Contains(strings.ToLower(second), "somenewagent") {
+		t.Fatalf("the unknown identity claim survived hop 2: %q", second)
+	}
+	if !strings.Contains(second, "Prefer dedicated tools over shell") {
+		t.Fatalf("hop 2 lost the caller's instructions: %q", second)
+	}
+	// The refused attempt is dumped for evidence.
+	dumps, _ := os.ReadDir(dir)
+	if len(dumps) != 1 {
+		t.Fatalf("406 dumps = %d, want 1", len(dumps))
+	}
+}
+
+// Test406FallsThroughToNeutralWhenNothingToStrip pins the chain end: when hop 2
+// would produce the identical body (no "you are" sentences at all), the
+// neutral hop serves directly — resending identical bytes would earn the
+// identical 406.
+func Test406FallsThroughToNeutralWhenNothingToStrip(t *testing.T) {
+	var systems []string
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sys := ""
+		if msgs, ok := body["messages"].([]any); ok && len(msgs) > 0 {
+			if first, ok := msgs[0].(map[string]any); ok {
+				sys, _ = first["content"].(string)
+			}
+		}
+		calls++
+		systems = append(systems, sys)
+		if calls == 1 {
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprintln(w, `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`)
+		fmt.Fprintln(w, `data: [DONE]`)
+	}))
+	defer srv.Close()
+
+	oldDir := dump406Dir
+	dump406Dir = t.TempDir()
+	defer func() { dump406Dir = oldDir }()
+
+	req := &ir.ChatRequest{
+		Model: "glm-5.3-flash",
+		Messages: []ir.Message{
+			{Role: ir.RoleSystem, Content: []ir.ContentPart{{Kind: "text",
+				Text: "Tone: concise. No identity sentence here at all."}}},
+			{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: "hi"}}},
+		},
+		Stream: true,
+	}
+	d := New(config.AutoClawSettings{Enabled: true, UserAPIBase: srv.URL, AppSecret: "test-secret"}, nil)
+	call := driver.ChatCall{
+		Account:       &model.Account{ID: "autoclaw:u1", CredsJSON: testCreds()},
+		UpstreamModel: "glm-5.3-flash",
+		Request:       req,
+	}
+	if _, err := d.Stream(context.Background(), call, func(ev ir.StreamEvent) error { return nil }); err != nil {
+		t.Fatalf("stream: %v", err)
+	}
+	if len(systems) != 2 {
+		t.Fatalf("attempts = %d, want 2", len(systems))
+	}
+	if systems[1] != neutralSystemLine && !strings.HasPrefix(systems[1], harnessMarker) {
+		t.Fatalf("second attempt system = %q, want the neutral line (hop 3)", systems[1])
 	}
 }
