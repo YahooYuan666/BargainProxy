@@ -5,8 +5,10 @@
  * 做什么：从本机运行的 BargainProxy 网关读取两批模型，在 ZCode 的个人
  * Provider 配置里维护 **6 个供应商**（2 个模型族 × 3 条协议线）：
  *
- *   BargainProxy 国模      Chat/Response/Anthropic  ← /v1/models 中非 antigravity 的模型
- *   BargainProxy Gemini    Chat/Response/Anthropic  ← /v1/models 中 antigravity 的模型（gemini/claude）
+ *   BargainProxy 国模      Chat/Response/Anthropic  ← /v1/models 中非 Gemini 家族的模型
+ *   BargainProxy Gemini    Chat/Response/Anthropic  ← /v1/models 中 Gemini 家族的模型（gemini/claude）
+ *     归属判据 = 渠道属于 {antigravity, aistudio} 或模型 id 以 gemini- 开头（BP-326：
+ *     旧判据只看渠道名 antigravity，接入 aistudio 后 gemini-4-hydrogen 会被误归国模）
  *
  * baseUrl 的拼接口径是实测钉死的（与 ZCode 内置 SDK 的行为一致）：
  *   chat/responses 线的 baseUrl 必须带 /v1，ZCode 会追加 /chat/completions、/responses；
@@ -189,6 +191,16 @@ async function getJson(url, timeoutMs = HTTP_TIMEOUT_MS, apiKey = "") {
 }
 
 // ── 来源：网关 /v1/models → 国模 / Gemini 两类 ─────────────────────────────
+//
+// 分类判据 = 模型本身是不是 Gemini/Claude，不是渠道名（BP-326 修正）。
+// 旧判据只有 `owner === "antigravity"`：BP-326 之前所有 Gemini 模型恰好都从
+// antigravity 出，渠道名与模型族重合所以碰巧成立；接入 aistudio（官方 Gemini
+// API，owned_by=aistudio）后 gemini-4-hydrogen 被兜底扫进国模族——模型在
+// ZCode 里归错组。现改为「Gemini 渠道集合 OR 模型 id 前缀」双判据，新渠道
+// 只要命名沿 gemini-* 就自动归位，不必再改这张表。
+const GEMINI_OWNERS = new Set(["antigravity", "aistudio"]);
+const GEMINI_ID = /^gemini-/i;
+
 async function gatewayFamilies(gateway, apiKey) {
   const doc = await getJson(`${gateway}/v1/models`, HTTP_TIMEOUT_MS, apiKey);
   if (!doc || !Array.isArray(doc.data)) return null;
@@ -198,8 +210,11 @@ async function gatewayFamilies(gateway, apiKey) {
     const id = typeof m?.id === "string" ? m.id : "";
     if (!id) continue;
     const owner = String(m?.owned_by ?? "");
-    if (owner === "opencodezen") continue; // 由 OpenCode 族单独维护
-    if (owner === "antigravity") gemini.push(id);
+    // owned_by 是 "+" 连接的渠道清单（多渠道路由时形如 "qoder+trae+lobster"），
+    // 只要其中任一渠道属于 Gemini 家族就归 Gemini。
+    const owners = owner.split("+").map((s) => s.trim().toLowerCase());
+    if (owners.includes("opencodezen")) continue; // 由 OpenCode 族单独维护
+    if (owners.some((o) => GEMINI_OWNERS.has(o)) || GEMINI_ID.test(id)) gemini.push(id);
     else cn.push(id);
   }
   const uniq = (arr) => [...new Set(arr)].sort();
