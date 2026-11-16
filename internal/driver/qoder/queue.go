@@ -53,6 +53,12 @@ const (
 	// falling back. The whole wait already has queueWaitBudget; this is the
 	// slice the polling may consume.
 	queuePollBudget = 20 * time.Second
+	// queueHeadStuckPolls (BP-327): how many consecutive status answers with
+	// the SAME queueCount, after the head was reached, mean "this queue is not
+	// moving for us" — resend instead of sleeping out the budget. Two polls
+	// because the pause between them is the upstream's own retryAfterSeconds
+	// (often 30s), so two is already a long look.
+	queueHeadStuckPolls = 2
 )
 
 // queueState is the queue's answer, found the way the reference finds it: the
@@ -65,6 +71,15 @@ type queueState struct {
 	QueueType         string
 	RetryAfterSeconds float64
 	RetryAfterKnown   bool
+	// QueueCount / QueueCountKnown (BP-327, plugins bf47b85 + RobbsLuo
+	// 8a96511): how many requests are ahead. Absent and zero are DIFFERENT
+	// answers — null means "not reported", 0 means "I am at the head" — and
+	// conflating them either way costs real time: treating null as 0 skips
+	// waiting for a queue that is actually deep, treating 0 as "wait anyway"
+	// sleeps 30s when the request could be resent immediately (upstream
+	// measured 92 pointless 30s waits).
+	QueueCount      int
+	QueueCountKnown bool
 }
 
 // queued reports whether the request is still waiting. A state with neither
@@ -164,6 +179,17 @@ func queueStateOf(obj map[string]any) (queueState, bool) {
 			q.RetryAfterSeconds, q.RetryAfterKnown = n, true
 		}
 	}
+	// BP-327: queueCount may arrive as a number or a numeric string. Only a
+	// decodable value counts as known — see the field's comment for why null
+	// and 0 must not be conflated.
+	switch v := obj["queueCount"].(type) {
+	case float64:
+		q.QueueCount, q.QueueCountKnown = int(v), true
+	case string:
+		if n, err := atof(v); err == nil {
+			q.QueueCount, q.QueueCountKnown = int(n), true
+		}
+	}
 	return q, true
 }
 
@@ -194,6 +220,17 @@ func (d *Driver) awaitQueue(ctx context.Context, rc realmConfig, sess *sessionCo
 		return false
 	}
 	failures := 0
+	// BP-327 (RobbsLuo 8a96511): the request reached the head of the queue
+	// (queueCount == 0) while the upstream still reported "queued" with a
+	// retryAfterSeconds. Sleeping that value out is pure waste — nothing is
+	// ahead of us — so remember the deepest depth seen and stop early when the
+	// head is reached and the answer stops changing.
+	// (plugins bf47b85's stuck detector, adapted: their 5-minute "nothing
+	// moved" window is pointless at our 30s budget, so the shape we take is
+	// "already at the head" + "no progress", not a long stall watch.)
+	headSeen := false
+	stuckPolls := 0
+	var lastState queueState
 	for {
 		if !time.Now().Before(deadline) {
 			return false
@@ -222,6 +259,25 @@ func (d *Driver) awaitQueue(ctx context.Context, rc realmConfig, sess *sessionCo
 				}
 			}
 			return true
+		} else {
+			// BP-327: at the head with no movement — resend now instead of
+			// sleeping out a queue we are already first in.
+			if state.QueueCountKnown {
+				if state.QueueCount <= 0 {
+					headSeen = true
+				}
+				if headSeen && state.QueueCount == lastState.QueueCount && lastState.QueueCountKnown {
+					stuckPolls++
+					if stuckPolls >= queueHeadStuckPolls {
+						log.Printf("qoder: queue says %d ahead and has not moved for %d polls — resending now instead of sleeping out the budget",
+							state.QueueCount, stuckPolls)
+						return true
+					}
+				} else {
+					stuckPolls = 0
+				}
+			}
+			lastState = state
 		}
 		pause := queuePause(state)
 		if time.Now().Add(pause).After(deadline) {

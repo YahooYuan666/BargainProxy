@@ -627,6 +627,8 @@ func (p *Pool) channelBusyUntilLocked(channel, modelName string, now time.Time) 
 
 // markChannelBusyLocked records/extends the channel+model pause.
 func (p *Pool) markChannelBusyLocked(channel, modelName string, until time.Time) {
+	// BP-327: wall clock only, same reason as restAccount (wall.go).
+	until = onWall(until)
 	key := channel + "|" + modelName
 	if cur, ok := p.busyUntil[key]; ok && cur.After(until) {
 		return // keep the later deadline
@@ -1161,6 +1163,12 @@ func (p *Pool) ReleaseOnCredits(a *model.Account, remain int64) {
 // deadline. Keeping the two beside the timestamp is what lets the panel say
 // "rate limit, back at 21:05" instead of just "cooling down" (2026-10-22).
 func (p *Pool) restAccount(a *model.Account, until time.Time, reason, by string, now time.Time) {
+	// BP-327: wall clock only — a monotonic reading stops while the machine
+	// sleeps, so an overnight suspend would push this deadline out by the
+	// sleep duration (magpie 8769a58 / plugins#1126 field report; our 11140
+	// rest is SEVEN days long, so it would drift by hours every night). See
+	// wall.go.
+	until = onWall(until)
 	if until.After(a.AccountCooldownUntil) {
 		a.AccountCooldownUntil = until
 		a.AccountCooldownReason = reason
@@ -1836,7 +1844,7 @@ func (p *Pool) setModelCooldownHard(a *model.Account, m string, resetAt time.Tim
 			resetAt = prev.ResetAt
 		}
 	}
-	a.ModelCooldowns[m] = model.ModelCooldown{Until: until, ResetAt: resetAt, Reason: reason, Message: message}
+	a.ModelCooldowns[m] = model.ModelCooldown{Until: onWall(until), ResetAt: resetAt, Reason: reason, Message: message}
 	// Opportunistic cleanup of expired entries. Must use the pool's injected
 	// clock (not wall time): with a test clock far from wall time, a wall
 	// comparison would delete fresh cooldowns immediately.

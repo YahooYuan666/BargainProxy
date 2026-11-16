@@ -76,6 +76,13 @@ type Result struct {
 	// from "no leg produced a content event", which must fall back to the
 	// ingress's own measurement.
 	UpstreamTTFBKnown bool
+	// BilledUsage (BP-327) is what this request actually cost: every upstream
+	// segment's own tokens, summed — including segments whose output was
+	// discarded (a failed continuation, a reset attempt). Response.Usage is
+	// the CLIENT-facing book and deliberately reports the last segment's
+	// prompt (see streamLedger). The two differ only when a rescue or
+	// continuation ran; both are zero when nothing reported usage.
+	BilledUsage ir.Usage
 }
 
 // Trace records how a request was attempted across bindings, so the request
@@ -1437,7 +1444,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		// misakano 07f8ae0): finish=stop with reasoning streamed and no answer
 		// — the upstream "thought and said done". See starved.go for every
 		// guard.
-		stopRescueTried := false
+		stopRescueTried := 0
 		if retryReq, starved := starvedRetryRequest(req, resp, ledger); starved {
 			log.Printf("gateway: %s turn ended stop=%s with no output at max_tokens=%d — thinking left nothing answerable; retrying once with thinking disabled",
 				binding.Channel, resp.StopReason, req.MaxTokens)
@@ -1457,16 +1464,21 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		}
 		// BP-302 stop-shaped rescue (misakano c2003af): the turn ended stop
 		// with prose the upstream called complete, but that reads as "stopped
-		// mid-thought" — a lead-in tail on a tool-class request. ONE segment
-		// per request; its text splices into the same stream. BP-316 removed
-		// the BP-303 tool-only half (built for Codex, no longer served; its
-		// field harm — pushing finished ZCode turns into extra tool calls —
-		// is sess_1d74dbe9) and added the field gates around narration. See
-		// stoprescue.go for every gate.
-		if scReq, why, ok := stopRescuePlan(binding.Channel, req, ledger, resp, stopRescueTried); ok {
-			stopRescueTried = true
-			log.Printf("gateway: %s turn ended stop but looks unfinished (%s) — trying one narration rescue segment on the same account",
-				binding.Channel, why)
+		// mid-thought" — a lead-in or promise tail on a tool-class request. Up
+		// to narrationMaxRescues segments per request (BP-327: two, because a
+		// long answer commonly announces twice); its text splices into the same
+		// stream. BP-316 removed the BP-303 tool-only half (built for Codex, no
+		// longer served; its field harm — pushing finished ZCode turns into
+		// extra tool calls — is sess_1d74dbe9) and added the field gates around
+		// narration. See stoprescue.go for every gate.
+		for stopRescueTried < narrationMaxRescues {
+			scReq, why, ok := stopRescuePlan(binding.Channel, req, ledger, resp, stopRescueTried)
+			if !ok {
+				break
+			}
+			stopRescueTried++
+			log.Printf("gateway: %s turn ended stop but looks unfinished (%s) — narration rescue segment %d/%d on the same account",
+				binding.Channel, why, stopRescueTried, narrationMaxRescues)
 			rescResp, rerr := drv.Stream(actx, driver.ChatCall{
 				Account: lease.Account, UpstreamModel: binding.UpstreamModel,
 				Request: scReq,
@@ -1478,6 +1490,11 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				log.Printf("gateway: %s narration rescue returned nothing; the original answer stands", binding.Channel)
 			default:
 				resp = mergedResponse(ledger, rescResp)
+			}
+			// A failed or empty rescue has nothing more to judge; stop here
+			// rather than re-deciding on the same text.
+			if rerr != nil || rescResp == nil {
+				break
 			}
 		}
 		// BP-295 length continuation: a finish=length turn with a PARTIAL prose
@@ -1546,6 +1563,11 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 				resp.Message.ToolCalls[i].Arguments = dropLoneCR(resp.Message.ToolCalls[i].Arguments)
 			}
 			res := &Result{Response: resp, Channel: binding.Channel, Account: lease.Account, Attempts: tr.Attempts, ToolsDeclared: len(req.Tools), Effort: effortSent, UpstreamTTFB: tr.UpstreamTTFB, UpstreamTTFBKnown: tr.upstreamTTFB}
+			// BP-327: the log/usage row reports what the request COST (every
+			// segment's own tokens, discarded ones included), while the client
+			// keeps seeing the context-sized book (resp.Usage). They differ
+			// only when a rescue or continuation ran.
+			res.BilledUsage = ledger.billingUsage()
 			if degraded {
 				res.Degraded = binding.Channel
 			}
@@ -1949,6 +1971,15 @@ func DescribeError(err error) (status int, class string, message string) {
 				"the upstream has no server for this model); switch models or retry later: %s",
 				ue.Model, ue.Message)
 			return 429, ue.Class, msg
+		}
+		// BP-327: the vendor behind the model is overloaded (workbuddy 11134).
+		// Same status as a queue — 429 keeps CLIs resending instead of aborting
+		// the task — but the advice differs: a slow queue is worth waiting out
+		// with the SAME model; an overloaded provider is not, because upstream
+		// field data shows it hitting every account of the channel at once.
+		if ue.Code == "11134" {
+			return 429, ue.Class, fmt.Sprintf("model provider temporarily overloaded (not this account, "+
+				"not a queue); switch models or retry later: %s", ue.Message)
 		}
 		if !ue.ResetAt.IsZero() {
 			if wait := time.Until(ue.ResetAt); wait > 0 {

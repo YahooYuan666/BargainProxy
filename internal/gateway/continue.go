@@ -69,6 +69,24 @@ type streamLedger struct {
 	usage    ir.Usage
 	usageSet bool
 
+	// BP-327 (misakano def074c / ab67974): TWO books.
+	//
+	//   usage  — what the CLIENT is told. Prompt tokens take the LAST segment's
+	//            value, because every continuation replays the same context and
+	//            summing them would inflate the client's context size by the
+	//            number of segments (which makes clients compact early).
+	//   billed — what this request actually COST. Every segment is a separate
+	//            upstream call that is charged on its own, including a segment
+	//            whose output was thrown away (a failed continuation, a
+	//            discarded attempt). Dropping those under-reports spend.
+	//
+	// Recorded per segment so a discarded segment can be billed without ever
+	// being shown: seg accumulates while a segment runs, endSegment decides
+	// which books it lands in.
+	billed   ir.Usage
+	seg      ir.Usage
+	segUsage bool
+
 	// BP-295: the terminal event is HELD here instead of flowing straight to
 	// the protocol writers. A writer's EvDone is the wire's one terminal
 	// ([DONE] / message_stop / response.completed) — anything spliced after
@@ -107,6 +125,11 @@ func (l *streamLedger) record(ev ir.StreamEvent) {
 		// attempt's reasoning drive the length-continuation signal ("thinking
 		// dominates the answer") for a turn the client never saw.
 		l.thinking.Reset()
+		// BP-327: the discarded attempt still cost money. Commit what it
+		// reported to the billing book BEFORE the retry starts, so the retry's
+		// numbers cannot be merged with the dead attempt's — and so the spend
+		// is not silently dropped.
+		l.commitSegment()
 	case ir.EvToolRestart:
 		// BP-139: the continuation explicitly REDOES the interrupted tool
 		// call (fresh, complete arguments) instead of splicing half-JSON —
@@ -124,7 +147,23 @@ func (l *streamLedger) record(ev ir.StreamEvent) {
 // conversation context, so summing them across N segments would inflate the
 // context size by N times, prematurely triggering client-side context
 // compaction or context overflow errors (upstream misakano 4d7d1e67 #134).
+//
+// BP-327: `usage` is the CLIENT-visible book. `seg` accumulates the current
+// segment for the BILLING book, which endSegment commits — a segment whose
+// output is discarded (failed continuation, attempt reset) still cost money.
 func (l *streamLedger) addUsage(u ir.Usage) {
+	// BP-327: billing book, current segment only.
+	l.seg.InputTokens += u.InputTokens
+	l.seg.CachedInputTokens += u.CachedInputTokens
+	l.seg.CacheKnown = l.seg.CacheKnown || u.CacheKnown
+	l.seg.OutputTokens += u.OutputTokens
+	l.seg.ReasoningTokens += u.ReasoningTokens
+	l.seg.Credit += u.Credit
+	l.seg.CreditOriginal += u.CreditOriginal
+	l.seg.CreditKnown = l.seg.CreditKnown || u.CreditKnown
+	l.seg.CreditOriginalKnown = l.seg.CreditOriginalKnown || u.CreditOriginalKnown
+	l.segUsage = true
+
 	// Prompt side: overwrite with latest segment
 	l.usage.InputTokens = u.InputTokens
 	l.usage.CachedInputTokens = u.CachedInputTokens
@@ -140,6 +179,50 @@ func (l *streamLedger) addUsage(u ir.Usage) {
 	l.usage.CreditKnown = l.usage.CreditKnown || u.CreditKnown
 	l.usage.CreditOriginalKnown = l.usage.CreditOriginalKnown || u.CreditOriginalKnown
 	l.usageSet = true
+}
+
+// commitSegment moves the current segment's usage into the billing book and
+// clears it. Called at every segment boundary (before a continuation, a rescue
+// or an attempt reset) so a later segment can never inherit an earlier one's
+// numbers — and so a discarded segment still gets billed.
+func (l *streamLedger) commitSegment() {
+	if !l.segUsage {
+		return
+	}
+	l.billed.InputTokens += l.seg.InputTokens
+	l.billed.CachedInputTokens += l.seg.CachedInputTokens
+	l.billed.CacheKnown = l.billed.CacheKnown || l.seg.CacheKnown
+	l.billed.OutputTokens += l.seg.OutputTokens
+	l.billed.ReasoningTokens += l.seg.ReasoningTokens
+	l.billed.Credit += l.seg.Credit
+	l.billed.CreditOriginal += l.seg.CreditOriginal
+	l.billed.CreditKnown = l.billed.CreditKnown || l.seg.CreditKnown
+	l.billed.CreditOriginalKnown = l.billed.CreditOriginalKnown || l.seg.CreditOriginalKnown
+	l.seg = ir.Usage{}
+	l.segUsage = false
+}
+
+// billingUsage is the amount this request actually cost: every segment's own
+// tokens summed, including segments whose output was discarded. Falls back to
+// the client book when no segment was committed (the single-segment case).
+func (l *streamLedger) billingUsage() ir.Usage {
+	out := l.billed
+	if l.segUsage {
+		out.InputTokens += l.seg.InputTokens
+		out.CachedInputTokens += l.seg.CachedInputTokens
+		out.CacheKnown = out.CacheKnown || l.seg.CacheKnown
+		out.OutputTokens += l.seg.OutputTokens
+		out.ReasoningTokens += l.seg.ReasoningTokens
+		out.Credit += l.seg.Credit
+		out.CreditOriginal += l.seg.CreditOriginal
+		out.CreditKnown = out.CreditKnown || l.seg.CreditKnown
+		out.CreditOriginalKnown = out.CreditOriginalKnown || l.seg.CreditOriginalKnown
+	}
+	if out.InputTokens == 0 && out.OutputTokens == 0 && out.Credit == 0 &&
+		!out.CreditKnown && !out.CacheKnown {
+		return l.usage
+	}
+	return out
 }
 
 // canContinue decides whether this failure may be resumed on the same account.

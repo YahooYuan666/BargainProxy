@@ -276,12 +276,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	logRow.AccountLabel = accountLabel(result.Account)
 	logRow.DurationMs = int(time.Since(start).Milliseconds())
 	if result.Response != nil {
-		logRow.InputTokens = result.Response.Usage.InputTokens
-		logRow.OutputTokens = result.Response.Usage.OutputTokens
-		logRow.Credit = result.Response.Usage.Credit
-		logRow.CreditKnown = result.Response.Usage.CreditKnown
-		logRow.CachedTokens = result.Response.Usage.CachedInputTokens
-		logRow.CacheKnown = result.Response.Usage.CacheKnown
+		// BP-327: cost book, not the context-sized one — see logResult.
+		u := result.Response.Usage
+		if result.BilledUsage.InputTokens > 0 || result.BilledUsage.OutputTokens > 0 ||
+			result.BilledUsage.CreditKnown || result.BilledUsage.CacheKnown {
+			u = result.BilledUsage
+		}
+		logRow.InputTokens = u.InputTokens
+		logRow.OutputTokens = u.OutputTokens
+		logRow.Credit = u.Credit
+		logRow.CreditKnown = u.CreditKnown
+		logRow.CachedTokens = u.CachedInputTokens
+		logRow.CacheKnown = u.CacheKnown
 		logRow.ToolCalls = len(result.Response.Message.ToolCalls)
 	}
 	logRow.ToolsDeclared = result.ToolsDeclared
@@ -348,7 +354,15 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Request-Id", reqID)
-	w.WriteHeader(http.StatusOK)
+	// BP-327: NO WriteHeader here. Committing 200 before the upstream has
+	// answered is what turned "no account available" (20~28ms, a terminal 429)
+	// into "200 + an error frame inside the stream" — the client sees success
+	// and has no reason to retry or switch. The status is committed by the
+	// first real Write (net/http does it implicitly), so a request that fails
+	// before any byte reaches the client still gets its honest status code.
+	// Field evidence for the failure side: the last 14 days' streamed failures
+	// that DO carry a terminal status (concurrency_exceeded 0~28ms,
+	// quota_exhausted 8~20ms) are exactly the ones that used to be masked.
 
 	// BP-142: a Chat client only understands data frames, so an SSE comment
 	// is the one keepalive we may send while the upstream is quiet — see

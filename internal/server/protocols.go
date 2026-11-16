@@ -85,7 +85,11 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		var sw *anthropic.StreamWriter
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
+		// BP-327: no early WriteHeader — the status is committed by the first
+		// real write, so a request that dies before any byte reaches the client
+		// (no account, quota wall, concurrency refusal: all decided in tens of
+		// milliseconds) still answers with its honest status instead of "200 +
+		// an error frame the client reads as success". See server.go streamChat.
 		// BP-142: keep the client alive while the upstream is silent. Before
 		// message_start only SSE comments are legal; after it, one ping per
 		// minute at most (see keepalive.go).
@@ -114,11 +118,21 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		}
 		result, err := s.execute(r, req, emit, logRow)
 		if err != nil {
-			_, _, msg := gateway.DescribeError(err)
+			status, class, msg := gateway.DescribeError(err)
 			if tw.sent {
+				// Something already reached the client: the status line is
+				// gone, so end the stream with an in-protocol error event.
 				_ = sw.FinishWithError(msg)
+			} else {
+				// BP-327: nothing was written, so the honest status is still
+				// available — answer JSON with it. Returning without writing
+				// made net/http send an EMPTY 200, the worst possible answer:
+				// the client sees success and an empty assistant turn, so it
+				// neither retries nor switches channels.
+				withRetryAfter(w, status, err)
+				writeJSON(w, status, anthropic.RenderError(kindForClass(class), msg))
 			}
-			logRow.Status, logRow.ErrorClass, logRow.DurationMs = statusOf(err), classOf(err), int(time.Since(start).Milliseconds())
+			logRow.Status, logRow.ErrorClass, logRow.DurationMs = status, class, int(time.Since(start).Milliseconds())
 			s.gw.LogRequest(logRow)
 			return
 		}
@@ -210,7 +224,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if req.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
+		// BP-327: status committed by the first real write — see streamChat.
 		// BP-142: Responses carries a sequence_number on every event, so we
 		// must not invent frames — a comment is the only legal keepalive.
 		lw, ka := newStreamKeepalive(w, "")
@@ -231,7 +245,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := s.execute(r, req, emit, logRow)
 		if err != nil {
-			_, _, msg := gateway.DescribeError(err)
+			status, class, msg := gateway.DescribeError(err)
 			if tw.sent {
 				// BP-244: name an overflow in the vocabulary the client acts on.
 				if ue, ok := uperr.As(err); ok && ue.ContextOverflow {
@@ -239,6 +253,12 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 				} else {
 					_ = sw.FinishWithError(msg)
 				}
+			} else {
+				// BP-327: nothing written — answer the honest status. Falling
+				// through made net/http send an EMPTY 200 (see the same fix on
+				// the Anthropic and Gemini ingresses).
+				withRetryAfter(w, status, err)
+				writeJSON(w, status, responses.RenderError(kindForClass(class), msg))
 			}
 			logRow.Status, logRow.ErrorClass, logRow.DurationMs = statusOf(err), classOf(err), int(time.Since(start).Milliseconds())
 			s.gw.LogRequest(logRow)
@@ -353,7 +373,7 @@ func (s *Server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 	if streaming {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
+		// BP-327: status committed by the first real write — see streamChat.
 		// BP-142: Gemini's SSE framing is comment-tolerant; it has no
 		// keepalive event of its own, so comments only (magpie sends nothing
 		// for Gemini for the same reason).
@@ -375,11 +395,15 @@ func (s *Server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 		}
 		result, err := s.execute(r, req, emit, logRow)
 		if err != nil {
-			_, _, msg := gateway.DescribeError(err)
+			status, class, msg := gateway.DescribeError(err)
 			if tw.sent {
 				_ = sw.FinishWithError(msg)
+			} else {
+				// BP-327: nothing written yet — answer the honest status.
+				withRetryAfter(w, status, err)
+				writeJSON(w, status, geminiv1.RenderError(status, googleState(status), msg))
 			}
-			logRow.Status, logRow.ErrorClass, logRow.DurationMs = statusOf(err), classOf(err), int(time.Since(start).Milliseconds())
+			logRow.Status, logRow.ErrorClass, logRow.DurationMs = status, class, int(time.Since(start).Milliseconds())
 			s.gw.LogRequest(logRow)
 			return
 		}
@@ -531,12 +555,20 @@ func logResult(row *model.RequestLog, result *gateway.Result, start time.Time) {
 	row.AccountLabel = accountLabel(result.Account)
 	row.DurationMs = int(time.Since(start).Milliseconds())
 	if result.Response != nil {
-		row.InputTokens = result.Response.Usage.InputTokens
-		row.OutputTokens = result.Response.Usage.OutputTokens
-		row.Credit = result.Response.Usage.Credit
-		row.CreditKnown = result.Response.Usage.CreditKnown
-		row.CachedTokens = result.Response.Usage.CachedInputTokens
-		row.CacheKnown = result.Response.Usage.CacheKnown
+		// BP-327: the row reports what the request COST (every segment's own
+		// tokens, discarded ones included), not the context-sized book the
+		// client was shown. They differ only when a rescue or continuation ran.
+		u := result.Response.Usage
+		if result.BilledUsage.InputTokens > 0 || result.BilledUsage.OutputTokens > 0 ||
+			result.BilledUsage.CreditKnown || result.BilledUsage.CacheKnown {
+			u = result.BilledUsage
+		}
+		row.InputTokens = u.InputTokens
+		row.OutputTokens = u.OutputTokens
+		row.Credit = u.Credit
+		row.CreditKnown = u.CreditKnown
+		row.CachedTokens = u.CachedInputTokens
+		row.CacheKnown = u.CacheKnown
 		row.ToolCalls = len(result.Response.Message.ToolCalls)
 	}
 	row.ToolsDeclared = result.ToolsDeclared

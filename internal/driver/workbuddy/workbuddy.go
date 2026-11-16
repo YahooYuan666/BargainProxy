@@ -123,6 +123,20 @@ const (
 	// fault; the driver retries once with the prompt moved into the user turn
 	// (BP-93).
 	codeChannelRefused = 11128
+	// codeProviderOverloaded (BP-327, misakano c06cd51 + RobbsLuo d273491,
+	// 2026-11-14): "the model provider is temporarily unavailable" — the WHOLE
+	// vendor behind the model is overloaded, nothing to do with this account.
+	// Field evidence: one provider's overload hit six accounts inside fifteen
+	// minutes, so rotating accounts only burns them. Treated exactly like the
+	// queue signals (no rotation, no account penalty, wait once), but the
+	// client-facing wording must NOT say "queue is full": the useful escape
+	// hatch is switching MODELS, not waiting for a queue.
+	//
+	// Before this constant existed the code fell through classifyBusiness to
+	// ClassInternal, which is doubly wrong: pool.ApplyResult's default branch
+	// charges ConsecutiveFails to the account, and uperr.Rotatable says "try
+	// another account of this channel" — the exact action upstream punishes.
+	codeProviderOverloaded = 11134
 )
 
 // Driver implements driver.Driver for the workbuddy channel.
@@ -1335,6 +1349,17 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		// requests fail fast until the queue drains.
 		e := uperr.New(uperr.ClassUpstreamBusy, 429, "workbuddy: upstream queue busy: %s", msg)
 		e.Model = upstreamModel
+		return e
+	case codeProviderOverloaded:
+		// BP-327: same capacity family as the queue signals — no rotation, no
+		// account penalty — but a DIFFERENT cause (the vendor behind the model
+		// is down, not a queue moving slowly). The wording carries that, so the
+		// advice the client sees is "switch models", not "wait for the queue".
+		// Code is set so the renderer can pick the honest text.
+		e := uperr.New(uperr.ClassUpstreamBusy, 429,
+			"workbuddy: model provider temporarily overloaded: %s", msg)
+		e.Model = upstreamModel
+		e.Code = fmt.Sprint(code)
 		return e
 	case codeBadParams:
 		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: %s", msg)

@@ -36,6 +36,7 @@ package gateway
 
 import (
 	"strings"
+	"unicode/utf8"
 
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
@@ -45,11 +46,37 @@ import (
 // believes the task is already done and repeats its conclusion.
 const narrationNudge = "你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要道歉或解释。"
 
+// narrationPromiseNudge (BP-327, misakano 09189a5) — the tail is a PROMISE
+// ("我将…"/"我会…") rather than a lead-in. The nudge above must not be reused
+// there: it says "you stopped on a colon", which the model contradicts in its
+// own answer ("上一条并未中断" — a real field quote), and that argument ends up
+// in the client's transcript. A promise names an action, so the nudge asks for
+// the action, not for "the rest of the text".
+const narrationPromiseNudge = "你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，不要解释为什么停下，不要重复已经写过的内容，不要重新开头。"
+
 // narrationMaxBytes: a lead-in sentence measured 40~200B in the field;
 // beyond 400B a "stopped on a colon" tail is almost certainly normal
 // formatting (misakano 79ba3d62). Structurally open tails bypass this — see
 // narrationTailStructurallyOpen.
+//
+// BP-327 (misakano bd59564, issue #245): this gate applies ONLY to
+// punctuation-type tails. A tail that hangs on no punctuation at all
+// ("现在我确认完了，我将开始修改 check.go") is a CUT-OFF SENTENCE, and its
+// length says nothing about whether it was finished — those are the most
+// common shape in long sessions. Gating them by total length rescued nothing
+// upstream. See narrationTailPunctuated.
 const narrationMaxBytes = 400
+
+// narrationMaxRescues bounds one request's narration rescue segments. TWO, not
+// one (BP-327, misakano 09189a5): a long answer commonly announces twice
+// ("我先说明结论，然后我将开始修改…" then stops again), and a single rescue
+// hands the second announcement straight back to the client (issue #245). Total
+// spend is still bounded by the cumulative output cap.
+const narrationMaxRescues = 2
+
+// tailHangPunct is the punctuation set whose trailing position means "more
+// text must follow" — the punctuation-type suspensions.
+const tailHangPunct = "：:，,、—–…（(【["
 
 // userYieldMarkers: prose that hands the turn back to the user. The gate
 // must be independent of narrationTailSuspends — a question tail reads as
@@ -115,8 +142,46 @@ func toolCallMarkupState(text string) markupState {
 	return markupPartial
 }
 
+// yieldTailBytes bounds the window used to judge "hands the turn back to the
+// user" when the final sentence runs long.
+const yieldTailBytes = 200
+
+// yieldTail returns the window after the LAST sentence break.
+//
+// BP-327 (misakano 09189a5): handing the turn back is always a property of the
+// final sentence — wording in the middle, or even right before the tail, can be
+// technical narration. A real field sample ended with
+// "…为是否需要更换提供量化支撑。\n\n---\n\n我将开始修改 check.go", and the
+// whole-text Contains below refused to rescue it because of 「是否需要」 in the
+// middle. Judging by the last sentence both keeps the real ask (「…请确认后我再
+// 发送。」) and stops the false positive.
+func yieldTail(s string) string {
+	// Strip trailing sentence punctuation FIRST: a properly finished last
+	// sentence ("…请确认后我再发送。") would otherwise split at its own period
+	// and yield an empty tail — silently disabling the gate.
+	s = strings.TrimRight(s, "。！？!?\n ")
+	if i := strings.LastIndexAny(s, "。！？!?\n"); i >= 0 {
+		_, n := utf8.DecodeRuneInString(s[i:])
+		s = s[i+n:]
+	}
+	return lastRunes(strings.TrimSpace(s), yieldTailBytes)
+}
+
+// lastRunes keeps at most n bytes from the end of s, on a rune boundary.
+func lastRunes(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	cut := len(s) - n
+	for cut < len(s) && !utf8.RuneStart(s[cut]) {
+		cut++
+	}
+	return s[cut:]
+}
+
 // textYieldsToUser reports whether the prose hands the turn back to the user:
-// a question tail, or explicit "please confirm" wording (CN and EN).
+// a question tail, or explicit "please confirm" wording (CN and EN) in the
+// FINAL sentence.
 func textYieldsToUser(text string) bool {
 	t := strings.TrimSpace(text)
 	if t == "" {
@@ -125,12 +190,13 @@ func textYieldsToUser(text string) bool {
 	if strings.HasSuffix(t, "？") || strings.HasSuffix(t, "?") {
 		return true
 	}
+	tail := yieldTail(t)
 	for _, m := range userYieldMarkers {
-		if strings.Contains(t, m) {
+		if strings.Contains(tail, m) {
 			return true
 		}
 	}
-	low := strings.ToLower(t)
+	low := strings.ToLower(tail)
 	for _, m := range userYieldMarkersEN {
 		if strings.Contains(low, m) {
 			return true
@@ -172,7 +238,7 @@ func narrationTailSuspends(text string) bool {
 	}
 	rs := []rune(t)
 	last := rs[len(rs)-1]
-	if strings.ContainsRune("：:，,、—–…（(【[", last) {
+	if strings.ContainsRune(tailHangPunct, last) {
 		return true
 	}
 	// Sentence-final punctuation, closing brackets and '&' (RP clients end
@@ -181,6 +247,24 @@ func narrationTailSuspends(text string) bool {
 		return false
 	}
 	return true
+}
+
+// narrationTailPunctuated reports whether the tail hangs on a PUNCTUATION
+// mark — the suspension shape that the length gate is meant to constrain.
+//
+// BP-327 (misakano bd59564, issue #245): "notes + list:" is normal formatting,
+// and the longer the answer the more likely a colon ending is intentional, so
+// those tails must stay length-bounded. The OPPOSITE shape — a sentence cut
+// with no punctuation at all ("我现在确认完了，我将开始修改 check.go") — is a
+// broken sentence whose length says nothing; those are exactly the common case
+// in long sessions and must never be gated by size.
+func narrationTailPunctuated(text string) bool {
+	t := strings.TrimRight(text, " \t\r\n")
+	if t == "" {
+		return false
+	}
+	rs := []rune(t)
+	return strings.ContainsRune(tailHangPunct, rs[len(rs)-1])
 }
 
 // toolClassRequest reports whether the request is an AGENT turn: tools
@@ -201,12 +285,12 @@ func toolClassRequest(req *ir.ChatRequest) (declared, toolTurn bool) {
 }
 
 // stopRescuePlan decides whether a finished stop-turn earns ONE narration
-// rescue segment. tried is the once-per-request flag. Every gate is
-// fail-closed: when in doubt, the original answer stands (a misfire costs
-// one upstream call; a wrong "continue" can execute tools the model never
-// meant to run).
-func stopRescuePlan(channel string, req *ir.ChatRequest, ledger *streamLedger, resp *ir.ChatResponse, tried bool) (contReq *ir.ChatRequest, why string, ok bool) {
-	if channel != model.ChannelWorkBuddy || req == nil || resp == nil || ledger == nil || tried {
+// rescue segment. tries is how many rescues this request already spent
+// (bounded by narrationMaxRescues). Every gate is fail-closed: when in doubt,
+// the original answer stands (a misfire costs one upstream call; a wrong
+// "continue" can execute tools the model never meant to run).
+func stopRescuePlan(channel string, req *ir.ChatRequest, ledger *streamLedger, resp *ir.ChatResponse, tries int) (contReq *ir.ChatRequest, why string, ok bool) {
+	if channel != model.ChannelWorkBuddy || req == nil || resp == nil || ledger == nil || tries >= narrationMaxRescues {
 		return nil, "", false
 	}
 	if resp.StopReason != ir.StopEnd {
@@ -238,15 +322,25 @@ func stopRescuePlan(channel string, req *ir.ChatRequest, ledger *streamLedger, r
 	if textYieldsToUser(text) {
 		return nil, "", false
 	}
-	// Punctuation-type tails longer than a real lead-in are normal
-	// formatting, not a cut-off thought. Structurally open tails (unclosed
-	// fence, truncated marker) skip this gate — see above.
-	if !narrationTailStructurallyOpen(text) && len(text) > narrationMaxBytes {
+	// BP-327: the length gate constrains ONLY punctuation-type suspensions
+	// ("notes + list:" is normal formatting and gets longer as the answer
+	// does). A tail cut with no punctuation is a broken sentence — length is
+	// irrelevant, and those are the most common shape in long sessions, so
+	// gating them by size rescued nothing at all upstream (issue #245).
+	// Structurally open tails (unclosed fence, truncated marker) skip it too.
+	punctuated := narrationTailPunctuated(text)
+	if punctuated && !narrationTailStructurallyOpen(text) && len(text) > narrationMaxBytes {
 		return nil, "", false
 	}
 	if !narrationTailSuspends(text) {
 		return nil, "", false
 	}
-	return continuationRequestNudge(req, ledger, narrationNudge),
-		"the answer stopped on a lead-in sentence", true
+	// Promise tails ("我将…"/"我会…") get their own nudge: the lead-in nudge
+	// claims they stopped on a colon, which they did not, and the model answers
+	// by arguing the point into the client's transcript (BP-327, 09189a5).
+	nudge, why := narrationNudge, "the answer stopped on a lead-in sentence"
+	if !punctuated {
+		nudge, why = narrationPromiseNudge, "the answer stopped on a promise sentence"
+	}
+	return continuationRequestNudge(req, ledger, nudge), why, true
 }

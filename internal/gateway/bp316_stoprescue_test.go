@@ -66,7 +66,10 @@ func TestBP302NarrationRescueSplices(t *testing.T) {
 			if len(msgs) < 2 || ir.TextOf(msgs[len(msgs)-2].Content) != "先看路由表：" {
 				t.Errorf("rescue must replay the seen text as an assistant turn, got %v", msgs[len(msgs)-2])
 			}
-			return []ir.StreamEvent{{Kind: ir.EvText, Delta: "下一步重启网卡"}, {Kind: ir.EvDone, Stop: ir.StopEnd}},
+			// BP-327: the rescue text ends on a finished sentence so the
+			// second rescue segment (now allowed) does not fire — this case
+			// is about the splice, not about chaining.
+			return []ir.StreamEvent{{Kind: ir.EvText, Delta: "下一步重启网卡。"}, {Kind: ir.EvDone, Stop: ir.StopEnd}},
 				&ir.ChatResponse{StopReason: ir.StopEnd}, nil
 		},
 	}}
@@ -74,7 +77,7 @@ func TestBP302NarrationRescueSplices(t *testing.T) {
 	if !strings.Contains(rescueNudge, "预告") {
 		t.Fatalf("rescue nudge must name the lead-in, got %q", rescueNudge)
 	}
-	if res.text.String() != "先看路由表：下一步重启网卡" {
+	if res.text.String() != "先看路由表：下一步重启网卡。" {
 		t.Fatalf("client text = %q, want spliced rescue", res.text.String())
 	}
 	if resp.StopReason != ir.StopEnd || res.dones != 1 {
@@ -164,7 +167,9 @@ func TestBP316NarrationLengthGate(t *testing.T) {
 	drv2 := &lcFake{steps: []func(n int, call driver.ChatCall) ([]ir.StreamEvent, *ir.ChatResponse, error){
 		stopStep(fenced, 0),
 		func(n int, call driver.ChatCall) ([]ir.StreamEvent, *ir.ChatResponse, error) {
-			return []ir.StreamEvent{{Kind: ir.EvText, Delta: "……剩余代码"}, {Kind: ir.EvDone, Stop: ir.StopEnd}},
+			// BP-327: closes the fence and the turn, so the second rescue
+			// segment (now allowed) has nothing to judge.
+			return []ir.StreamEvent{{Kind: ir.EvText, Delta: "……剩余代码\n```\n以上。"}, {Kind: ir.EvDone, Stop: ir.StopEnd}},
 				&ir.ChatResponse{StopReason: ir.StopEnd}, nil
 		},
 	}}
@@ -210,7 +215,9 @@ func TestBP316MarkupStates(t *testing.T) {
 	drv2 := &lcFake{steps: []func(n int, call driver.ChatCall) ([]ir.StreamEvent, *ir.ChatResponse, error){
 		stopStep("执行 pwsh -c 即可。</｜｜DSML｜｜ parameter>", 0),
 		func(n int, call driver.ChatCall) ([]ir.StreamEvent, *ir.ChatResponse, error) {
-			return []ir.StreamEvent{{Kind: ir.EvText, Delta: " 下行 400-600 Mbps 稳定。"}, {Kind: ir.EvDone, Stop: ir.StopEnd}},
+			// BP-327: completes the marker and the sentence, so the second
+			// rescue segment (now allowed) does not fire.
+			return []ir.StreamEvent{{Kind: ir.EvText, Delta: " 下行 400-600 Mbps 稳定。</｜｜DSML｜｜ calls>"}, {Kind: ir.EvDone, Stop: ir.StopEnd}},
 				&ir.ChatResponse{StopReason: ir.StopEnd}, nil
 		},
 	}}
