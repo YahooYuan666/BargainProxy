@@ -2,7 +2,6 @@
 setlocal enabledelayedexpansion
 rem Start the project-local portable PostgreSQL. Data: .tools\pgdata
 rem Listens on 127.0.0.1:55432 only. No system installation involved.
-setlocal
 set "ROOT=%~dp0..\.."
 pushd "%ROOT%"
 
@@ -18,8 +17,17 @@ if not exist "%PGDATA%\PG_VERSION" (
   if errorlevel 1 goto failed
 )
 
+rem 防御性兜底：确保 PGDATA 下的标准空子目录齐全（从其他设备拷贝、解压或 Git 检出时常丢失空目录，导致 pg_ctl 报 FATAL: could not open directory）
+for %%d in (pg_commit_ts pg_dynshmem pg_logical\mappings pg_logical\snapshots pg_notify pg_replslot pg_serial pg_snapshots pg_stat pg_stat_tmp pg_tblspc pg_twophase pg_wal\archive_status) do (
+  if not exist "%PGDATA%\%%d" mkdir "%PGDATA%\%%d" >nul 2>&1
+)
+
 "%PGBIN%\pg_ctl.exe" -D "%PGDATA%" status >nul 2>&1
-if errorlevel 1 (
+if not errorlevel 1 (
+  echo [pg] already running on 127.0.0.1:55432
+  goto pg_ready
+)
+
 rem A just-stopped server keeps its data directory locked for a few seconds
 rem after the port closes. Starting in that window makes pg_ctl wait about
 rem 30s and then fail (observed 2026-10-22: the first start-all after a stop
@@ -32,9 +40,15 @@ rem the first line (observed 2026-10-22 when double-clicking start-all).
 set /a waits=0
 :waitold
 set "OLDPID="
-if exist "%PGDATA%\postmaster.pid" set /p OLDPID=<"%PGDATA%\postmaster.pid"
+if exist "%PGDATA%\postmaster.pid" (
+  for /f "usebackq" %%a in ("%PGDATA%\postmaster.pid") do (
+    set "OLDPID=%%a"
+    goto checkpid
+  )
+)
+:checkpid
 if not defined OLDPID goto startdb
-tasklist /FI "PID eq !OLDPID!" | findstr /C:" !OLDPID! " >nul
+tasklist /FI "PID eq !OLDPID!" 2>nul | findstr /C:" !OLDPID! " >nul
 if not errorlevel 1 (
   set /a waits+=1
   if !waits! lss 20 (ping -n 2 127.0.0.1 >nul & goto waitold)
@@ -47,9 +61,8 @@ rem pg_ctl can also fail while the server did come up; the port decides.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%\scripts\pg\port-ready.ps1"
 if errorlevel 1 goto failed
 echo [pg] started on 127.0.0.1:55432
-) else (
-  echo [pg] already running on 127.0.0.1:55432
-)
+
+:pg_ready
 
 rem The application database is created by the gateway itself on first run
 rem (store.EnsureDatabase), so this step needs no Go toolchain - boot autostart
