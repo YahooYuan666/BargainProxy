@@ -19,7 +19,15 @@ pushd "%ROOT%"
 
 where go >nul 2>nul
 if errorlevel 1 (
-  echo [error] Go not found in PATH. Install Go, or build elsewhere and copy bargainproxy.exe in.
+  rem 防御性适配：当本机无 Go 环境（如轻量客户端或异机部署）但已有构建产物时，复用既有二进制放行启动
+  if exist "%ROOT%\bargainproxy.exe" (
+    echo [warn] Go not found in PATH; skipping rebuild and using existing bargainproxy.exe
+    popd
+    endlocal
+    exit /b 0
+  )
+  echo [error] Go not found in PATH and bargainproxy.exe missing.
+  echo [error] Install Go, or build elsewhere and copy bargainproxy.exe in.
   popd
   endlocal
   exit /b 1
