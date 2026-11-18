@@ -386,6 +386,11 @@ func (p *Postgres) UpsertTaskRun(t *model.TaskRun) error {
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
         ON CONFLICT (account_id, task_type, run_date) DO UPDATE SET
             status = EXCLUDED.status, detail = EXCLUDED.detail, credits = EXCLUDED.credits,
+            -- BP-329: started_at must move with the attempt that produced the
+            -- row. Leaving it behind spliced a failed 00:15 run and a
+            -- successful 04:37 rerun into one row the panel rendered as a
+            -- 4h22m execution (2026-11-18, workbuddy global activity).
+            started_at = EXCLUDED.started_at,
             finished_at = EXCLUDED.finished_at`,
 		t.AccountID, t.TaskType, t.RunDate, t.Status, t.Detail, t.Credits, t.StartedAt, t.FinishedAt)
 	return err

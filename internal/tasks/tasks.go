@@ -128,13 +128,19 @@ type Scheduler struct {
 	// Persisted in settings so a restart inside the same slot does not re-run
 	// a slot that already fired; a missed slot (sleep, delayed tick) still
 	// runs late exactly once.
-	fired     map[string]string
-	stop      chan struct{}
-	startOnce sync.Once
-	stopOnce  sync.Once
-	loopWG    sync.WaitGroup
-	ctx       context.Context
-	cancel    context.CancelFunc
+	fired map[string]string
+	// runningTask: taskType -> a scheduled run of it is in flight (BP-328).
+	// The tick and the runs are decoupled now, so this is what stops a slow
+	// probe round from being started on top of itself.
+	runningTask map[string]bool
+	stop        chan struct{}
+	startOnce   sync.Once
+	stopOnce    sync.Once
+	loopWG      sync.WaitGroup
+	// bgWG tracks the dispatched task goroutines so Stop can wait for them.
+	bgWG   sync.WaitGroup
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 // New builds the scheduler.
@@ -640,8 +646,14 @@ func (s *Scheduler) Start() {
 	})
 }
 
-// Stop terminates the loop.
-func (s *Scheduler) Stop() { s.stopOnce.Do(func() { s.cancel(); close(s.stop) }); s.loopWG.Wait() }
+// Stop terminates the loop. Dispatched task goroutines are waited for too:
+// their own contexts are children of s.ctx, so cancelling first lets them
+// unwind instead of writing a ledger row after the store is closed.
+func (s *Scheduler) Stop() {
+	s.stopOnce.Do(func() { s.cancel(); close(s.stop) })
+	s.loopWG.Wait()
+	s.bgWG.Wait()
+}
 
 func (s *Scheduler) loop() {
 	ticker := time.NewTicker(1 * time.Minute)
@@ -820,16 +832,76 @@ func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
 
 // runScheduled executes a timer-driven task unless its switch is off (manual
 // panel runs are never gated). Returns true when the gate let it through.
+//
+// BP-328: the dispatch is asynchronous. Everything in the loop used to run
+// inline, so probe_all — 30–60 minutes per round, every qoder/lobster/
+// antigravity account burning its RPC timeout inside a 5-minute spread window
+// — starved every daily slot behind it: activity configured for 03:25 was
+// recorded at 04:25, the 01:05 check-in at 02:05 (audit 2026-11-19). dueSlot's
+// catch-up kept the tasks from being lost, but an hour of drift moved them into
+// a different traffic window, and on 2026-11-17 that window was the workbuddy
+// .ai outage.
+//
+// markFired stays synchronous (see loop): a slot that has been claimed must not
+// be claimed twice just because the run is still in flight.
 func (s *Scheduler) runScheduled(taskType string, now time.Time) bool {
+	return s.dispatchIfEnabled(taskType, func() { s.runTaskOnce(taskType, now) })
+}
+
+// dispatchIfEnabled applies the timer switch and then hands the work to a
+// background goroutine, guarded by the per-task in-flight gate.
+func (s *Scheduler) dispatchIfEnabled(taskType string, fn func()) bool {
 	if !s.TaskEnabled(taskType) {
 		return false
 	}
-	s.runDaily(taskType, now)
+	s.dispatch(taskType, fn)
 	return true
+}
+
+// dispatch runs fn in its own goroutine unless this task type is already in
+// flight. A still-running task is skipped with a log line rather than queued:
+// a second probe round started on top of a slow one only doubles the upstream
+// traffic that caused the delay.
+func (s *Scheduler) dispatch(taskType string, fn func()) {
+	s.mu.Lock()
+	if s.runningTask[taskType] {
+		s.mu.Unlock()
+		s.log.Printf("task %s: skipped — the previous run is still in flight", taskType)
+		return
+	}
+	if s.runningTask == nil {
+		s.runningTask = map[string]bool{}
+	}
+	s.runningTask[taskType] = true
+	s.mu.Unlock()
+
+	s.bgWG.Add(1)
+	safego.Go("tasks.dispatch:"+taskType, func() {
+		defer s.bgWG.Done()
+		defer func() {
+			s.mu.Lock()
+			delete(s.runningTask, taskType)
+			s.mu.Unlock()
+		}()
+		fn()
+	})
+}
+
+// isRunning reports whether a scheduled run of this task type is in flight.
+func (s *Scheduler) isRunning(taskType string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.runningTask[taskType]
 }
 
 // runDaily executes a daily task once, guarded by the run ledger.
 func (s *Scheduler) runDaily(taskType string, now time.Time) {
+	s.runTaskOnce(taskType, now)
+}
+
+// runTaskOnce is the body of one scheduled run: its own 30-minute budget, and
+// one log line with the outcome.
+func (s *Scheduler) runTaskOnce(taskType string, now time.Time) {
 	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Minute)
 	defer cancel()
 	detail, err := s.RunTask(ctx, taskType, "")
@@ -1378,8 +1450,11 @@ func (s *Scheduler) activityWorkBuddy(ctx context.Context, acc *model.Account) (
 	if !ok {
 		return "", fmt.Errorf("workbuddy driver not installed")
 	}
-	cid := fmt.Sprintf("bp-activity-%d", time.Now().UnixMilli())
-	if err := drv.ReportChatActivity(ctx, acc, cid, "", "", ""); err != nil {
+	attempts, err := s.reportActivityWithRetry(ctx, drv, acc)
+	if err != nil {
+		if attempts > 1 {
+			return fmt.Sprintf("activity report failed after %d attempts: %v", attempts, err), err
+		}
 		return "activity report failed: " + err.Error(), err
 	}
 	note := "activity reported"
@@ -1391,7 +1466,85 @@ func (s *Scheduler) activityWorkBuddy(ctx context.Context, acc *model.Account) (
 	} else {
 		note += fmt.Sprintf(", streak %dd", days)
 	}
+	// BP-330: a recovered hiccup is worth a line in the ledger — it is the
+	// only trace that the .ai host wobbled again.
+	if attempts > 1 {
+		note += fmt.Sprintf(" (after %d attempts)", attempts)
+	}
 	return note, nil
+}
+
+// reportActivityWithRetry sends the daily activity report, retrying the
+// failures that are worth retrying.
+//
+// BP-330 (field evidence 2026-11-17 04:30–04:39): four international accounts
+// failed back-to-back with `Post "https://www.workbuddy.ai/v2/report": EOF`
+// after 5.01–5.03s each. The report runs once per slot, the streak is per
+// calendar day and cannot be backfilled, so ONE five-second network hiccup
+// cost the day — and with the machine asleep through the next two slots it
+// cost the day outright. The CN accounts on workbuddy.cn reported fine in the
+// same minutes: the .ai host was flaky, nothing about the accounts.
+//
+// Retried: ClassTransport (reset connections, mid-response EOF, 5xx) and
+// ClassUpstreamTimeout (the host accepted then stalled). Both are properties
+// of the moment; the same request usually works seconds later.
+//
+// Deliberately NOT retried, because a second attempt makes things worse:
+//   - ClassAuth: the credential is dead; workBuddyWithAuthRetry already
+//     handles it by refreshing once around this whole task.
+//   - ClassSoftRate / ClassModelRate / ClassHardCredit / ClassQuotaExhausted:
+//     the vendor's own limit. Hammering it deepens the risk control.
+//   - ClassBadRequest / ClassContentBlocked / ClassNotFound / ClassEdgeBlock:
+//     the request or the route is wrong; repeating it cannot help.
+//
+// Returns the number of attempts made, so the ledger can tell "one blip" from
+// "the host is gone".
+func (s *Scheduler) reportActivityWithRetry(ctx context.Context, drv *workbuddy.Driver, acc *model.Account) (int, error) {
+	// Backoff between attempts. Short on purpose: this runs inside a daily
+	// slot whose own context is 30 minutes, and the failure being papered over
+	// is a seconds-long wobble, not an outage.
+	backoff := []time.Duration{time.Second, 3 * time.Second}
+	attempts := 0
+	var lastErr error
+	for i := 0; i <= len(backoff); i++ {
+		attempts++
+		// A fresh conversation id per attempt: the event must look like a real
+		// send each time, not a replay of the same conversation.
+		cid := fmt.Sprintf("bp-activity-%d-%d", time.Now().UnixMilli(), i)
+		lastErr = drv.ReportChatActivity(ctx, acc, cid, "", "", "")
+		if lastErr == nil {
+			return attempts, nil
+		}
+		if !retryableActivityReport(lastErr) {
+			return attempts, lastErr
+		}
+		if i == len(backoff) {
+			break
+		}
+		s.log.Printf("activity %s: report attempt %d failed (%v), retrying in %s", label(acc), attempts, lastErr, backoff[i])
+		select {
+		case <-ctx.Done():
+			return attempts, lastErr
+		case <-time.After(backoff[i]):
+		}
+	}
+	return attempts, lastErr
+}
+
+// retryableActivityReport reports whether an activity-report failure is a
+// transient one. Anything not positively identified as transient is not
+// retried: the default must be "don't hammer the upstream".
+func retryableActivityReport(err error) bool {
+	ue, ok := uperr.As(err)
+	if !ok {
+		return false
+	}
+	switch ue.Class {
+	case uperr.ClassTransport, uperr.ClassUpstreamTimeout:
+		return true
+	default:
+		return false
+	}
 }
 
 // travelWorkBuddy runs one cat-travel patrol step (ticket 26, agentpoints
