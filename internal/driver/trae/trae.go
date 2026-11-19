@@ -425,7 +425,9 @@ func (d *Driver) chatOnce(ctx context.Context, creds *Creds, body []byte, call d
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+		ue := classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	// A 200 whose content-type is JSON (not event-stream) is an error in a
 	// 200: classify the business error it carries instead of feeding JSON

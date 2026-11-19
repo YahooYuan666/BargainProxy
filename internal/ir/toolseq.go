@@ -10,17 +10,22 @@ package ir
 //
 // Two forms are merged, both strictly bounded so semantics never change:
 //
-//	Form 1 (forward): this message is an assistant with tool_calls and EMPTY
-//	  content, the previous kept message is an assistant with tool_calls →
-//	  its calls are appended to the previous one.
+//	Form 1 (forward): this message is an assistant with tool_calls, the
+//	  previous kept message is an assistant with tool_calls → its calls are
+//	  appended to the previous one. BP-331 (hub niyouqianma PR#3, 2c497cba):
+//	  the fragment may also carry text — Codex replays one parallel batch as
+//	  "reasoning text + calls" then "comment text + calls", and refusing to
+//	  merge text-bearing fragments left the split batch in the wire shape the
+//	  upstream answers 11148 to. The text rides along (ContentPart append);
+//	  nothing is dropped.
 //	Form 2 (reverse): this message is a text-only assistant (no tool_calls),
 //	  the previous kept message is an assistant with tool_calls and EMPTY
 //	  content → the text is folded into the previous one.
 //
-// Anything else (non-adjacent, non-empty content, tool/system/user in
-// between) is left as-is: guessing would change meaning. Returns the
-// (possibly shorter) message list and whether anything changed; when nothing
-// changed the original slice is returned unchanged.
+// Anything else (non-adjacent, tool/system/user in between) is left as-is:
+// guessing would change meaning. Returns the (possibly shorter) message list
+// and whether anything changed; when nothing changed the original slice is
+// returned unchanged.
 func MergeAdjacentToolCalls(messages []Message) ([]Message, bool) {
 	if len(messages) < 2 {
 		return messages, false
@@ -31,9 +36,14 @@ func MergeAdjacentToolCalls(messages []Message) ([]Message, bool) {
 		if m.Role == RoleAssistant && len(out) > 0 {
 			prev := &out[len(out)-1]
 			if prev.Role == RoleAssistant && len(prev.ToolCalls) > 0 {
-				// Form 1: call-only fragment joins the previous batch.
-				if len(m.ToolCalls) > 0 && emptyContent(m.Content) {
+				// Form 1: call fragment joins the previous batch, text riding
+				// along (BP-331: empty content is the common shape, but a
+				// text-bearing fragment of the same batch merges too).
+				if len(m.ToolCalls) > 0 {
 					prev.ToolCalls = append(prev.ToolCalls, m.ToolCalls...)
+					if len(m.Content) > 0 {
+						prev.Content = append(prev.Content, m.Content...)
+					}
 					changed = true
 					continue
 				}

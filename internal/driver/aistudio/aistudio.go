@@ -437,7 +437,9 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
-		return nil, classifyHTTP(resp.StatusCode, string(body), call.UpstreamModel)
+		ue := classifyHTTP(resp.StatusCode, string(body), call.UpstreamModel)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 
 	out := &ir.ChatResponse{Model: call.UpstreamModel}

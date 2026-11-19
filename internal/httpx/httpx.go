@@ -13,11 +13,13 @@ package httpx
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -87,6 +89,70 @@ func RPCClient() *http.Client {
 	return &http.Client{Timeout: RPCTimeout()}
 }
 
+// h1Transport clones the default transport with HTTP/2 disabled.
+//
+// BP-331 (CLIProxyAPI d0c90bb5): an h2 connection to slow Google endpoints is
+// what produced the BP-256 field hang (`http2: timeout awaiting response
+// headers`, 6m40s). The pinning was wired for antigravity and REVERTED within
+// minutes: through the local Mihomo TUN egress the antigravity quota probes
+// answered `malformed HTTP response … http2_handshake_failed` on every call —
+// in THIS network environment those endpoints need h2, and the hang class
+// stays handled by the host deadline. The helpers stay available (and tested)
+// for an endpoint family that actually accepts h1; nothing wires them.
+// An empty non-nil TLSNextProto is the documented way to keep the transport
+// from registering its h2 upgrade; ForceAttemptHTTP2=false backs it up.
+func h1Transport() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ForceAttemptHTTP2 = false
+	tr.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	return tr
+}
+
+// ChatClientH1 is ChatClient pinned to HTTP/1.1 (see h1Transport).
+func ChatClientH1() *http.Client {
+	tr := h1Transport()
+	tr.ResponseHeaderTimeout = HeaderTimeout()
+	return &http.Client{Transport: tr}
+}
+
+// RPCClientH1 is RPCClient pinned to HTTP/1.1 (see h1Transport).
+func RPCClientH1() *http.Client {
+	return &http.Client{Timeout: RPCTimeout(), Transport: h1Transport()}
+}
+
+// ApplyRetryAfter attaches the response's Retry-After header to a classified
+// upstream error as its reset moment.
+//
+// BP-331 (CLIProxyAPI deacbf21): the body-parse paths (qoder retryAfterSeconds,
+// workbuddy data.retry_after, antigravity QuotaFailure) each carry their own
+// reset signal, but a bare header 429/503 used to fall through to the account's
+// backoff ladder even when the upstream stated exactly when to come back. The
+// pool already consumes Error.ResetAt for both classes (pool.go soft-rate
+// branch), so this only fills it in. Applies ONLY when the class benefits and
+// nothing more precise was already parsed from the body.
+func ApplyRetryAfter(e *uperr.Error, h http.Header) {
+	if e == nil || h == nil {
+		return
+	}
+	if e.Class != uperr.ClassSoftRate && e.Class != uperr.ClassUpstreamBusy {
+		return
+	}
+	if !e.ResetAt.IsZero() {
+		return
+	}
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		e.ResetAt = time.Now().Add(time.Duration(secs) * time.Second)
+		return
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		e.ResetAt = t
+	}
+}
+
 // ClassifyTransportErr maps a client.Do / stream-read failure to an uperr
 // class:
 //
@@ -126,7 +192,12 @@ var persistentTransportMarkers = []string{
 	"no route to host",              // routing table / wrong gateway
 	"network is unreachable",        // adapter down / no default route
 	"connection refused",            // nothing listening (dead local relay)
-	"authentication failed",         // egress auth in general
+	// BP-331 (magpie 6ac19f4b): Windows WSAECONNREFUSED spells "No connection
+	// could be made because the target machine ACTIVELY REFUSED it" — no
+	// "connection refused" substring anywhere. This host IS Windows, so a dead
+	// local relay used to fall through to the transient-bucket retry ladder.
+	"actively refused",      // Windows wording of the same refusal
+	"authentication failed", // egress auth in general
 }
 
 // IsPersistentTransportErr reports whether a transport error is of the kind

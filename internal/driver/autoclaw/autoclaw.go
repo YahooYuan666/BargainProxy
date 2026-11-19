@@ -894,7 +894,9 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		ue := classifyHTTP(resp.StatusCode, raw)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer streamBody.Close()
@@ -921,7 +923,9 @@ func (d *Driver) chatProxy(ctx context.Context, cr *Creds, body []byte, modelID 
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		ue := classifyHTTP(resp.StatusCode, raw)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	return resp, nil
 }
@@ -962,7 +966,9 @@ func (d *Driver) chatSandbox(ctx context.Context, acc *model.Account, cr *Creds,
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		ue := classifyHTTP(resp.StatusCode, raw)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	return resp, nil
 }

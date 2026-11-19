@@ -50,16 +50,21 @@ func TestMergeAdjacentToolCallsReverse(t *testing.T) {
 	}
 }
 
-// TestMergeAdjacentToolCallsGuards 条件从严：隔消息/有正文/非 assistant
-// 相邻都不得合并（不猜语义），且对已合并结果幂等。
+// TestMergeAdjacentToolCallsGuards 条件从严：隔消息/非 assistant 相邻都不得
+// 合并（不猜语义），且对已合并结果幂等。BP-331 更新：带正文的片段现在并入
+// 且正文随带（hub PR#3——Codex 把并行批拆成带文本的段，旧口径留下 11148 的
+// wire 形），所以「有正文不合并」的旧断言改为断言正文随带、绝不静默丢弃。
 func TestMergeAdjacentToolCallsGuards(t *testing.T) {
-	// 有正文的 assistant 不并入上一条。
 	msgs := []Message{
 		{Role: RoleAssistant, ToolCalls: []ToolCall{call("c1")}},
 		{Role: RoleAssistant, Content: txt("text"), ToolCalls: []ToolCall{call("c2")}},
 	}
-	if out, changed := MergeAdjacentToolCalls(msgs); changed || len(out) != 2 {
-		t.Fatalf("non-empty content must not merge: changed=%v len=%d", changed, len(out))
+	out, changed := MergeAdjacentToolCalls(msgs)
+	if !changed || len(out) != 1 || len(out[0].ToolCalls) != 2 {
+		t.Fatalf("text-bearing fragment must merge (BP-331): changed=%v len=%d", changed, len(out))
+	}
+	if len(out[0].Content) != 1 || out[0].Content[0].Text != "text" {
+		t.Fatalf("the fragment's text must ride along: %v", out[0].Content)
 	}
 	// 隔着 user 消息不合并。
 	msgs = []Message{

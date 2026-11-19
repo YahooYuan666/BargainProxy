@@ -438,7 +438,9 @@ func (d *Driver) apiGet(ctx context.Context, path, token string) (map[string]any
 	defer resp.Body.Close()
 	raw, _ := readLimited(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		ue := classifyHTTP(resp.StatusCode, raw)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	var env envelope
 	if err := json.Unmarshal(raw, &env); err != nil {

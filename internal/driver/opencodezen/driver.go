@@ -491,7 +491,9 @@ func (d *Driver) chatOnce(ctx context.Context, wire []byte, emit driver.Emit) (*
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		d.dumpWireOnFailure(wire, resp.StatusCode)
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		ue := classifyHTTP(resp.StatusCode, raw)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	stream := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer stream.Close()
@@ -881,7 +883,9 @@ func (d *Driver) responsesOnce(ctx context.Context, wire []byte, emit driver.Emi
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		d.dumpWireOnFailure(wire, resp.StatusCode)
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		ue := classifyHTTP(resp.StatusCode, raw)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	stream := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
 	defer stream.Close()

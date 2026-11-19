@@ -82,6 +82,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		e := classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+		httpx.ApplyRetryAfter(e, resp.Header)
 		return nil, e
 	}
 	streamBody := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())

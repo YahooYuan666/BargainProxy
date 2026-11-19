@@ -610,6 +610,13 @@ func convertIncomingMessage(message map[string]interface{}, toolsEnabled, allowS
 		if parseToolCallsText(content) != nil {
 			content = ""
 		}
+		// BP-331 (plugins 2b5e7d66, qoder 0.2.69): Kimi on this lane rejects
+		// a call-only assistant turn whose content is null OR EMPTY — one
+		// space passes (workbuddy chat lane same fill, plugins #1213). The
+		// call-only shape arrives here with an empty text.
+		if content == "" {
+			content = " "
+		}
 		msg := buildStructuredMessage("assistant", content)
 		msg.ToolCalls = structuredToolCalls
 		applyReasoning(message, &msg)

@@ -383,6 +383,7 @@ func (d *Driver) streamOnce(ctx context.Context, rt *runtime, call driver.ChatCa
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		ue := classifyQoder(resp.StatusCode, string(raw))
+		httpx.ApplyRetryAfter(ue, resp.Header)
 		// BP-304 (plugins qoder 0.2.64 #880): `400 unknown or disabled model`
 		// on a listing-disabled key with the credits spent is the account's
 		// daily quota, not a bad request — recast so the pool rests instead

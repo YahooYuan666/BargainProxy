@@ -1471,7 +1471,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		// longer served; its field harm — pushing finished ZCode turns into
 		// extra tool calls — is sess_1d74dbe9) and added the field gates around
 		// narration. See stoprescue.go for every gate.
-		for stopRescueTried < narrationMaxRescues {
+		for stopRescueTried < narrationMaxRescues && !g.cfg.NarrationRescueDisabled {
 			scReq, why, ok := stopRescuePlan(binding.Channel, req, ledger, resp, stopRescueTried)
 			if !ok {
 				break
@@ -1479,6 +1479,7 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			stopRescueTried++
 			log.Printf("gateway: %s turn ended stop but looks unfinished (%s) — narration rescue segment %d/%d on the same account",
 				binding.Channel, why, stopRescueTried, narrationMaxRescues)
+			lenBefore := ledger.text.Len()
 			rescResp, rerr := drv.Stream(actx, driver.ChatCall{
 				Account: lease.Account, UpstreamModel: binding.UpstreamModel,
 				Request: scReq,
@@ -1494,6 +1495,16 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			// A failed or empty rescue has nothing more to judge; stop here
 			// rather than re-deciding on the same text.
 			if rerr != nil || rescResp == nil {
+				break
+			}
+			// BP-331 (misakano 6c508881): a rescue segment that produced NO new
+			// text leaves the request body identical — sending it again only
+			// pays another full-context bill for the same answer. (The ack
+			// exit —「已完成」/done — is judged inside stopRescuePlan, so it
+			// gates the FIRST attempt too.)
+			if ledger.text.Len() == lenBefore {
+				log.Printf("gateway: %s narration rescue segment %d produced no new text — not rescuing again",
+					binding.Channel, stopRescueTried)
 				break
 			}
 		}

@@ -44,15 +44,27 @@ import (
 
 // narrationNudge (misakano c2003af) — must NAME the lead-in, or the model
 // believes the task is already done and repeats its conclusion.
-const narrationNudge = "你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要道歉或解释。"
+//
+// BP-331 (misakano 85179d43, issue #273 second comment): the instruction
+// rides the conversation as a role=user message, and AGENT clients cannot
+// tell it from real user input — upstream field: one was taken for user
+// approval and ran tools unattended for 9 minutes, invisible in the client's
+// history. Every nudge therefore opens with a self-identifying prefix, and
+// closes with an explicit exit ("if you actually already finished, output
+// NOTHING") so a false positive does not grow a self-defense paragraph into
+// the transcript (misakano f8d83465: the model's own field quote「上一条回复
+// 并未中断…」). The exit demands ZERO output, not "one word" — content deltas
+// stream straight through, so even「已完成」would have landed in the client
+// text (issue #273 phenomenon 3, byte-verified).
+const narrationNudge = "【BargainProxy 网关自动续写·非用户消息】你上一条回复停在一句预告（例如以冒号结尾的「……：」）上就结束了，剩余内容还没写。请紧接着把剩下的部分写完：需要查看文件、执行命令或调用工具就直接调用，不要重复已经写过的内容，不要重新开头，不要道歉或解释。如果你确实已经写完了，什么都不要输出，直接结束这一轮。"
 
 // narrationPromiseNudge (BP-327, misakano 09189a5) — the tail is a PROMISE
 // ("我将…"/"我会…") rather than a lead-in. The nudge above must not be reused
 // there: it says "you stopped on a colon", which the model contradicts in its
 // own answer ("上一条并未中断" — a real field quote), and that argument ends up
 // in the client's transcript. A promise names an action, so the nudge asks for
-// the action, not for "the rest of the text".
-const narrationPromiseNudge = "你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，不要解释为什么停下，不要重复已经写过的内容，不要重新开头。"
+// the action, not for "the rest of the text". Same prefix and exit as above.
+const narrationPromiseNudge = "【BargainProxy 网关自动续写·非用户消息】你上一条回复最后停在「我将…」「我会…」这类承诺句上就结束了，承诺的动作没有执行。请直接执行它：需要查看文件、执行命令或调用工具就直接调用，不要解释为什么停下，不要重复已经写过的内容，不要重新开头。如果你确实已经写完了，什么都不要输出，直接结束这一轮。"
 
 // narrationMaxBytes: a lead-in sentence measured 40~200B in the field;
 // beyond 400B a "stopped on a colon" tail is almost certainly normal
@@ -78,18 +90,43 @@ const narrationMaxRescues = 2
 // text must follow" — the punctuation-type suspensions.
 const tailHangPunct = "：:，,、—–…（(【["
 
-// userYieldMarkers: prose that hands the turn back to the user. The gate
-// must be independent of narrationTailSuspends — a question tail reads as
-// sentence-final there, but it is the model ASKING, not stopping mid-thought.
+// userYieldMarkers (strong): direct ask-to-user wording. BP-331 (misakano
+// 89c84fb3, PR #261 — the #209 regression fix that supersedes BP-327's
+// last-sentence window): a confirm request is usually followed by the DRAFT
+// ITSELF ("请确认后我再发送。\n\n收件人：…\n主题：…"), so a tail-only window
+// reads the draft as the final sentence, misses the ask, and the rescue
+// fires — the exact shape that once sent a draft email to the whole staff.
+// Strong wording matches ANYWHERE in the text.
 var userYieldMarkers = []string{
-	"请确认", "确认后", "等你确认", "待你确认", "等你回复",
-	"是否需要", "需不需要", "要不要我", "要不要", "你希望", "请告知",
-	"让我知道", "请你确认", "你确认后", "确认无误", "可以吗", "行吗", "好吗",
+	"请确认", "请你确认", "你确认后", "等你确认", "待你确认", "等你回复", "让我知道",
+	"please confirm", "let me know",
 }
 
-var userYieldMarkersEN = []string{
-	"please confirm", "let me know", "should i ", "do you want", "would you like",
-	"awaiting your", "waiting for your", "confirm before", "shall i ",
+// userYieldDeliberation (weak): wording that CAN ask the user but is just as
+// common in technical narration (misakano field sample: a 4083-char answer
+// stopped on 「我将开始修改 internal/verify/check.go」 and matched
+// 「为“是否需要更换”提供量化支撑」 three thousand chars earlier — the shape
+// BP-327's whole-text Contains blocked on). Judged by POSITION only, three
+// positions (misakano 6cd32a7d): the final sentence; the trailing question
+// when only punctuation-less draft lines follow it; directly followed by
+// 我/你 (「确认后我再发送」).
+var userYieldDeliberation = []string{
+	"是否需要", "需不需要", "要不要", "确认后", "确认无误", "请告知", "你希望",
+	"可以吗", "行吗", "好吗",
+	"should i ", "shall i ", "do you want", "would you like",
+	"awaiting your", "waiting for your", "confirm before",
+}
+
+// narrationPromiseWords: first-person next-action wording in the tail — the
+// only unpunctuated long suspensions worth rescuing (BP-331, misakano
+// bb8a9536 + 75653945: a roleplay client's "一两句 + ||| 分条 + <face:…> 收尾、
+// 通篇不写句号" is neither a punctuation hover nor a promise, and every
+// normal reply used to be continued — 87 times a day, each billed at
+// 0.2→8.58 credits).
+var narrationPromiseWords = []string{
+	"我将", "我会", "我来", "我去", "我要", "我打算", "我准备", "我继续",
+	"接下来我", "下一步我", "现在开始", "现在我", "让我来",
+	"i will ", "i'll ", "i am going to ", "let me ",
 }
 
 // toolCallMarkupMarkers: tool calls the model wrote as PLAIN TEXT. DSML is
@@ -179,9 +216,16 @@ func lastRunes(s string, n int) string {
 	return s[cut:]
 }
 
-// textYieldsToUser reports whether the prose hands the turn back to the user:
-// a question tail, or explicit "please confirm" wording (CN and EN) in the
-// FINAL sentence.
+// textYieldsToUser reports whether the prose hands the turn back to the user.
+//
+// BP-331 (misakano 89c84fb3 + 6cd32a7d, superseding BP-327's pure
+// last-sentence window): STRONG ask wording matches anywhere — the confirm
+// request is usually followed by the draft itself (issue #209 regression);
+// WEAK wording is position-gated (final sentence / trailing question /
+// addressed to 我|你), because in technical narration it sits thousands of
+// chars before the stop. A question tail still reads as an ask immediately.
+// The gate must be independent of narrationTailSuspends — a question tail is
+// sentence-final there, but it is the model ASKING, not stopping mid-thought.
 func textYieldsToUser(text string) bool {
 	t := strings.TrimSpace(text)
 	if t == "" {
@@ -190,19 +234,97 @@ func textYieldsToUser(text string) bool {
 	if strings.HasSuffix(t, "？") || strings.HasSuffix(t, "?") {
 		return true
 	}
-	tail := yieldTail(t)
+	low := strings.ToLower(t)
 	for _, m := range userYieldMarkers {
-		if strings.Contains(tail, m) {
-			return true
-		}
-	}
-	low := strings.ToLower(tail)
-	for _, m := range userYieldMarkersEN {
 		if strings.Contains(low, m) {
 			return true
 		}
 	}
+	// Weak wording, position-gated — three positions.
+	if containsAnyOf(strings.ToLower(yieldTail(t)), userYieldDeliberation) {
+		return true
+	}
+	if q := trailingQuestion(t); q != "" && containsAnyOf(strings.ToLower(q), userYieldDeliberation) {
+		return true
+	}
+	return deliberationAddressesUser(low)
+}
+
+// containsAnyOf reports whether s contains any of the markers.
+func containsAnyOf(s string, subs []string) bool {
+	for _, m := range subs {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
 	return false
+}
+
+// trailingQuestion returns the body's LAST question sentence when only
+// punctuation-less content (draft lines) follows it — "要不要现在发送？\n
+// 收件人：…\n主题：…". A full sentence (any 。！？!?) after the question means
+// the model kept talking and the question is just part of the narration
+// (misakano 6cd32a7d).
+func trailingQuestion(t string) string {
+	i := strings.LastIndexAny(t, "？?")
+	if i < 0 {
+		return ""
+	}
+	if strings.ContainsAny(t[i+1:], "。！？!?") {
+		return ""
+	}
+	// The question runs from the last sentence break before it.
+	start := strings.LastIndexAny(t[:i], "。！？!?\n")
+	if start >= 0 {
+		start++
+	}
+	return t[start : i+1]
+}
+
+// deliberationAddressesUser reports whether a weak marker directly addresses
+// the user: immediately followed by 我 or 你 (「确认后我再发送」；the plural
+// 「我们/你们」 does NOT count — misakano 6cd32a7d). Technical narration
+// (「为“是否需要更换”提供量化支撑」) touches neither. Expects the lowercased
+// text; CN markers carry no case, EN markers are already lowercase.
+func deliberationAddressesUser(t string) bool {
+	for _, m := range userYieldDeliberation {
+		for rest := t; ; {
+			i := strings.Index(rest, m)
+			if i < 0 {
+				break
+			}
+			rest = rest[i+len(m):]
+			switch {
+			case strings.HasPrefix(rest, "我们"), strings.HasPrefix(rest, "你们"):
+				// a statement about the team, not an ask
+			case strings.HasPrefix(rest, "我"), strings.HasPrefix(rest, "你"):
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// narrationAckedDone reports whether the text ends on the nudge's
+// "already finished" exit — the model replied 「已完成」 or done. That is an
+// explicit declaration: rescuing again would resend the same body for another
+// full-context bill (misakano f8d83465/75653945). Judged by SUFFIX, not by
+// last sentence: the rescue segment splices directly onto the previous text
+// with no separator, so sentence-splitting would weld the two together.
+func narrationAckedDone(text string) bool {
+	tail := strings.TrimRight(text, " \t\r\n「」\"'*_。")
+	if strings.HasSuffix(tail, "已完成") {
+		return true
+	}
+	return strings.HasSuffix(strings.ToLower(tail), "done")
+}
+
+// narrationTailPromises reports whether the tail's last sentence carries
+// first-person next-action wording — the only unpunctuated long suspensions
+// that are genuinely cut-off sentences (BP-331, misakano bb8a9536).
+func narrationTailPromises(text string) bool {
+	tail := strings.ToLower(yieldTail(text))
+	return containsAnyOf(tail, narrationPromiseWords)
 }
 
 // narrationTailStructurallyOpen: the tail is structurally unfinished — a
@@ -242,8 +364,10 @@ func narrationTailSuspends(text string) bool {
 		return true
 	}
 	// Sentence-final punctuation, closing brackets and '&' (RP clients end
-	// turns on &&happy&&-style tags): a finished thought.
-	if strings.ContainsRune("。.!！?？\"'”’））》】]}`*~&", last) {
+	// turns on &&happy&&-style tags). BP-331 adds '>' (misakano 75653945):
+	// <face:…>/<br> tag closers mean "said and done" for clients whose prose
+	// ends on an emoji tag instead of a period.
+	if strings.ContainsRune("。.!！?？\"'”’））》】]}`*~&>", last) {
 		return false
 	}
 	return true
@@ -322,14 +446,23 @@ func stopRescuePlan(channel string, req *ir.ChatRequest, ledger *streamLedger, r
 	if textYieldsToUser(text) {
 		return nil, "", false
 	}
-	// BP-327: the length gate constrains ONLY punctuation-type suspensions
-	// ("notes + list:" is normal formatting and gets longer as the answer
-	// does). A tail cut with no punctuation is a broken sentence — length is
-	// irrelevant, and those are the most common shape in long sessions, so
-	// gating them by size rescued nothing at all upstream (issue #245).
-	// Structurally open tails (unclosed fence, truncated marker) skip it too.
+	// BP-331 (misakano f8d83465/75653945): the model used the nudge's exit —
+	// 「已完成」/done is an explicit "already finished"; the chain stops.
+	if narrationAckedDone(text) {
+		return nil, "", false
+	}
+	// BP-327 + BP-331 (misakano 75653945): the length gate constrains
+	// punctuation-type suspensions ("notes + list:" is normal formatting and
+	// gets longer as the answer does) AND — new — long unpunctuated text
+	// WITHOUT promise wording: a roleplay client's no-period style is normal
+	// formatting, not a cut sentence (field: 87 rescues a day on one client).
+	// A tail cut with no punctuation IS a broken sentence when the last
+	// sentence announces a next action ("我将开始修改 check.go") — those are
+	// the most common shape in long sessions. Structurally open tails
+	// (unclosed fence, truncated marker) skip the gate entirely.
 	punctuated := narrationTailPunctuated(text)
-	if punctuated && !narrationTailStructurallyOpen(text) && len(text) > narrationMaxBytes {
+	if !narrationTailStructurallyOpen(text) && len(text) > narrationMaxBytes &&
+		(punctuated || !narrationTailPromises(text)) {
 		return nil, "", false
 	}
 	if !narrationTailSuspends(text) {

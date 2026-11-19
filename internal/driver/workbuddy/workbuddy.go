@@ -105,6 +105,25 @@ const (
 	// same body fails on every account, so this is request-level: no rotation,
 	// no account penalty (2026-10-19).
 	codePromptTooLong = 11115
+	// BP-331 (misakano 733942a7 + PR #251/#269, RobbsLuo 18153486): the
+	// request-level rejection family — the CLIENT's declared request is the
+	// problem, and the same body fails on every account. Unregistered codes
+	// fell into the generic internal bucket, which feeds the loss-streak and
+	// rotates the pool: a deterministic request error masquerading as an
+	// account failure (misakano field note for 11152, 2026-11-18).
+	//   11129 tool-definition schema shape ("invalid function call parameters",
+	//        displayMsg 「工具定义不合规」; weakly-typed keyword values, top-level
+	//        $ref, duplicate required entries);
+	//   11152 tool name invalid or duplicated (names with dots/colons/slashes/
+	//        CJK/spaces, or two tools of one name);
+	//   11133 request parameters do not meet the model's requirements;
+	//   11148 tool calls and tool results do not match;
+	//   11135 invalid image content.
+	codeToolSchemaRejected = 11129
+	codeToolNameInvalid    = 11152
+	codeModelParamInvalid  = 11133
+	codeToolMismatch       = 11148
+	codeImageInvalid       = 11135
 	// codeEmptyContent (BP-299, misakano f987bac): "a message has empty
 	// content" — some text block in the history is empty. The same body fails
 	// on every account, so rotation only burns the pool and feeds the
@@ -537,6 +556,19 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 				wire["tool_calls"] = tcs
 			}
 		}
+		// BP-331 (plugins #1213 / 0a34ff85, magpie 6e588210): kimi-k3.1-pro
+		// and -highspeed reject a call-only assistant turn — tool_calls with
+		// content null/absent — with 400 "Invalid request parameters" (field
+		// 2026-11-19). One space passes, and the tolerant models read it as
+		// nothing. Same fill the messages lane already ships (BP-299
+		// emptytext.go). Judged on the MESSAGE's parts, not the wire key: the
+		// else branch above stores a nil slice into wire["content"], which is
+		// a TYPED nil — `wire["content"] == nil` would never see it. The
+		// trae/zen lanes deliberately keep content ABSENT on this shape and
+		// their upstreams accept it — left alone.
+		if m.Role == ir.RoleAssistant && wire["tool_calls"] != nil && len(m.Content) == 0 {
+			wire["content"] = emptyTextFill
+		}
 		if m.ToolCallID != "" {
 			wire["tool_call_id"] = m.ToolCallID
 		}
@@ -672,6 +704,22 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 				// global edge never asked for.
 				if creds.RealmOrDefault() != "global" && kimiRouted(call.UpstreamModel) && prompt.ExpandLocalRefs(params) {
 					log.Printf("workbuddy: expanded $defs refs in tool %q schema", t.Name)
+				}
+				// BP-331 (misakano 733942a7, 2026-11-18 per-shape field matrix):
+				// keyword VALUES are validated by Go strong typing —
+				// minimum:"1", uniqueItems:"true", description:123, enum:"x",
+				// additionalProperties:"false", required:["a","a"] all answer
+				// 400 11129. Coerce what is coercible, drop what is not.
+				if prompt.CoerceSchemaKeywordTypes(params) {
+					log.Printf("workbuddy: coerced keyword types in tool %q schema", t.Name)
+				}
+				// BP-331: a TOP-LEVEL $ref is rejected outright (400 11129)
+				// while nested $ref+$defs answers 200 — expand from the local
+				// $defs when possible, otherwise drop the ref (a tool without
+				// parameters beats a tool that can never be called). Not
+				// Kimi-gated: misakano's matrix ran on the plain chat lane.
+				if prompt.FixTopLevelRef(params) {
+					log.Printf("workbuddy: fixed top-level $ref in tool %q schema", t.Name)
 				}
 				fn["parameters"] = params
 			}
@@ -1363,6 +1411,22 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		return e
 	case codeBadParams:
 		return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: %s", msg)
+	case codeToolSchemaRejected, codeToolNameInvalid:
+		// BP-331 (misakano 733942a7): the hint must NAME the tools — the raw
+		// displayMsg (「工具定义不合规」/「工具名称不规范」) reads like an account
+		// fault and the client cannot tell what to fix. Retrying as-is fails
+		// the same way on every account.
+		return uperr.New(uperr.ClassBadRequest, 400,
+			"workbuddy: tool definitions rejected by upstream (schema shape or tool name) — fix or drop the offending tool: %s", msg)
+	case codeModelParamInvalid:
+		return uperr.New(uperr.ClassBadRequest, 400,
+			"workbuddy: request parameters do not meet the model's requirements: %s", msg)
+	case codeToolMismatch:
+		return uperr.New(uperr.ClassBadRequest, 400,
+			"workbuddy: tool calls and tool results do not match: %s", msg)
+	case codeImageInvalid:
+		return uperr.New(uperr.ClassBadRequest, 400,
+			"workbuddy: invalid image content in request: %s", msg)
 	case codeEmptyContent:
 		// BP-299 (misakano f987bac): request-level empty text block. No
 		// rotation, no account penalty — bad_request never rotates — and the
@@ -1488,6 +1552,29 @@ func isPromptTooLong(lowerBody string) bool {
 	return strings.Contains(lowerBody, "prompt is too long") ||
 		strings.Contains(lowerBody, "context length exceeded") ||
 		strings.Contains(lowerBody, "context_too_long")
+}
+
+// toolSchemaRejectedMarkers are the wordings 11129 carries when the body has
+// no parseable business code (misakano badParamsMarkers11129, 733942a7):
+// English literal, snake_case, and the Chinese displayMsg (no case to lose).
+// Expects the lowercased body.
+var toolSchemaRejectedMarkers = []string{
+	"invalid function call parameters",
+	"invalid_function_call_parameters",
+	"invalid_function_parameters",
+	"工具定义不合规",
+}
+
+// isToolSchemaRejected reports a 400 whose wording names a tool-definition
+// rejection. Business-code 11129 is matched earlier by classifyBusiness —
+// this catches the message-only shapes.
+func isToolSchemaRejected(lowerBody string) bool {
+	for _, m := range toolSchemaRejectedMarkers {
+		if strings.Contains(lowerBody, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyClientFingerprint sends the official WorkBuddy desktop client's header
@@ -1735,6 +1822,13 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 			e.ContextOverflow = true
 			return e
 		}
+	}
+	// BP-331 (misakano 733942a7): a tool-definition rejection may arrive with
+	// no parseable business code — English wording, snake_case, or the Chinese
+	// displayMsg 「工具定义不合规」. Same body fails on every account.
+	if status == 400 && isToolSchemaRejected(lower) {
+		return uperr.New(uperr.ClassBadRequest, status,
+			"workbuddy: tool definitions rejected by upstream (schema shape or tool name) — fix or drop the offending tool: %s", truncate(body, 300))
 	}
 	switch {
 	case status == 401:

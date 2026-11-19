@@ -76,6 +76,14 @@ func New(cfg config.AntigravitySettings, httpClient *http.Client) *Driver {
 	if httpClient == nil {
 		httpClient = httpx.ChatClient() // streaming: no total timeout, header watchdog
 	}
+	// BP-331 field REVERSAL (2026-11-20, ten minutes after the first deploy):
+	// the CLIProxyAPI h1 pinning was wired here and the antigravity QUOTA
+	// PROBES broke immediately — every retrieveUserQuotaSummary answered
+	// `net/http: HTTP/1.x transport connection broken: malformed HTTP
+	// response "…http2_handshake_failed"` through the local Mihomo TUN
+	// egress. These endpoints must keep h2 in THIS network environment; the
+	// BP-256 h2-hang class stays handled by host_deadline. httpx.ChatClientH1
+	// remains available with the field note; it is not wired anywhere.
 	return &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient(), sigCache: newThoughtSigCache()}
 }
 
@@ -265,6 +273,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		// answers 200. Off unless channels.antigravity.dump_dir is set.
 		d.dumpFailure(acc.ID, call.UpstreamModel, resp.StatusCode, body, raw)
 		ue := classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+		httpx.ApplyRetryAfter(ue, resp.Header)
 		// Experimental replay (BP-44) can go stale — the account switched, the
 		// model changed, or the upstream expired the signature. The experiment
 		// must never make things worse than the placeholder path: on a
@@ -284,7 +293,9 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		if resp.StatusCode != http.StatusOK {
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 			resp.Body.Close()
-			return nil, classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+			ue := classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
+			httpx.ApplyRetryAfter(ue, resp.Header)
+			return nil, ue
 		}
 	}
 	body2 := httpx.WatchIdle(resp.Body, httpx.IdleTimeout())
@@ -584,6 +595,16 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 					}
 				case part.Text != "":
 					textBuf.WriteString(part.Text)
+					// BP-331 (magpie 2ba62f7f + c5f2a67d): the quota system
+					// sometimes answers as a MODEL TURN — a 200 stream whose
+					// whole text is the rejection ("Individual quota reached …
+					// Resets in 1h18m40s"). Left alone it reads as a normal
+					// answer, the model never rests, and every later request
+					// re-pays the prefill to hear it again. Checked while the
+					// text is still short; the offending delta is withheld.
+					if qerr := bodyQuotaReject(textBuf.String(), call.UpstreamModel); qerr != nil {
+						return nil, qerr
+					}
 					if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: part.Text}); err != nil {
 						return nil, err
 					}
@@ -1702,6 +1723,78 @@ func isTOSViolation(lower string) bool {
 	// other products use ("account has been restricted"), which is what keeps a
 	// generic 403 on the WAF path.
 	return strings.Contains(lower, "violation of terms of service")
+}
+
+// bodyQuotaSentinels: the text-form quota rejection announces itself in the
+// stream body (magpie 2ba62f7f field wording). Lowercased for matching.
+var bodyQuotaSentinels = []string{
+	"individual quota reached",
+	"exhausted your capacity on this model",
+}
+
+// bodyQuotaScanBytes bounds the sentinel scan: the rejection IS the whole
+// turn (a sentence or two); once the answer has walked past the window it is
+// a real completion and stops paying for the check.
+const bodyQuotaScanBytes = 4096
+
+// bodyQuotaReject turns a quota rejection that arrived as MODEL TEXT into the
+// soft-rate error the pool already understands (model-scoped rest, no account
+// penalty). The stated "Resets in 1h18m40s" is the Go-duration form
+// (magpie c5f2a67d); without a parseable reset the pool's ordinary soft
+// backoff applies (uperr.ResetAt stays zero).
+func bodyQuotaReject(text, upstreamModel string) *uperr.Error {
+	if len(text) > bodyQuotaScanBytes {
+		return nil
+	}
+	lower := strings.ToLower(text)
+	for _, s := range bodyQuotaSentinels {
+		if !strings.Contains(lower, s) {
+			continue
+		}
+		e := uperr.New(uperr.ClassSoftRate, 429,
+			"antigravity: model quota exhausted (stated in the stream body): %s", strings.TrimSpace(text))
+		e.Model = upstreamModel
+		if d := parseGoDurationReset(lower); d > 0 {
+			e.ResetAt = time.Now().Add(d)
+		}
+		return e
+	}
+	return nil
+}
+
+// parseGoDurationReset reads "Resets in 1h18m40s" out of the lowercased
+// rejection text and parses the duration token. Returns 0 when absent or
+// unparseable — the caller then falls back to the plain soft backoff.
+func parseGoDurationReset(lower string) time.Duration {
+	const marker = "resets in "
+	i := strings.Index(lower, marker)
+	if i < 0 {
+		return 0
+	}
+	rest := strings.TrimLeft(lower[i+len(marker):], " \t")
+	end := 0
+	for end < len(rest) {
+		c := rest[end]
+		if (c >= '0' && c <= '9') || c == 'h' || c == 'm' || c == 's' {
+			end++
+			continue
+		}
+		// A dot only belongs to the token when it starts a fraction
+		// ("1.5h"); after a unit it is sentence punctuation ("1h18m40s.").
+		if c == '.' && end+1 < len(rest) && rest[end+1] >= '0' && rest[end+1] <= '9' {
+			end++
+			continue
+		}
+		break
+	}
+	if end == 0 {
+		return 0
+	}
+	d, err := time.ParseDuration(rest[:end])
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
 }
 
 // parseQuotaReset extracts a precise reset moment from a QuotaFailure body.

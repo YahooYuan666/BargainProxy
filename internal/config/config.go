@@ -65,6 +65,15 @@ type Config struct {
 	// control reads as abnormal activity.
 	SingleActivePerChannel bool `json:"single_active_per_channel"`
 
+	// NarrationRescueDisabled turns off the BP-302 stop-shaped narration
+	// rescue entirely (default false = on). The rescue appends a user-role
+	// instruction to the conversation, and agent clients cannot tell it from
+	// real user input — upstream field: one was taken for user approval and
+	// ran tools unattended for 9 minutes (misakano #273). The self-identifying
+	// nudge prefix bounds that; this switch removes the mechanism. Set true to
+	// return to "the model said stop, so it stopped". Restart-effective.
+	NarrationRescueDisabled bool `json:"narration_rescue_disabled,omitempty"`
+
 	// TaskAccountGap is the pause between accounts inside one scheduled task
 	// run (probe / check-in / activity). Upstream task traffic for several
 	// accounts in a burst is a risk-control signal; the reference projects use

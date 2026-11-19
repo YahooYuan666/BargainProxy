@@ -102,7 +102,9 @@ func (d *Driver) chatRelay(ctx context.Context, call driver.ChatCall, cr *Creds,
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		ue := classifyHTTP(resp.StatusCode, raw)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	var env struct {
 		OK    *bool           `json:"ok"`
@@ -217,7 +219,9 @@ func (d *Driver) openRelayEvents(ctx context.Context, cr *Creds, endpoint string
 	if resp.StatusCode >= 400 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
-		return nil, classifyHTTP(resp.StatusCode, raw)
+		ue := classifyHTTP(resp.StatusCode, raw)
+		httpx.ApplyRetryAfter(ue, resp.Header)
+		return nil, ue
 	}
 	return resp, nil
 }
