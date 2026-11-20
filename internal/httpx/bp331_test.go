@@ -87,7 +87,9 @@ func TestApplyRetryAfterGuards(t *testing.T) {
 }
 
 // The h1-pinned transport really pins h1: no h2 upgrade registered, no
-// ForceAttemptHTTP2.
+// ForceAttemptHTTP2, and NO ALPN extension at all (BP-332 — the native
+// Antigravity client's wire shape; advertising http/1.1 would be a different
+// fingerprint).
 func TestChatClientH1PinsHTTP1(t *testing.T) {
 	tr := h1Transport()
 	if tr.ForceAttemptHTTP2 {
@@ -96,7 +98,21 @@ func TestChatClientH1PinsHTTP1(t *testing.T) {
 	if tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
 		t.Fatal("TLSNextProto must be an empty non-nil map (disables the h2 upgrade)")
 	}
+	// BP-332: the line BP-331 missed. Without an explicit TLSClientConfig with
+	// NextProtos=nil the handshake still advertises h2 and every antigravity
+	// probe died with "malformed HTTP response … http2_handshake_failed".
+	if tr.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig must be explicit — a nil config leaves the ALPN shape implicit (BP-332)")
+	}
+	if len(tr.TLSClientConfig.NextProtos) != 0 {
+		t.Fatalf("NextProtos = %v, want nil/empty (native Antigravity sends no ALPN; http/1.1 would be a third fingerprint)", tr.TLSClientConfig.NextProtos)
+	}
 	if ChatClientH1() == nil || RPCClientH1() == nil {
 		t.Fatal("clients must construct")
+	}
+	// The clone must not mutate the process-wide default transport's config.
+	if base, ok := http.DefaultTransport.(*http.Transport); ok && base.TLSClientConfig != nil &&
+		len(base.TLSClientConfig.NextProtos) == 0 && base.TLSClientConfig == tr.TLSClientConfig {
+		t.Fatal("TLSClientConfig must be cloned, never shared with http.DefaultTransport")
 	}
 }

@@ -76,15 +76,16 @@ func New(cfg config.AntigravitySettings, httpClient *http.Client) *Driver {
 	if httpClient == nil {
 		httpClient = httpx.ChatClient() // streaming: no total timeout, header watchdog
 	}
-	// BP-331 field REVERSAL (2026-11-20, ten minutes after the first deploy):
-	// the CLIProxyAPI h1 pinning was wired here and the antigravity QUOTA
-	// PROBES broke immediately — every retrieveUserQuotaSummary answered
-	// `net/http: HTTP/1.x transport connection broken: malformed HTTP
-	// response "…http2_handshake_failed"` through the local Mihomo TUN
-	// egress. These endpoints must keep h2 in THIS network environment; the
-	// BP-256 h2-hang class stays handled by host_deadline. httpx.ChatClientH1
-	// remains available with the field note; it is not wired anywhere.
-	return &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient(), sigCache: newThoughtSigCache()}
+	// BP-332: the RPC lane (quota / project / refresh probes) rides the h1
+	// no-ALPN transport, matching the native Antigravity client's wire shape
+	// (CLIProxyAPI d0c90bb5 + issue #7671: one credential must not present two
+	// TLS fingerprints to Google). BP-331 wired this WITHOUT the explicit
+	// NextProtos=nil and every quota probe broke with "malformed HTTP
+	// response … http2_handshake_failed"; with that line in place the same
+	// probes answer HTTP/1.1 (controlled A/B, 4/4 rounds). The CHAT lane stays
+	// on the default transport for now — upstream changed only the discovery
+	// path, and moving chat is a separate decision after this proves out.
+	return &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClientH1(), sigCache: newThoughtSigCache()}
 }
 
 // SetThoughtSignatureReplay toggles the experimental real-signature replay

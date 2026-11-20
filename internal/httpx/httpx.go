@@ -89,22 +89,42 @@ func RPCClient() *http.Client {
 	return &http.Client{Timeout: RPCTimeout()}
 }
 
-// h1Transport clones the default transport with HTTP/2 disabled.
+// h1Transport clones the default transport with HTTP/2 disabled AND the TLS
+// ALPN extension suppressed entirely.
 //
-// BP-331 (CLIProxyAPI d0c90bb5): an h2 connection to slow Google endpoints is
-// what produced the BP-256 field hang (`http2: timeout awaiting response
-// headers`, 6m40s). The pinning was wired for antigravity and REVERTED within
-// minutes: through the local Mihomo TUN egress the antigravity quota probes
-// answered `malformed HTTP response … http2_handshake_failed` on every call —
-// in THIS network environment those endpoints need h2, and the hang class
-// stays handled by the host deadline. The helpers stay available (and tested)
-// for an endpoint family that actually accepts h1; nothing wires them.
-// An empty non-nil TLSNextProto is the documented way to keep the transport
-// from registering its h2 upgrade; ForceAttemptHTTP2=false backs it up.
+// BP-332 (CLIProxyAPI d0c90bb5 + issue #7671): this is FINGERPRINT alignment,
+// not a hang workaround. The native Antigravity client is a Go
+// `language_server` binary that speaks HTTP/1.1 and sends NO ALPN extension at
+// all; CLIProxyAPI already cloned that shape for its executor but missed the
+// model-discovery path, so one credential presented two different TLS
+// fingerprints to Google (h1/no-ALPN for generate, h2/ALPN for discovery).
+//
+// BP-331 shipped this WITHOUT the NextProtos line and the antigravity quota
+// probes broke immediately (`HTTP/1.x transport connection broken: malformed
+// HTTP response "…http2_handshake_failed"`). The missing piece is the explicit
+// empty TLSClientConfig with NextProtos=nil — that PINS "send no ALPN" instead
+// of leaving it to the implicit nil-config path, which still let the handshake
+// advertise h2 while our h2 parser was already off (so h2 frames were read as
+// h1). Controlled A/B, 4/4 rounds each: without it every probe failed; with it
+// every probe answered HTTP/1.1.
+//
+// NextProtos must be nil, NOT []string{"http/1.1"}: advertising http/1.1 is a
+// third fingerprint the native client never sends.
+//
+// An empty non-nil TLSNextProto keeps the transport from registering its h2
+// upgrade; ForceAttemptHTTP2=false backs it up.
 func h1Transport() *http.Transport {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ForceAttemptHTTP2 = false
 	tr.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	if tr.TLSClientConfig == nil {
+		tr.TLSClientConfig = &tls.Config{}
+	} else {
+		tr.TLSClientConfig = tr.TLSClientConfig.Clone()
+	}
+	// Native Antigravity sends no ALPN extension. With HTTP/2 disabled above,
+	// an empty NextProtos keeps the wire shape aligned while using HTTP/1.1.
+	tr.TLSClientConfig.NextProtos = nil
 	return tr
 }
 
