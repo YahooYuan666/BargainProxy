@@ -1092,6 +1092,21 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			}
 			return nil, cerr
 		}
+		// BP-333: the slot MUST come back even if the driver panics. Before
+		// this guard every release was an explicit call sitting on a normal
+		// return path, so a panic between Acquire and Release leaked the
+		// in-flight slot for the life of the process. Single-active mode then
+		// read the leaked holder as "this pool is interacting", and every
+		// later request skipped the channel entirely — field 2026-11-20
+		// 16:21/17:00: two panics in prompt.CoerceSchemaKeywordTypes left
+		// WorkBuddy's y1313 at 2/2 in-flight with nothing running, and the
+		// deepseek route fell through to Trae for every turn while eight
+		// healthy accounts sat idle. Release is idempotent (Lease.released),
+		// so the explicit calls below still return the slot at the same
+		// moment they always did; this defer only covers the paths that
+		// never reach them. The receiver is evaluated HERE, so each attempt
+		// defers its own lease.
+		defer lease.Release()
 		// BP-310: the pool handed back an account this binding already tried
 		// and failed on. Do not pay it twice — the previous failure says a
 		// retry would meet the same wall (no response at all, or a 5xx with an

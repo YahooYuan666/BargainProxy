@@ -308,48 +308,93 @@ var (
 //   - enum / examples: must be an array, otherwise dropped.
 //   - required: duplicate, empty, and non-string entries removed (a repeated
 //     entry answered 400 11129 in the field); an emptied list is dropped.
+//
+// "Already legal" is decided by a TYPE assertion, never by comparing the old
+// value with the new one. That distinction is load-bearing (BP-333): the first
+// version of this function asked `if nv != v` to decide whether to report a
+// change, and `v` is an `any` holding whatever the client sent — so the first
+// enum array and the first additionalProperties object it met panicked with
+// "comparing uncomparable type", because Go cannot compare maps or slices with
+// ==. Those are exactly the two shapes the upstream field matrix lists as
+// LEGAL (200), i.e. the ones that must be passed through untouched. The
+// upstream implementation this was ported from reports no change value at all
+// and so never had the comparison to get wrong; the bool here exists only for
+// the caller's log line and is therefore derived from types alone.
 func CoerceSchemaKeywordTypes(schema any) bool {
 	switch s := schema.(type) {
 	case map[string]any:
 		changed := false
-		coerceOne := func(key string, ok func(any) (any, bool)) {
-			if v, present := s[key]; present {
-				if nv, good := ok(v); good {
-					if nv != v {
-						s[key] = nv
-						changed = true
-					}
-				} else {
-					delete(s, key)
-					changed = true
-				}
-			}
-		}
+		// Number-valued keywords: a real number is already legal and stays
+		// byte-identical; a numeric string is rewritten; anything else is
+		// dropped.
 		for _, k := range schemaNumberKeys {
-			coerceOne(k, coerceNumber)
+			v, present := s[k]
+			if !present || isNumberValue(v) {
+				continue
+			}
+			if num, ok := coerceNumber(v); ok {
+				s[k] = num
+			} else {
+				delete(s, k)
+			}
+			changed = true
 		}
+		// Boolean-valued keywords: a real bool stays; "true"/"false" is
+		// rewritten; anything else is dropped.
 		for _, k := range schemaBoolKeys {
-			coerceOne(k, coerceBool)
+			v, present := s[k]
+			if !present {
+				continue
+			}
+			if _, isBool := v.(bool); isBool {
+				continue
+			}
+			if b, ok := coerceBool(v); ok {
+				s[k] = b
+			} else {
+				delete(s, k)
+			}
+			changed = true
 		}
+		// String-valued keywords: a string stays; anything else is dropped.
 		for _, k := range schemaStringKeys {
-			coerceOne(k, func(v any) (any, bool) {
-				_, isStr := v.(string)
-				return v, isStr
-			})
+			v, present := s[k]
+			if !present {
+				continue
+			}
+			if _, isStr := v.(string); isStr {
+				continue
+			}
+			delete(s, k)
+			changed = true
 		}
 		// additionalProperties accepts EITHER a schema object or a boolean;
-		// "false" is the string shape that answered 400.
-		coerceOne("additionalProperties", func(v any) (any, bool) {
-			if _, isSchema := v.(map[string]any); isSchema {
-				return v, true
+		// "false" is the string shape that answered 400. A nested schema
+		// object is legal and is left alone (the recursion below visits it).
+		if v, present := s["additionalProperties"]; present {
+			_, isSchema := v.(map[string]any)
+			_, isBool := v.(bool)
+			if !isSchema && !isBool {
+				if b, ok := coerceBool(v); ok {
+					s["additionalProperties"] = b
+				} else {
+					delete(s, "additionalProperties")
+				}
+				changed = true
 			}
-			return coerceBool(v)
-		})
+		}
+		// enum / examples must be arrays. An array is legal and untouched —
+		// it is NOT compared against anything (see the header note).
 		for _, k := range []string{"enum", "examples"} {
-			coerceOne(k, func(v any) (any, bool) {
-				_, isList := v.([]any)
-				return v, isList
-			})
+			v, present := s[k]
+			if !present {
+				continue
+			}
+			if _, isList := v.([]any); isList {
+				continue
+			}
+			delete(s, k)
+			changed = true
 		}
 		// required: dedupe + drop empties/non-strings (["a","a"] → 400 11129).
 		if req, ok := s["required"].([]any); ok {
@@ -413,6 +458,18 @@ func CoerceSchemaKeywordTypes(schema any) bool {
 			}
 		}
 		return changed
+	}
+	return false
+}
+
+// isNumberValue reports whether v is already a legal JSON number value.
+// Kept separate from coerceNumber so the caller can skip a legal number
+// WITHOUT rewriting it: coerceNumber turns every number into float64, and
+// rewriting an int as float64 changes the marshalled bytes for no reason.
+func isNumberValue(v any) bool {
+	switch v.(type) {
+	case float64, int, int64:
+		return true
 	}
 	return false
 }
