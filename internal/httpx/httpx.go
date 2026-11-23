@@ -76,10 +76,31 @@ func IdleTimeout() time.Duration {
 	return idleTimeout
 }
 
+// idleConnTimeout bounds how long a pooled connection may sit idle before it is
+// closed. Go's default is 90s, which is far too long for this workload: a
+// connection that died in between (vendor edge reaped it, TUN/proxy rotated the
+// path) is still in the pool, and the next request sends its headers into a
+// black hole and waits out the full ResponseHeaderTimeout before failing
+// (Coding2API 21542dc1: "死连接只发不收会挂到总超时" — they dropped it to 3s).
+//
+// 15s keeps the win for back-to-back requests (a chat turn's next segment, a
+// burst of probes) while refusing to reuse a socket that has been quiet long
+// enough to be suspect. Cheap to tune: one constant.
+const idleConnTimeout = 15 * time.Second
+
+// newTransport clones the default transport with the shorter idle window.
+func newTransport() *http.Transport {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	if tr.IdleConnTimeout > idleConnTimeout || tr.IdleConnTimeout == 0 {
+		tr.IdleConnTimeout = idleConnTimeout
+	}
+	return tr
+}
+
 // ChatClient builds a client for streaming chat calls: no total timeout,
 // response-header timeout from the current default.
 func ChatClient() *http.Client {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := newTransport()
 	tr.ResponseHeaderTimeout = HeaderTimeout()
 	return &http.Client{Transport: tr}
 }
@@ -114,7 +135,7 @@ func RPCClient() *http.Client {
 // An empty non-nil TLSNextProto keeps the transport from registering its h2
 // upgrade; ForceAttemptHTTP2=false backs it up.
 func h1Transport() *http.Transport {
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := newTransport()
 	tr.ForceAttemptHTTP2 = false
 	tr.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
 	if tr.TLSClientConfig == nil {

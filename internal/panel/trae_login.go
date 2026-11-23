@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
@@ -64,15 +65,28 @@ func randomHex32(n int) string {
 	return hex.EncodeToString(b)
 }
 
-// traeMachineTraceID derives the stable login_trace_id (hex16) from the
-// machine/device ids, mirroring the reference (tail of the concatenation).
-func traeMachineTraceID(machineID, deviceID string) string {
-	h := machineID + deviceID
-	const n = 16
-	if len(h) >= n {
-		return h[len(h)-n:]
+// traeTraceSalt is a process-scoped random salt mixed into the login trace id
+// (BP-335, Coding2API e5eb6cc4).
+//
+// The old derivation was `(machineID+deviceID)[-16:]` — both values sit in the
+// login URL in plain text, so anyone who SAW the URL could compute the trace
+// and complete someone else's in-flight login with their own refresh token.
+// Salting with a value that never leaves this process removes that: the trace
+// can still be recomputed here for the callback check, but not from the URL.
+var traeTraceSalt = func() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return ""
 	}
-	return strings.Repeat("0", n-len(h)) + h
+	return hex.EncodeToString(b)
+}()
+
+// traeMachineTraceID derives the login_trace_id (hex16) from the machine/device
+// ids and the process salt. The value is a HASH, not a substring, so it reveals
+// nothing about the ids it came from.
+func traeMachineTraceID(machineID, deviceID string) string {
+	sum := sha256.Sum256([]byte(traeTraceSalt + "\x00" + machineID + "\x00" + deviceID))
+	return hex.EncodeToString(sum[:8]) // 16 hex chars, same width as before
 }
 
 // buildTraeLoginURL mirrors the reference BuildLoginURL parameter set.
@@ -362,6 +376,19 @@ func (p *Panel) handleTraeCallback(w http.ResponseWriter, r *http.Request, key s
 		p.finishFlow(key, "failed", "", "回调解析失败："+err.Error())
 		writeOAuthPage(w, false, "授权失败："+html.EscapeString(err.Error()))
 		return
+	}
+	// BP-335: when the callback echoes our login_trace_id, verify it against the
+	// value this flow minted. A trace that came from a URL someone else saw
+	// cannot match, which is what closes the "complete another user's login"
+	// hole. When the upstream does not echo it, the loopback listener remains
+	// the defense (see the doc comment above).
+	if got := r.URL.Query().Get("login_trace_id"); got != "" && f.traeDevice != nil {
+		if want := traeMachineTraceID(f.traeDevice.MachineID, f.traeDevice.DeviceID); got != want {
+			log.Printf("panel: trae callback login_trace_id mismatch — refusing (got %.16s)", got)
+			p.finishFlow(key, "failed", "", "回调校验失败")
+			writeOAuthPage(w, false, "授权校验失败，请回到控制台重新发起")
+			return
+		}
 	}
 	creds := &traeCredsWorking{accessToken: info.AccessToken, refreshToken: info.RefreshToken, expiresAt: info.ExpiresAt}
 	if creds.refreshToken != "" {

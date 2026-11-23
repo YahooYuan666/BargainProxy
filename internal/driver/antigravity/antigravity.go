@@ -275,6 +275,16 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 		d.dumpFailure(acc.ID, call.UpstreamModel, resp.StatusCode, body, raw)
 		ue := classifyHTTP(resp.StatusCode, raw, call.UpstreamModel)
 		httpx.ApplyRetryAfter(ue, resp.Header)
+		// BP-335 (CLIProxyAPI ec25cc83): a 401/403 means this credential is
+		// flagged. Any keep-alive socket opened with it is suspect — the next
+		// account sharing this transport would reuse it and fail immediately.
+		// Dropping the idle pool costs one TLS handshake on the next request
+		// and removes a class of "the second account fails too" reports.
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			if tr, ok := d.http.Transport.(*http.Transport); ok && tr != nil {
+				tr.CloseIdleConnections()
+			}
+		}
 		// Experimental replay (BP-44) can go stale — the account switched, the
 		// model changed, or the upstream expired the signature. The experiment
 		// must never make things worse than the placeholder path: on a
@@ -520,6 +530,17 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 			break
 		}
 		if !strings.HasPrefix(line, "data:") {
+			// BP-335 (CLIProxyAPI ec25cc83): a 200 response whose body is a
+			// plain JSON document rather than an SSE stream. Some builds answer
+			// errors this way, and the line used to be skipped as "not a data:
+			// frame" — the turn then ended with no terminal signal at best, or
+			// as a clean empty success at worst, and the quota/refusal error
+			// inside the body never reached the classifier.
+			if strings.HasPrefix(line, "{") {
+				if fe := detectFrameError(line, call.UpstreamModel); fe != nil {
+					return nil, fe
+				}
+			}
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
@@ -683,6 +704,17 @@ func (d *Driver) parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall
 	}
 	if !terminated {
 		return nil, uperr.New(uperr.ClassTransport, 0, "antigravity: stream ended without terminal signal")
+	}
+	// BP-335 empty reply (CLIProxyAPI 892fc486): the stream can terminate
+	// CLEANLY ([DONE]) having emitted no text, no reasoning and no tool call.
+	// Before this guard that shape returned a success-shaped response, the
+	// gateway booked it as a healthy answer, and the client saw a 200 with an
+	// empty body. ClassTransport is the right verdict here (the gateway has its
+	// own empty-reply net at the exit, but catching it at the driver names the
+	// channel and lets the pool's normal failover run).
+	if textBuf.Len() == 0 && thinkBuf.Len() == 0 && len(toolCalls) == 0 {
+		return nil, uperr.New(uperr.ClassEmptyReply, 0,
+			"antigravity: stream ended cleanly with no content (no text, no reasoning, no tool call)")
 	}
 	// BP-298: the loop broke on [DONE] — read the tail so the pooled
 	// connection survives.
@@ -1540,8 +1572,16 @@ func mapFinish(reason string) ir.StopReason {
 	// includes SPII (sensitive personal info), IMAGE_SAFETY and
 	// MALFORMED_RESPONSE; letting them fall to the default read as a quiet
 	// empty success instead of the refusal the vendor meant.
+	//
+	// BP-335 (CLIProxyAPI 2c8b32fd, 2026-11-21) completes the list:
+	// UNEXPECTED_TOOL_CALL, LANGUAGE and NO_IMAGE are refusals too, and OTHER
+	// is the vendor's catch-all for "this turn is not a normal answer".
+	// Falling through to StopEnd made each of them read as a clean finish:
+	// sticky stayed, nothing retried, and the client got a short answer with
+	// no hint that the vendor refused.
 	case "SAFETY", "RECITATION", "PROHIBITED_CONTENT", "BLOCKLIST",
-		"SPII", "IMAGE_SAFETY", "MALFORMED_RESPONSE":
+		"SPII", "IMAGE_SAFETY", "MALFORMED_RESPONSE",
+		"UNEXPECTED_TOOL_CALL", "LANGUAGE", "NO_IMAGE", "OTHER":
 		return ir.StopContentFilter
 	default:
 		return ir.StopEnd
@@ -1635,6 +1675,17 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		if upstreamModel != "" {
 			e.Model = upstreamModel
 		}
+		// BP-335 (sub2api #8973): a "bare" 429 — no ErrorInfo details and no
+		// reset moment anywhere in the body — is request-scoped. Google answers
+		// it both for a throttled account and for a single request it refuses
+		// to serve, and in the second case every account gets the same answer.
+		// Cooling each one walks the pool offline for everyone; the gateway
+		// therefore cools at most ONE account per request for this shape.
+		// A 429 that names a reset moment is a real per-account window and is
+		// left alone.
+		if reset.IsZero() && !strings.Contains(lower, "errorinfo") && !strings.Contains(lower, "details") {
+			e.RequestScoped = true
+		}
 		return e
 	case status == 403:
 		if uperr.IsEdgeBlock(body) {
@@ -1658,6 +1709,12 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		return uperr.New(uperr.ClassWAF, status, "antigravity: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "antigravity: %s", truncate(body, 300))
+	case status == 408:
+		// BP-335 (sub2api #8968): a 408 is the upstream timing out on
+		// THIS request — not the account's fault, and another account hits
+		// the same slow upstream. The generic default used to charge a
+		// strike for it.
+		return uperr.RequestTimeout(status, "%s", truncate(body, 300))
 	case status >= 500:
 		return uperr.New(uperr.ClassTransport, status, "antigravity: %s", truncate(body, 300))
 	default:
@@ -1680,17 +1737,33 @@ func isCapacityExhausted(lower string) bool {
 	return strings.Contains(lower, "no capacity available")
 }
 
+// sessionIDLegacyMask reproduces the pre-BP-335 id shape ("-"+positive decimal).
+// Kept as a fallback switch: BP-335 changes the wire format, and if the upstream
+// ever refuses the signed form this flips back without a rebuild of the logic.
+var sessionIDLegacyMask atomic.Bool
+
+// SetLegacySessionID restores the old all-positive, dash-prefixed session id.
+// Exposed for a rollback if the signed form is ever rejected upstream.
+func SetLegacySessionID(v bool) { sessionIDLegacyMask.Store(v) }
+
 // stableSessionID derives the upstream's request.sessionId from the FIRST
-// user text, exactly as AIClient2API's generateStableSessionID does:
+// user text.
 //
-//	hash  = sha256(firstUserText)              // the first text part of the
-//	n     = first 8 bytes, big-endian uint64   // first user-role content
-//	id    = "-" + (n & 0x7FFFFFFFFFFFFFFF)      // positive, dash-prefixed
+// BP-314 shape (the fallback):  hash = sha256(firstUserText); n = first 8 bytes
+// big-endian; id = "-" + (n & 0x7FFFFFFFFFFFFFFF) — always positive, always
+// dash-prefixed. AIClient2API's generateStableSessionID does exactly this.
 //
-// Stability is the point: the same conversation prefix must map to the same id
-// so the upstream can treat consecutive turns as one session (prefix cache and
-// conversation continuity). A random id — or none at all, which is what we did
-// before BP-314 — makes every turn look like a fresh conversation.
+// BP-335 shape (the default; CLIProxyAPI 55e5a7ea, 2026-11-22): the Hub's real
+// ids are SIGNED int64 — both signs occur. A generator that can only produce
+// one sign (and always prefixes a dash) is a fingerprintable deviation from the
+// native client, which is what this field exists to imitate. So the raw int64
+// is used, its own sign intact, and the dash appears only for negative values.
+//
+// Stability is the point in BOTH shapes: the same conversation prefix must map
+// to the same id so the upstream can treat consecutive turns as one session
+// (prefix cache and conversation continuity). A random id — or none at all,
+// which is what we did before BP-314 — makes every turn look like a fresh
+// conversation.
 //
 // Returns "" when there is no user text to hash (nothing to key on).
 func stableSessionID(contents []geminiContent) string {
@@ -1703,8 +1776,14 @@ func stableSessionID(contents []geminiContent) string {
 				continue
 			}
 			sum := sha256.Sum256([]byte(p.Text))
-			n := binary.BigEndian.Uint64(sum[:8]) & 0x7FFFFFFFFFFFFFFF
-			return "-" + strconv.FormatUint(n, 10)
+			if sessionIDLegacyMask.Load() {
+				n := binary.BigEndian.Uint64(sum[:8]) & 0x7FFFFFFFFFFFFFFF
+				return "-" + strconv.FormatUint(n, 10)
+			}
+			// Signed: reinterpret the same bytes as int64 so the sign is
+			// whatever the hash produced, and let FormatInt add the "-" only
+			// when the value is actually negative.
+			return strconv.FormatInt(int64(binary.BigEndian.Uint64(sum[:8])), 10)
 		}
 	}
 	return ""

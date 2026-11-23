@@ -41,22 +41,22 @@ type Driver struct {
 	// ever opens a paid lane; today every request goes through the gate.
 	gateEnabled atomic.Bool
 	// wireFor resolves a model id to its upstream lane ("chat" / "responses";
-		// "" = not servable). Wired from the catalog in main; nil means chat.
-		wireFor func(string) string
-	}
+	// "" = not servable). Wired from the catalog in main; nil means chat.
+	wireFor func(string) string
+}
 
-	// SetWireResolver wires the catalog's lane decision into the driver.
-	func (d *Driver) SetWireResolver(f func(string) string) { d.wireFor = f }
+// SetWireResolver wires the catalog's lane decision into the driver.
+func (d *Driver) SetWireResolver(f func(string) string) { d.wireFor = f }
 
-	// New builds the driver.
-	func New(cfg config.OpenCodeZenSettings, httpClient *http.Client) *Driver {
-		if httpClient == nil {
-			httpClient = httpx.ChatClient()
-		}
-		d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
-		d.gateEnabled.Store(true)
-		return d
+// New builds the driver.
+func New(cfg config.OpenCodeZenSettings, httpClient *http.Client) *Driver {
+	if httpClient == nil {
+		httpClient = httpx.ChatClient()
 	}
+	d := &Driver{cfg: cfg, http: httpClient, rpc: httpx.RPCClient()}
+	d.gateEnabled.Store(true)
+	return d
+}
 
 // Channel reports the channel id.
 func (d *Driver) Channel() string { return model.ChannelOpenCodeZen }
@@ -480,10 +480,10 @@ func (d *Driver) chatOnce(ctx context.Context, wire []byte, emit driver.Emit) (*
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-		for _, h := range disguiseHeaders(ids, "chat") {
-			req.Header.Set(h[0], h[1])
-		}
-		resp, err := d.http.Do(req)
+	for _, h := range disguiseHeaders(ids, "chat") {
+		req.Header.Set(h[0], h[1])
+	}
+	resp, err := d.http.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "opencodezen: %v", err)
 	}
@@ -514,7 +514,7 @@ func parseSSE(ctx context.Context, r io.Reader, emit driver.Emit) (*ir.ChatRespo
 		gotUsage   bool
 		terminated bool
 		toolFolder = streamx.NewToolFolder() // BP-320: id 分流+起始顺序重编号
-		gateOnly   = true // no real (non-gate) tool seen yet
+		gateOnly   = true                    // no real (non-gate) tool seen yet
 	)
 	for sc.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -727,6 +727,12 @@ func classifyHTTP(status int, body []byte) *uperr.Error {
 		return uperr.New(uperr.ClassBadRequest, status, "opencodezen: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "opencodezen: %s", truncate(body, 300))
+	case status == 408:
+		// BP-335 (sub2api #8968): a 408 is the upstream timing out on
+		// THIS request — not the account's fault, and another account hits
+		// the same slow upstream. The generic default used to charge a
+		// strike for it.
+		return uperr.RequestTimeout(status, "%s", truncate(body, 300))
 	case status >= 500:
 		return uperr.New(uperr.ClassTransport, status, "opencodezen: %s", truncate(body, 300))
 	default:
@@ -872,10 +878,10 @@ func (d *Driver) responsesOnce(ctx context.Context, wire []byte, emit driver.Emi
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-		for _, h := range disguiseHeaders(ids, "responses") {
-			req.Header.Set(h[0], h[1])
-		}
-		resp, err := d.http.Do(req)
+	for _, h := range disguiseHeaders(ids, "responses") {
+		req.Header.Set(h[0], h[1])
+	}
+	resp, err := d.http.Do(req)
 	if err != nil {
 		return nil, uperr.New(httpx.ClassifyTransportErr(ctx, err), 0, "opencodezen: %v", err)
 	}

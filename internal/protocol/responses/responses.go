@@ -30,6 +30,10 @@ type Request struct {
 	Metadata     map[string]any  `json:"metadata,omitempty"`
 	PreviousID   string          `json:"previous_response_id,omitempty"`
 	Store        *bool           `json:"store,omitempty"`
+	// Stop is the Responses `stop` field: a string or an array of strings.
+	// It used to be dropped entirely (BP-335, sub2api #8963), so an upstream
+	// that honours stop sequences returned the marker AND the text after it.
+	Stop json.RawMessage `json:"stop,omitempty"`
 }
 
 // WireReasoning carries the Responses reasoning effort.
@@ -63,6 +67,14 @@ func ParseRequest(body []byte) (*ir.ChatRequest, error) {
 		Temperature: w.Temperature,
 		TopP:        w.TopP,
 		MaxTokens:   w.MaxOutput,
+	}
+	// BP-335: carry `stop` through. Responses accepts a string or an array;
+	// the chat ingress has parsed both forms for a long time (chat.go:165) —
+	// this surface simply never read the field.
+	if stops, err := parseStopSequences(w.Stop); err != nil {
+		return nil, fmt.Errorf("responses: stop: %w", err)
+	} else if len(stops) > 0 {
+		req.Stop = stops
 	}
 	if w.Reasoning != nil && w.Reasoning.Effort != "" {
 		req.RequestedEffort = w.Reasoning.Effort
@@ -128,6 +140,35 @@ func cacheControlKey(raw json.RawMessage) string {
 	return ""
 }
 
+// parseStopSequences accepts the two shapes the Responses `stop` field takes —
+// a bare string or an array of strings — and returns the non-empty entries.
+// An absent/empty field yields no sequences. A malformed value is an error
+// rather than a silent drop: forwarding a request whose stop sequences were
+// quietly discarded produces output the client explicitly asked not to see.
+func parseStopSequences(raw json.RawMessage) ([]string, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var single string
+	if err := json.Unmarshal(raw, &single); err == nil {
+		if single == "" {
+			return nil, nil
+		}
+		return []string{single}, nil
+	}
+	var list []string
+	if err := json.Unmarshal(raw, &list); err == nil {
+		out := make([]string, 0, len(list))
+		for _, s := range list {
+			if s != "" {
+				out = append(out, s)
+			}
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("must be a string or an array of strings")
+}
+
 func sessionKeyFrom(metadata map[string]any) string {
 	if metadata == nil {
 		return ""
@@ -188,6 +229,18 @@ func parseInput(raw json.RawMessage) ([]ir.Message, error) {
 				if b, err := json.Marshal(ov); err == nil {
 					text = string(b)
 				}
+			}
+			// BP-335 (sub2api #8929): VS Code / Codex send IDE context as a
+			// STANDALONE function_call_output with NO call_id (the active file,
+			// the selection, the open tabs). As a tool message it has no call to
+			// pair with, so RepairToolPairing drops it as an orphan and the
+			// model silently never sees the context. With no call_id there is
+			// nothing tool-shaped about it — carry it as plain user text.
+			if callID == "" {
+				if text != "" {
+					out = append(out, ir.Message{Role: ir.RoleUser, Content: []ir.ContentPart{{Kind: "text", Text: text}}})
+				}
+				continue
 			}
 			out = append(out, ir.Message{Role: ir.RoleTool, ToolCallID: callID, Content: []ir.ContentPart{{Kind: "text", Text: text}}})
 		case "reasoning", "item_reference":

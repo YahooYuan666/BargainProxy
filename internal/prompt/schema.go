@@ -368,6 +368,25 @@ func CoerceSchemaKeywordTypes(schema any) bool {
 			delete(s, k)
 			changed = true
 		}
+		// BP-335 (misakano abed8395 + hub 8a9cfe31, 2026-11-20/22): a `pattern`
+		// is a REGEX the upstream compiles with RE2. RE2 has no `\u` escape, so
+		// a JS-authored pattern like `^[^\uD800-\uDFFF]*$` (which REA 6.9.0
+		// attaches to every path field) fails to compile and the upstream
+		// rejects the WHOLE tools array with 400 11129 — every tool the client
+		// declared becomes unusable. Translate the escapes RE2 does understand
+		// and drop the pattern if it still will not compile: losing one local
+		// regex is far cheaper than losing the tool set.
+		if v, present := s["pattern"]; present {
+			if p, isStr := v.(string); isStr {
+				if fixed, ok := re2Pattern(p); !ok {
+					delete(s, "pattern")
+					changed = true
+				} else if fixed != p {
+					s["pattern"] = fixed
+					changed = true
+				}
+			}
+		}
 		// additionalProperties accepts EITHER a schema object or a boolean;
 		// "false" is the string shape that answered 400. A nested schema
 		// object is legal and is left alone (the recursion below visits it).

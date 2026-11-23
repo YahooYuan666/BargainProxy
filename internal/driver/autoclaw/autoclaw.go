@@ -2242,6 +2242,12 @@ func classify(status int, code, text, lower string) *uperr.Error {
 	case status == 406:
 		return uperr.New(uperr.ClassBadRequest, status,
 			"autoclaw: request refused by the gateway's content check (406): %s", clipped)
+	case status == 408:
+		// BP-335 (sub2api #8968): a 408 is the upstream timing out on
+		// THIS request — not the account's fault, and another account hits
+		// the same slow upstream. The generic default used to charge a
+		// strike for it.
+		return uperr.RequestTimeout(status, "autoclaw: %s", clipped)
 	case status >= 500:
 		return uperr.New(uperr.ClassTransport, status, "autoclaw: %s", clipped)
 	case status != 0:

@@ -22,13 +22,13 @@ import (
 )
 
 type videoRequest struct {
-	Prompt       string            `json:"prompt"`
-	Model        string            `json:"model"`
-	Watermark    bool              `json:"watermark"`
-	Seconds      int               `json:"seconds,omitempty"`
-	ImageURL     string            `json:"image_url,omitempty"`
-	LastImageURL string            `json:"last_image_url,omitempty"`
-	Extra        videoExtra        `json:"extra_parameters,omitempty"`
+	Prompt       string     `json:"prompt"`
+	Model        string     `json:"model"`
+	Watermark    bool       `json:"watermark"`
+	Seconds      int        `json:"seconds,omitempty"`
+	ImageURL     string     `json:"image_url,omitempty"`
+	LastImageURL string     `json:"last_image_url,omitempty"`
+	Extra        videoExtra `json:"extra_parameters,omitempty"`
 }
 
 type videoExtra struct {
@@ -98,14 +98,17 @@ func (d *Driver) GenerateVideo(ctx context.Context, acc *model.Account, modelNam
 	}
 	var sub videoSubmitResponse
 	if err := json.Unmarshal(payload, &sub); err != nil {
-		return nil, uperr.New(uperr.ClassInternal, 500, "workbuddy video: bad body: %v", err)
+		// BP-335: the upstream answered 200 with a body that is not the JSON it
+		// promises. That is a protocol fault, not an account fault — and it must
+		// not charge the account a strike.
+		return nil, uperr.New(uperr.ClassProtocol, 500, "workbuddy video: bad body: %v", err)
 	}
 	if sub.Code != 0 {
 		return nil, uperr.New(uperr.ClassBadRequest, 400,
 			"workbuddy video: code=%d %s", sub.Code, sub.Msg)
 	}
 	if sub.Data.ID == "" {
-		return nil, uperr.New(uperr.ClassInternal, 500, "workbuddy video: no task id")
+		return nil, uperr.New(uperr.ClassProtocol, 500, "workbuddy video: 200 response carried no task id")
 	}
 	// Poll (same account token; 5s cadence, ctx bounds the wait).
 	qb, _ := json.Marshal(map[string]string{"task_id": sub.Data.ID})
@@ -144,11 +147,16 @@ func (d *Driver) GenerateVideo(ctx context.Context, acc *model.Account, modelNam
 				}
 			}
 			if len(out.URLs) == 0 {
-				return nil, uperr.New(uperr.ClassInternal, 500, "workbuddy video: completed with no URLs")
+				// BP-335: "completed" with nowhere to fetch the result is a
+				// protocol fault, not the account's.
+				return nil, uperr.New(uperr.ClassProtocol, 500, "workbuddy video: completed with no URLs")
 			}
 			return out, nil
 		case "failed", "cancelled":
-			return nil, uperr.New(uperr.ClassInternal, 500,
+			// BP-335: the upstream accepted the task and then failed it. Nothing
+			// about the ACCOUNT changed, so this must not charge a strike — the
+			// old ClassInternal did exactly that.
+			return nil, uperr.New(uperr.ClassProtocol, 500,
 				"workbuddy video: task %s", st.Data.Status)
 		}
 	}

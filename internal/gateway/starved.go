@@ -49,6 +49,35 @@ import (
 // than the answer is worth (probes use max_tokens=1 and should just fail).
 const minStarvedBudget = 16
 
+// emptyReplyOf reports whether a cleanly-terminated turn produced NOTHING the
+// client can act on — no text, no reasoning, no tool call — while the request
+// declared a real output budget (a max_tokens=1 liveness probe is SUPPOSED to
+// answer nothing, so its empty answer is honest and must not be retried).
+//
+// BP-335 (magpie d847b796 + CLIProxyAPI 892fc486, both 2026-11-20): this shape
+// used to fall through every rescue and reach the success branch, so the
+// client got a 200 with an empty body and reported "Stream ended without
+// finish_reason" without ever retrying. It is a per-attempt event — another
+// account may answer fine — so the gateway treats it as a failed leg and lets
+// the existing cascade run.
+//
+// The starved rescue does NOT cover this: shape A requires finish=length and
+// shape B requires reasoning to have streamed. Here there is neither.
+func emptyReplyOf(req *ir.ChatRequest, ledger *streamLedger) bool {
+	if req == nil || ledger == nil {
+		return false
+	}
+	// A probe (or a client that asked for no output) answering nothing is the
+	// honest result, not a failure.
+	if req.MaxTokens <= 0 || req.MaxTokens < minStarvedBudget {
+		return false
+	}
+	if ledger.sawTool || ledger.text.Len() > 0 || ledger.thinking.Len() > 0 {
+		return false
+	}
+	return true
+}
+
 // starvedRetryRequest rewrites req for the rescue call. ok=false when the
 // turn does not match either starved shape or the retry cannot change
 // anything. The ledger is the authoritative record of what the CLIENT saw:

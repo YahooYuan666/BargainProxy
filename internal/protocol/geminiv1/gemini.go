@@ -39,11 +39,16 @@ type Part struct {
 	FunctionResp *FunctionResult `json:"functionResponse,omitempty"`
 }
 
-// UnmarshalJSON accepts both spellings of the function part keys
-// (functionCall/function_call, functionResponse/function_response): some
-// clients emit snake_case, and encoding/json's case-folding does not cover
-// the underscore (BP-271, CLIProxyAPI #7186/#7187). Scope is exactly these
-// two keys — inlineData keeps its single camelCase form.
+// UnmarshalJSON accepts both spellings of the part keys: some clients emit
+// snake_case, and encoding/json's case-folding does not cover the underscore
+// (BP-271, CLIProxyAPI #7186/#7187; BP-335 extends it to the media keys,
+// CLIProxyAPI 08098d24).
+//
+// BP-335 correction: the earlier comment here claimed "inlineData keeps its
+// single camelCase form" and scoped the aliases to the two function keys.
+// CLIProxyAPI 08098d24 (2026-11-22) shows real clients DO send `inline_data`
+// (and `mime_type` inside it); without the alias the image was dropped by
+// json.Unmarshal with no error, so the model silently never saw it.
 func (p *Part) UnmarshalJSON(data []byte) error {
 	type partAlias Part
 	var a partAlias
@@ -51,9 +56,6 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*p = Part(a)
-	if p.FunctionCall != nil && p.FunctionResp != nil {
-		return nil
-	}
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil // not an object; the alias pass above already errored if it mattered
@@ -72,6 +74,40 @@ func (p *Part) UnmarshalJSON(data []byte) error {
 			if err := json.Unmarshal(v, &fr); err == nil {
 				p.FunctionResp = &fr
 			}
+		}
+	}
+	if p.InlineData == nil {
+		if v, ok := raw["inline_data"]; ok {
+			var b Blob
+			if err := json.Unmarshal(v, &b); err == nil {
+				p.InlineData = &b
+			}
+		}
+	}
+	return nil
+}
+
+// UnmarshalJSON accepts `mime_type` as well as `mimeType` inside an
+// inlineData blob (BP-335, CLIProxyAPI 08098d24): the snake_case spelling was
+// silently discarded, leaving the MIME type empty and the image unusable.
+func (b *Blob) UnmarshalJSON(data []byte) error {
+	type blobAlias Blob
+	var a blobAlias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*b = Blob(a)
+	if b.MIMEType != "" {
+		return nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	if v, ok := raw["mime_type"]; ok {
+		var s string
+		if err := json.Unmarshal(v, &s); err == nil {
+			b.MIMEType = s
 		}
 	}
 	return nil

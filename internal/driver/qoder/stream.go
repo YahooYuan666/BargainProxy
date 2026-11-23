@@ -243,6 +243,28 @@ func (a *toolCallAccumulator) isEmpty() bool {
 	return len(a.calls) == 0
 }
 
+// dropInvalidArgs removes every recorded call whose `arguments` is not valid
+// JSON. A truncated call cannot be executed by any client — the caller should
+// report the truncation instead (BP-335, qoder2api-hub 91e9d72c).
+//
+// A call with an EMPTY argument string is left alone: an empty string is what
+// a no-argument call legitimately streams as, and the driver's own empty-args
+// normalization handles it.
+func (a *toolCallAccumulator) dropInvalidArgs() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	kept := a.calls[:0]
+	for _, c := range a.calls {
+		fn, _ := c["function"].(map[string]interface{})
+		args, _ := fn["arguments"].(string)
+		if args != "" && !json.Valid([]byte(args)) {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	a.calls = kept
+}
+
 func (a *toolCallAccumulator) snapshot() []map[string]interface{} {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -361,19 +383,19 @@ func (a *streamAccumulator) accept(delta *bridgeDelta) {
 	if delta.ReasoningContent != "" {
 		a.emit("", delta.ReasoningContent, nil)
 	}
-		if len(delta.ToolCalls) > 0 {
-			a.discardBufferedToolCallText()
-			a.toolCalls.append(delta.ToolCalls)
-			// BP-262 (qoder2api #124): preserve content delta on the same frame
-			// instead of dropping it on early return.
-			contentToSend := ""
-			if delta.Content != "" {
-				a.streamingText = true
-				contentToSend = delta.Content
-			}
-			a.emit(contentToSend, "", withToolCallIndices(delta.ToolCalls))
-			return
+	if len(delta.ToolCalls) > 0 {
+		a.discardBufferedToolCallText()
+		a.toolCalls.append(delta.ToolCalls)
+		// BP-262 (qoder2api #124): preserve content delta on the same frame
+		// instead of dropping it on early return.
+		contentToSend := ""
+		if delta.Content != "" {
+			a.streamingText = true
+			contentToSend = delta.Content
 		}
+		a.emit(contentToSend, "", withToolCallIndices(delta.ToolCalls))
+		return
+	}
 	if delta.Content == "" {
 		return
 	}
@@ -416,6 +438,15 @@ func (a *streamAccumulator) finalFinishReason() string {
 	// calls have no function name is a nameless truncation — downgrade to "stop"
 	// so client loops do not hang waiting for missing tool executions.
 	if !a.toolCalls.isEmpty() {
+		// BP-335 (qoder2api-hub 91e9d72c, 2026-11-20): a call whose arguments
+		// are NOT valid JSON cannot be executed by any client. When the turn
+		// ended in "length" the cause is the output budget cutting the
+		// arguments mid-string, so the honest verdict is the truncation —
+		// drop the unusable call and report length, rather than hand the
+		// client a tool call it will fail on.
+		if strings.EqualFold(a.finishReason, "length") {
+			a.toolCalls.dropInvalidArgs()
+		}
 		if a.toolCalls.hasValidCalls() {
 			return "tool_calls"
 		}
@@ -530,14 +561,14 @@ func aggregateNonStream(chunks []string, reqID string, created int64, model stri
 	if len(fullReasoning) > 0 {
 		msg["reasoning_content"] = strings.Join(fullReasoning, "")
 	}
-		hasCalls := toolCalls.hasValidCalls()
-		if hasCalls {
-			msg["tool_calls"] = toolCalls.snapshot()
-		}
-		finishReason := "stop"
-		if hasCalls || fallbackToolCalls != nil {
-			finishReason = "tool_calls"
-		}
+	hasCalls := toolCalls.hasValidCalls()
+	if hasCalls {
+		msg["tool_calls"] = toolCalls.snapshot()
+	}
+	finishReason := "stop"
+	if hasCalls || fallbackToolCalls != nil {
+		finishReason = "tool_calls"
+	}
 	resp := map[string]interface{}{
 		"id":      reqID,
 		"object":  "chat.completion",

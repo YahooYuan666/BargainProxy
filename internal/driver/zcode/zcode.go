@@ -23,6 +23,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -109,6 +110,20 @@ type Driver struct {
 	// one 400 is enough to disable it for this process — otherwise every tool
 	// turn would pay an extra round trip (BP-69).
 	allowUnsignedThinking atomic.Bool
+	// giftAnswers remembers, per account, which plans already have a settled
+	// answer TODAY (BP-335, plugins fdbf261b). ZCode drops plans into the feed
+	// in batches through the day (19:00, 19:30 …), so the daily claim task has
+	// to re-check later — but re-POSTing a plan that already answered
+	// claimed/done/captcha is pure waste and, for captcha, re-arms the wall.
+	// Keyed "accountID\x00planID", value carries the Beijing day it belongs to.
+	giftMu      sync.Mutex
+	giftAnswers map[string]giftAnswer
+}
+
+// giftAnswer is a settled per-plan answer for one day.
+type giftAnswer struct {
+	day  string // Asia/Shanghai yyyy-mm-dd
+	code int
 }
 
 // New builds the driver.

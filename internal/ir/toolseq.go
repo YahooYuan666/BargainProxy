@@ -1,5 +1,20 @@
 package ir
 
+// trailingCallBatch reports whether the message list's SECOND-to-last entry is
+// an assistant carrying tool calls — i.e. the text-only assistant at the tail
+// sits BETWEEN two call batches.
+//
+// Used by MergeAdjacentToolCalls' Form 3 to keep "calls → commentary → calls"
+// untouched: that commentary belongs to the FIRST batch, and folding it
+// forward would silently move it into the second.
+func trailingCallBatch(out []Message) bool {
+	if len(out) < 2 {
+		return false
+	}
+	second := out[len(out)-2]
+	return second.Role == RoleAssistant && len(second.ToolCalls) > 0
+}
+
 // MergeAdjacentToolCalls normalizes the "back-to-back assistant tool_calls"
 // shape some OpenAI-compatible agent clients produce when replaying parallel
 // tool calls: several consecutive assistant messages each carrying part of
@@ -21,6 +36,14 @@ package ir
 //	Form 2 (reverse): this message is a text-only assistant (no tool_calls),
 //	  the previous kept message is an assistant with tool_calls and EMPTY
 //	  content → the text is folded into the previous one.
+//	Form 3 (forward, text-then-calls): this message is an assistant with
+//	  tool_calls, the previous kept message is a TEXT-ONLY assistant → the
+//	  previous one's text is folded into THIS message (text first, then the
+//	  calls) and the previous message is dropped. BP-335 (misakano 9ad206bd
+//	  PR#281): Codex replays one turn as "assistant text" then "assistant
+//	  tool_calls" as SEPARATE items; sent upstream as two assistant turns, Kimi
+//	  finishes the progress line and stops. Forms 1 and 2 both require the
+//	  PREVIOUS message to carry calls, so this order matched neither.
 //
 // Anything else (non-adjacent, tool/system/user in between) is left as-is:
 // guessing would change meaning. Returns the (possibly shorter) message list
@@ -35,6 +58,24 @@ func MergeAdjacentToolCalls(messages []Message) ([]Message, bool) {
 	for _, m := range messages {
 		if m.Role == RoleAssistant && len(out) > 0 {
 			prev := &out[len(out)-1]
+			// Form 3: text-only assistant followed by an assistant carrying
+			// calls. Fold the text into the call turn (text first) and drop the
+			// text-only one.
+			//
+			// Guard: the text-only message must not sit BETWEEN two call
+			// batches. A client that interleaves "calls → commentary → calls"
+			// means the commentary belongs between them (a progress note about
+			// the first batch); folding it forward would move it into the
+			// second batch and merge nothing — the original semantics are kept
+			// by leaving that shape alone (BP-331's adjacency rule).
+			if prev.Role == RoleAssistant && len(prev.ToolCalls) == 0 && hasText(prev.Content) &&
+				len(m.ToolCalls) > 0 && !trailingCallBatch(out) {
+				merged := m
+				merged.Content = append(append([]ContentPart(nil), prev.Content...), m.Content...)
+				out[len(out)-1] = merged
+				changed = true
+				continue
+			}
 			if prev.Role == RoleAssistant && len(prev.ToolCalls) > 0 {
 				// Form 1: call fragment joins the previous batch, text riding
 				// along (BP-331: empty content is the common shape, but a

@@ -36,7 +36,7 @@ func TestBP231GiftClaim(t *testing.T) {
 				t.Errorf("preview query = %q, want app_version+platform", r.URL.RawQuery)
 			}
 			for k, want := range map[string]string{
-				"X-Device-Mid":         dashedDeviceMid,
+				"X-Device-Mid":        dashedDeviceMid,
 				"X-ZCode-App-Version": giftAppVersion,
 				"X-Platform":          "win32-x64",
 				"Authorization":       "Bearer tok",
@@ -131,8 +131,11 @@ func TestBP231GiftClaimIdempotent(t *testing.T) {
 			t.Fatalf("run %d counts = %+v, want already=1", i, res)
 		}
 	}
-	if posts.Load() != 2 {
-		t.Fatalf("claim posts = %d, want one per run", posts.Load())
+	// BP-335 (plugins fdbf261b): a plan that answered 1003 today is SETTLED —
+	// the second run reads the per-plan answer table instead of POSTing again.
+	// Re-POSTing a settled plan is pure waste (and re-arms captcha walls).
+	if posts.Load() != 1 {
+		t.Fatalf("claim posts = %d, want 1 (the settled plan must not be re-POSTed)", posts.Load())
 	}
 }
 

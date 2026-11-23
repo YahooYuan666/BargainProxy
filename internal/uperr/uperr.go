@@ -93,7 +93,31 @@ const (
 	// not charge any account; Rotatable is false so a leg-level copy would
 	// also never be retried within its channel.
 	ClassEgressDown = "egress_down"
-	ClassInternal   = "internal" // gateway bug or unclassified
+	// ClassEmptyReply: the upstream terminated the turn CLEANLY (finish=stop or
+	// [DONE]) having produced nothing at all — no text, no thinking, no tool
+	// call, no usage. The client sees a 200 with an empty body and reports
+	// "Stream ended without finish_reason", and because nothing failed there is
+	// nothing to retry: one silent empty turn per request, forever (BP-335;
+	// magpie d847b796 + CLIProxyAPI 892fc486, both 2026-11-20).
+	//
+	// Rotatable: the same body may well be served by another account — the
+	// empty reply is a per-attempt event, not a property of the request. Zero
+	// account penalty: an upstream that answers nothing says nothing about the
+	// account's health, and charging it turns one bad turn into a cooled pool.
+	ClassEmptyReply = "empty_reply"
+	// ClassProtocol: the upstream's RESPONSE did not conform to its own
+	// protocol — a non-JSON body where JSON was promised, an oversized SSE
+	// frame, a task that failed after acceptance, a nonsense status code.
+	// This is not the account's fault and not the request's: retrying the same
+	// account usually fails identically, so it does not rotate, and it charges
+	// no penalty (Coding2API 31ce9b03, 2026-11-23).
+	//
+	// It must still be RECORDED: an upstream that emitted frames may have
+	// billed them, so the request ledger keeps the row. Before this class the
+	// same shapes fell into ClassInternal, whose default pool branch feeds
+	// ConsecutiveFails — protocol garbage used to bench healthy accounts.
+	ClassProtocol = "protocol"
+	ClassInternal = "internal" // gateway bug or unclassified
 )
 
 // Error is the normalized upstream failure.
@@ -118,10 +142,23 @@ type Error struct {
 	// cooled the channel to 00:00 UTC, so every later probe answered
 	// "cooling down" without ever reaching upstream). The moment still
 	// rides ResetAt so clients and the panel report the honest wait.
-	SharedQuota bool   `json:"-"`
-	Model       string // set when the error is scoped to a single model
-	Channel   string // binding that produced the failure (final one for pool errors)
-	Sentinel  string // matched sentinel text for ClassSentinel
+	SharedQuota bool `json:"-"`
+	// RequestScoped marks a failure that belongs to THIS REQUEST rather than
+	// to the account. A "bare" 429 (no ErrorInfo, no reset moment, no model) is
+	// the case: Google answers it both for a throttled account and for a single
+	// oversized request it will not serve, and in the second case the same
+	// request gets the same 429 from every account it reaches. Cooling each one
+	// takes the whole pool offline for everyone (BP-335; sub2api #8973 field
+	// evidence: one 1.8MB request bare-429'd four accounts in a row while those
+	// same accounts served other requests normally).
+	//
+	// The gateway records the first account it cools for such a failure; later
+	// accounts hit by the SAME request keep serving (no cooldown) so one bad
+	// request costs at most one account.
+	RequestScoped bool   `json:"-"`
+	Model         string // set when the error is scoped to a single model
+	Channel       string // binding that produced the failure (final one for pool errors)
+	Sentinel      string // matched sentinel text for ClassSentinel
 	// Code is the upstream business code when the body carried one (e.g.
 	// workbuddy "6004"); the panel shows it as the rate-limit label (BP-49).
 	Code          string
@@ -190,11 +227,17 @@ func New(class string, status int, format string, args ...any) *Error {
 // record on each — Coding2API measured a fresh account banned three minutes
 // later after exactly that (f428e33). The binding loop still cascades to
 // another CHANNEL: a different upstream is a different verdict.
+//
+// BP-335: ClassProtocol is NOT rotatable — the upstream's own response shape
+// was wrong, and the next account of the same channel talks to the same
+// broken surface. ClassEmptyReply IS rotatable: an upstream that answered
+// nothing once may well answer on another account, and the cost of trying is
+// one request that was going to be wasted anyway.
 func Rotatable(class string) bool {
 	switch class {
 	case ClassBadRequest, ClassContentBlocked, ClassSentinel, ClassUpstreamBusy,
 		ClassUpstreamTimeout, ClassCanceled, ClassNotFound, ClassEdgeBlock,
-		ClassTransportDead, ClassAccountRestricted, ClassEgressDown:
+		ClassTransportDead, ClassAccountRestricted, ClassEgressDown, ClassProtocol:
 		return false
 	default:
 		return true

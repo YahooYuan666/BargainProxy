@@ -1287,10 +1287,17 @@ func detectBusinessError(raw []byte) (int, string, bool) {
 	// RawMessage + shape dispatch — two same-tag fields make encoding/json
 	// treat the pair as ambiguous and fill NEITHER, silently losing every
 	// nested error.
+	//
+	// BP-335: a THIRD layer exists in the field — {"error":{"data":{"code":
+	// 14018,"msg":"Credits exhausted…"}}} (live 2026-11-23 19:10:00). The
+	// nested-object branch above reads error.code and finds nothing (the code
+	// lives under error.data), so the whole envelope fell through to the 429
+	// status fallback and the business code was lost to the cooldown math.
 	var doc struct {
 		Code    any             `json:"code"`
 		Msg     string          `json:"msg"`
 		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
 		Error   json.RawMessage `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &doc); err != nil {
@@ -1304,16 +1311,42 @@ func detectBusinessError(raw []byte) (int, string, bool) {
 	}
 	code := toInt(doc.Code)
 	msg := pick(doc.Msg, doc.Message)
+	// BP-335: the data layer carries the code for the billing envelope
+	// ({"data":{"code":14018,…}}) even when the top level does not.
+	if code == 0 && len(doc.Data) > 0 && doc.Data[0] == '{' {
+		var dataLayer struct {
+			Code    any    `json:"code"`
+			Msg     string `json:"msg"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal(doc.Data, &dataLayer) == nil {
+			code = toInt(dataLayer.Code)
+			msg = pick(dataLayer.Msg, dataLayer.Message)
+		}
+	}
 	if len(doc.Error) > 0 && code == 0 || msg == "" && len(doc.Error) > 0 {
 		if len(doc.Error) > 0 && doc.Error[0] == '{' {
 			var nested struct {
-				Code    any    `json:"code"`
-				Msg     string `json:"msg"`
-				Message string `json:"message"`
+				Code    any             `json:"code"`
+				Msg     string          `json:"msg"`
+				Message string          `json:"message"`
+				Data    json.RawMessage `json:"data"`
 			}
 			if json.Unmarshal(doc.Error, &nested) == nil && code == 0 {
 				code = toInt(nested.Code)
 				msg = pick(nested.Msg, nested.Message)
+				// BP-335: error.data is the third layer (14018 lives there).
+				if code == 0 && len(nested.Data) > 0 && nested.Data[0] == '{' {
+					var dataLayer struct {
+						Code    any    `json:"code"`
+						Msg     string `json:"msg"`
+						Message string `json:"message"`
+					}
+					if json.Unmarshal(nested.Data, &dataLayer) == nil {
+						code = toInt(dataLayer.Code)
+						msg = pick(dataLayer.Msg, dataLayer.Message)
+					}
+				}
 			}
 		} else if msg == "" {
 			var es string
@@ -1475,12 +1508,28 @@ func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 		// error string. The account is fine on its other models: model-scoped
 		// hold, account untouched (the /v1/messages wrapper classification is
 		// what the messages lane actually surfaces).
-		if code == 11158 || code == 11102 || strings.HasPrefix(msg, "11158:") ||
+		if code == 11158 || strings.HasPrefix(msg, "11158:") ||
 			strings.Contains(lowerMsg, "not allowed for user type") {
 			e := uperr.New(uperr.ClassModelRate, 200, "workbuddy: model not allowed for this account type (11158): %s", msg)
 			e.Model = upstreamModel
 			e.Code = "11158"
 			return e
+		}
+		// BP-335 (misakano d629a8ca, 2026-11-21; hub 8a9cfe31): a BARE 11102 —
+		// "model [X] service info not found", the model id does not exist
+		// upstream — is REQUEST-level, not model-scoped. Every account answers
+		// it identically, so the old shared branch (11102 grouped with 11158)
+		// walked the whole pool writing a bogus (account, model) negative cache
+		// entry on each, and ended with the backwards advice "retry on another
+		// account". misakano measured DeepSeek-V4.1-Flash going from
+		// 400/4.15s/try=3 to 400/0.19s/try=1 with this split; the fix is also
+		// that the id is CASE-SENSITIVE and a display name is not an id.
+		//
+		// 11158 keeps its model-scoped hold: another account (a Pro one) really
+		// can serve that model.
+		if code == 11102 {
+			return uperr.New(uperr.ClassBadRequest, 400,
+				"workbuddy: model id not found upstream (11102): %s — the id is case-sensitive and a display name is not an id; switching accounts will not help, check /v1/models", msg)
 		}
 		if code == codePromptTooLong || isPromptTooLong(lowerMsg) {
 			return uperr.New(uperr.ClassBadRequest, 400, "workbuddy: prompt too long: %s", msg)
@@ -1861,10 +1910,20 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		return uperr.New(uperr.ClassWAF, status, "workbuddy: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "workbuddy: %s", truncate(body, 300))
+	case status == 408:
+		// BP-335 (sub2api #8968): a 408 is the upstream timing out on
+		// THIS request — not the account's fault, and another account hits
+		// the same slow upstream. The generic default used to charge a
+		// strike for it.
+		return uperr.RequestTimeout(status, "%s", truncate(body, 300))
 	case status >= 500:
 		return uperr.New(uperr.ClassTransport, status, "workbuddy: %s", truncate(body, 300))
 	default:
-		return uperr.New(uperr.ClassInternal, status, "workbuddy: %s", truncate(body, 300))
+		// BP-335: a status none of the branches above recognise (3xx, 418,
+		// 451, a nonsense code) means the upstream did not answer in its own
+		// protocol. ClassInternal would feed the pool's ConsecutiveFails — the
+		// account is fine, the surface is not.
+		return uperr.New(uperr.ClassProtocol, status, "workbuddy: unexpected status %d: %s", status, truncate(body, 300))
 	}
 }
 

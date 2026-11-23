@@ -56,7 +56,22 @@ func (d *lcFake) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	d.calls = append(d.calls, lcCall{req: call.Request, ctxOK: ctx.Err() == nil})
 	d.mu.Unlock()
 	if n > len(d.steps) || d.steps[n-1] == nil {
-		return &ir.ChatResponse{StopReason: ir.StopEnd}, nil
+		// A default "successful" leg. It EMITS one text event as well as
+		// returning it: BP-335's empty-reply guard reads the stream ledger (what
+		// the client actually saw), and a real upstream never answers a chat
+		// turn with nothing at all — a fake that did would now be retried as a
+		// failure, which is not what these fixtures are testing.
+		text := []ir.ContentPart{{Kind: "text", Text: "ok"}}
+		if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: "ok"}); err != nil {
+			return nil, err
+		}
+		if err := emit(ir.StreamEvent{Kind: ir.EvDone, Stop: ir.StopEnd}); err != nil {
+			return nil, err
+		}
+		return &ir.ChatResponse{
+			Message:    ir.Message{Role: ir.RoleAssistant, Content: text},
+			StopReason: ir.StopEnd,
+		}, nil
 	}
 	step := d.steps[n-1]
 	evs, resp, err := step(n, call)

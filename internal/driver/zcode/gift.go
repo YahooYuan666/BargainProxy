@@ -164,6 +164,25 @@ func (d *Driver) ClaimGiftPlans(ctx context.Context, acc *model.Account) (*GiftC
 		if label == "" {
 			label = p.id
 		}
+		// BP-335 (plugins fdbf261b): a plan that already answered today is not
+		// POSTed again. claimed(0)/already(1003)/captcha(3007) are SETTLED —
+		// re-asking wastes a request and, for captcha, re-arms the wall. 1004
+		// ("not offered yet") is deliberately NOT settled: that is exactly the
+		// case the later re-check exists for.
+		if code, settled := d.settledGiftCode(acc.ID, p.id); settled {
+			switch code {
+			case 0:
+				res.Claimed++
+				res.Notes = append(res.Notes, fmt.Sprintf("claimed %s (settled earlier today)", label))
+			case 1003:
+				res.Already++
+				res.Notes = append(res.Notes, fmt.Sprintf("already claimed %s (settled earlier today)", label))
+			case 3007:
+				res.Captcha++
+				res.Notes = append(res.Notes, fmt.Sprintf("captcha required for %s (settled earlier today; claim it in the ZCode app)", label))
+			}
+			continue
+		}
 		code, msg, err := d.claimGiftPlan(ctx, creds, acc.ID, p.id)
 		switch {
 		case err != nil:
@@ -172,12 +191,15 @@ func (d *Driver) ClaimGiftPlans(ctx context.Context, acc *model.Account) (*GiftC
 		case code == 0:
 			res.Claimed++
 			res.Notes = append(res.Notes, fmt.Sprintf("claimed %s", label))
+			d.rememberGiftCode(acc.ID, p.id, code)
 		case code == 1003:
 			res.Already++
 			res.Notes = append(res.Notes, fmt.Sprintf("already claimed %s", label))
+			d.rememberGiftCode(acc.ID, p.id, code)
 		case code == 3007:
 			res.Captcha++
 			res.Notes = append(res.Notes, fmt.Sprintf("captcha required for %s (claim it in the ZCode app)", label))
+			d.rememberGiftCode(acc.ID, p.id, code)
 		case code == 1004:
 			// BP-279 (plugins 0.1.50, #729): "not eligible for this plan yet" —
 			// ZCode is not offering the plan at that moment; a plan can be
@@ -197,6 +219,36 @@ func (d *Driver) ClaimGiftPlans(ctx context.Context, acc *model.Account) (*GiftC
 	log.Printf("zcode: gift plans claimed=%d already=%d captcha=%d ineligible=%d failed=%d (account=%s)",
 		res.Claimed, res.Already, res.Captcha, res.Ineligible, res.Failed, acc.ID)
 	return res, nil
+}
+
+// giftAnswerDay is the Beijing calendar day used to scope per-plan answers.
+// giftZone is Asia/Shanghai, where ZCode drops its daily plans.
+var giftZone = time.FixedZone("CST", 8*3600)
+
+func giftAnswerDay() string {
+	return time.Now().In(giftZone).Format("2006-01-02")
+}
+
+// settledGiftCode reports the settled answer for (account, plan) today, if any.
+func (d *Driver) settledGiftCode(accountID, planID string) (int, bool) {
+	d.giftMu.Lock()
+	defer d.giftMu.Unlock()
+	a, ok := d.giftAnswers[accountID+"\x00"+planID]
+	if !ok || a.day != giftAnswerDay() {
+		return 0, false
+	}
+	return a.code, true
+}
+
+// rememberGiftCode records a settled answer for (account, plan) for today.
+// Only the settled codes are recorded — 1004 stays retryable.
+func (d *Driver) rememberGiftCode(accountID, planID string, code int) {
+	d.giftMu.Lock()
+	defer d.giftMu.Unlock()
+	if d.giftAnswers == nil {
+		d.giftAnswers = make(map[string]giftAnswer)
+	}
+	d.giftAnswers[accountID+"\x00"+planID] = giftAnswer{day: giftAnswerDay(), code: code}
 }
 
 // collectGiftPlans reads both sources the app offers: the billing preview

@@ -109,6 +109,14 @@ type Trace struct {
 	// per request: a second FreeUsageLimitError inside the same turn falls
 	// through to the pool's normal handling instead of stacking holds.
 	SharedRateRodeOut bool
+	// RequestScopedCooled is the account this REQUEST already cooled for a
+	// request-scoped failure (BP-335: a "bare" 429). One bad request must cost
+	// at most one account — the second account hit by the same body skips the
+	// cooldown and keeps serving everyone else.
+	RequestScopedCooled string
+	// BriefRetried pins the BP-335 end-of-cascade brief retry to once per
+	// request: the second pass must never brief-retry again.
+	BriefRetried bool
 	// UpstreamTTFB is when the upstream's FIRST stream event arrived, which is
 	// what the panel's 反应时间 column is supposed to show (BP-323).
 	//
@@ -759,7 +767,84 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		g.markEgressDown(noResponseChannels, time.Now())
 		return nil, egressDownError(noResponseChannels, 0, lastErr)
 	}
+	// BP-335 (magpie de73fa74/0d7c026d, 2026-11-23): every dispatched leg
+	// failed with a TRANSIENT verdict, and some pools were skipped in
+	// pre-flight for a cooldown that is nearly over. The skipped pool was never
+	// asked; asking it once now (instead of failing while it unlocks in
+	// seconds) rescues the turn. Guards: only when nothing reached the client,
+	// only transient last-error classes, and one attempt per request
+	// (BriefRetried on the trace).
+	lastUEForBrief, _ := uperr.As(lastErr)
+	if attempted && !emitted() && isBriefRetryable(lastUEForBrief) {
+		if res, err := g.briefRetry(ctx, req, emit, tr); err == nil {
+			log.Printf("gateway: brief retry answered on a pool whose cooldown ended during the cascade")
+			return res, nil
+		}
+	}
 	return nil, lastErr
+}
+
+// briefRetryWindow bounds how close a pool's cooldown end must be to count as
+// "briefly waiting": past this the wait is a real backoff and failing fast is
+// the honest answer (magpie's handOnEvery=30s plays the same role).
+const briefRetryWindow = 2 * time.Minute
+
+// isBriefRetryable reports whether the cascade's last failure is the kind a
+// short wait can plausibly fix. Long-walled classes (credit, quota, restricted)
+// are excluded — waiting them out would be the real backoff the caller can do
+// itself.
+//
+// ClassUpstreamBusy is deliberately excluded too: its 429 already carries a
+// Retry-After, and the CLIs auto-resend on that header (BP-169, misakano
+// f07eba54 — a 503 makes WorkBuddy's CLI ABORT the task, a 429 makes it
+// resend). Having the gateway ALSO wait out the pause stacks two delays on
+// every queue-full. The brief retry is for cooldowns the client cannot see:
+// model holds and soft rates the last legs burned through.
+func isBriefRetryable(ue *uperr.Error) bool {
+	if ue == nil {
+		return false
+	}
+	switch ue.Class {
+	case uperr.ClassSoftRate, uperr.ClassModelRate:
+		return true
+	}
+	return false
+}
+
+// briefRetry asks for ONE more full Execute pass when some pool in the route
+// unlocks inside briefRetryWindow. The wait is bounded by the unlock moment
+// (not the window: a pool unlocking in 10s waits 10s); if nothing unlocks in
+// time the original error stands. tr.BriefRetried makes it once-per-request.
+func (g *Gateway) briefRetry(ctx context.Context, req *ir.ChatRequest, emit driver.Emit, tr *Trace) (*Result, error) {
+	if tr.BriefRetried {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "brief retry already used")
+	}
+	type cand struct {
+		channel string
+		until   time.Time
+	}
+	best := cand{until: time.Now().Add(briefRetryWindow)}
+	for _, binding := range g.router.Resolve(req.Model) {
+		ok, earliest := g.pool.NextAvailable(binding.Channel, req.Model)
+		if ok || earliest.IsZero() || earliest.After(best.until) {
+			continue
+		}
+		best = cand{channel: binding.Channel, until: earliest}
+	}
+	if best.channel == "" {
+		return nil, uperr.New(uperr.ClassCanceled, 0, "brief retry: no pool unlocks soon")
+	}
+	wait := time.Until(best.until)
+	if wait > 0 {
+		log.Printf("gateway: brief retry: %s unlocks in %s — waiting once instead of failing", best.channel, wait.Round(time.Millisecond))
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return nil, uperr.New(uperr.ClassCanceled, 0, "brief retry: client gone")
+		}
+	}
+	tr.BriefRetried = true
+	return g.Execute(ctx, req, emit)
 }
 
 // concurrencyError renders the per-pool refusal. The gateway aggregates these
@@ -1293,13 +1378,13 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		if streamErr != nil && !emitted() {
 			if ue, ok := uperr.As(streamErr); ok && ue.Class == uperr.ClassUpstreamBusy && ctx.Err() == nil {
 				for r := 0; r < 2; r++ {
-						if !ue.ResetAt.IsZero() {
-							if wait := time.Until(ue.ResetAt); wait > 5*time.Second {
-								log.Printf("gateway: %s queue busy with deep wait (%s > 5s) — skipping retries to cascade immediately (BP-263)",
-									binding.Channel, wait.Round(time.Second))
-								break // deep queue: hand the wait to the cascade / client
-							}
+					if !ue.ResetAt.IsZero() {
+						if wait := time.Until(ue.ResetAt); wait > 5*time.Second {
+							log.Printf("gateway: %s queue busy with deep wait (%s > 5s) — skipping retries to cascade immediately (BP-263)",
+								binding.Channel, wait.Round(time.Second))
+							break // deep queue: hand the wait to the cascade / client
 						}
+					}
 					backoff := 500 * time.Millisecond << r
 					select {
 					case <-actx.Done():
@@ -1534,9 +1619,39 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		if cancel != nil {
 			cancel()
 		}
+		// BP-335 empty-reply detection (magpie d847b796 + CLIProxyAPI 892fc486,
+		// both 2026-11-20): the upstream can end a turn CLEANLY having produced
+		// nothing — finish=stop (or a bare [DONE]) with zero text, zero
+		// reasoning, zero tool calls. Every driver defaults a missing finish
+		// reason to StopEnd, and the starved rescue's two shapes both require
+		// SOMETHING (shape A needs finish=length, shape B needs reasoning to
+		// have streamed), so this shape fell through to the success branch:
+		// ApplyResult(nil), sticky kept, 200 with an empty body, and the client
+		// reported "Stream ended without finish_reason" without ever retrying.
+		//
+		// Judged HERE rather than in each driver because the terminal is still
+		// HELD (heldDone above): nothing has reached the client yet, so the
+		// existing cascade and same-account continuation are both still
+		// available. One guard covers all ten drivers.
+		//
+		// Guards: an explicit tiny max_tokens is a liveness probe and an empty
+		// answer is its honest result (same threshold the starved rescue uses);
+		// a client that asked for no output at all is not a failure either.
+		if streamErr == nil && emptyReplyOf(req, ledger) {
+			streamErr = uperr.New(uperr.ClassEmptyReply, 0,
+				"%s: the turn ended cleanly with no output at all (no text, no reasoning, no tool call) — the upstream answered nothing",
+				binding.Channel)
+			log.Printf("gateway: %s account %s (%s) produced an EMPTY reply (stop=%q, max_tokens=%d) — treating as a failed leg so the cascade can try elsewhere",
+				binding.Channel, lease.Account.ID, lease.Account.Nickname, stopOf(resp), req.MaxTokens)
+		}
 		// BP-295: release the held terminal — exactly one, carrying the FINAL
 		// stop reason (a continuation may have turned length into end).
-		if ledger.heldDone != nil && !ledger.doneReleased {
+		//
+		// BP-335: NOT on an empty-reply leg. The driver already emitted its
+		// terminal (that is what heldDone holds), but the leg is now being
+		// retried — releasing it would tell the client "done, empty" and close
+		// the stream before the cascade ever runs.
+		if streamErr == nil && ledger.heldDone != nil && !ledger.doneReleased {
 			ledger.doneReleased = true
 			final := ledger.heldDone.Stop
 			if resp != nil && resp.StopReason != "" {
@@ -1605,6 +1720,9 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 			ue = uperr.New(uperr.ClassInternal, 0, "%v", streamErr)
 		}
 		lastUE = ue
+		// BP-335: set by the request-scoped guard below when this leg must not
+		// cool its account (the request already cost one).
+		skipCooldown := false
 		// One line per failed leg: without it the log only shows the final
 		// channel's error, which is how "WorkBuddy died" rumors start. The
 		// window marker separates "our timer gave up" from an upstream error.
@@ -1644,7 +1762,25 @@ func (g *Gateway) executeBinding(ctx context.Context, binding router.Binding, re
 		// zai_auto, BP-116) keeps its own spelling: that wall is scoped to
 		// the named model, not to this request's.
 		rekeyCooldownModel(ue, binding.UpstreamModel, req.Model)
-		g.pool.ApplyResult(lease.Account, req.Model, ue)
+		// BP-335 (sub2api #8973): a request-scoped failure (a bare 429) has
+		// already cost this request one account. The SAME body gets the same
+		// answer from the next account, so cooling it too is pure self-harm —
+		// with maxAccountAttempts=3 that turned one oversized request into three
+		// cooled accounts. Record the first one and skip the rest; the accounts
+		// stay fully available to every other request.
+		if ue.RequestScoped {
+			if tr != nil && tr.RequestScopedCooled != "" && tr.RequestScopedCooled != lease.Account.ID {
+				log.Printf("gateway: %s account %s (%s) hit the same request-scoped failure (bare 429) that already cooled %s — NOT cooling a second account for one request",
+					binding.Channel, lease.Account.ID, lease.Account.Nickname, tr.RequestScopedCooled)
+				ue.RequestScoped = false // consumed: do not let a later leg skip on this flag
+				skipCooldown = true
+			} else if tr != nil {
+				tr.RequestScopedCooled = lease.Account.ID
+			}
+		}
+		if !skipCooldown {
+			g.pool.ApplyResult(lease.Account, req.Model, ue)
+		}
 		if ue.Class == uperr.ClassAccountRestricted {
 			// Say out loud that an account just left routing: otherwise the
 			// only trace is a disabled checkbox in the panel, and "the pool is
@@ -2032,6 +2168,17 @@ func DescribeError(err error) (status int, class string, message string) {
 		// (not 500): the client is not at fault, and retrying the same account
 		// is pointless — the panel now shows the disabled account.
 		return 403, ue.Class, "upstream restricted the account: " + ue.Message
+	case uperr.ClassEmptyReply:
+		// BP-335: the upstream ended the turn cleanly having produced nothing.
+		// 502 is the honest answer — the gateway did its job and the upstream
+		// returned an empty turn; a 200 with an empty body is what made clients
+		// report "Stream ended without finish_reason" and never retry.
+		return 502, ue.Class, "upstream returned an empty reply (no text, no reasoning, no tool call): " + ue.Message
+	case uperr.ClassProtocol:
+		// BP-335: the upstream answered outside its own protocol (non-JSON
+		// body, oversized frame, a task that failed after acceptance). Not the
+		// account's fault and not the request's.
+		return 502, ue.Class, "upstream protocol error (not an account problem): " + ue.Message
 	case uperr.ClassConcurrencyExceeded:
 		// Every pool is serving someone else. 429 + the plain reason; queueing
 		// silently was the old behaviour and it looked like a hang.

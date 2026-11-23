@@ -4,7 +4,6 @@
 package server
 
 import (
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -49,9 +48,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	start := time.Now()
 	reqID := "msg_" + randToken(12)
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	body, status, err := readRequestBody(r, maxInboundBody)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, anthropic.RenderError("invalid_request_error", "failed to read body"))
+		writeJSON(w, statusOr(status, http.StatusBadRequest), anthropic.RenderError("invalid_request_error", err.Error()))
 		return
 	}
 	req, err := anthropic.ParseMessagesRequest(body)
@@ -171,9 +170,9 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleCountTokens(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, status, err := readRequestBody(r, 8<<20)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, anthropic.RenderError("invalid_request_error", "failed to read body"))
+		writeJSON(w, statusOr(status, http.StatusBadRequest), anthropic.RenderError("invalid_request_error", err.Error()))
 		return
 	}
 	req, err := anthropic.ParseMessagesRequest(body)
@@ -193,9 +192,9 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	reqID := "resp_" + randToken(12)
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	body, status, err := readRequestBody(r, maxInboundBody)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, responses.RenderError("invalid_request_error", "failed to read body"))
+		writeJSON(w, statusOr(status, http.StatusBadRequest), responses.RenderError("invalid_request_error", err.Error()))
 		return
 	}
 	req, err := responses.ParseRequest(body)
@@ -337,9 +336,9 @@ func (s *Server) handleGeminiGenerate(w http.ResponseWriter, r *http.Request) {
 		streaming = false
 	}
 
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	body, status, err := readRequestBody(r, maxInboundBody)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, geminiv1.RenderError(400, "INVALID_ARGUMENT", "failed to read body"))
+		writeJSON(w, statusOr(status, http.StatusBadRequest), geminiv1.RenderError(statusOr(status, 400), "INVALID_ARGUMENT", err.Error()))
 		return
 	}
 	session := r.Header.Get("X-Session-Id")

@@ -310,6 +310,14 @@ func continuationRequestNudge(req *ir.ChatRequest, ledger *streamLedger, nudge s
 	return &clone
 }
 
+// stopOf renders a response's stop reason for a log line, tolerating nil.
+func stopOf(resp *ir.ChatResponse) string {
+	if resp == nil {
+		return ""
+	}
+	return string(resp.StopReason)
+}
+
 // mergedResponse builds the aggregate the caller sees after several segments:
 // the whole text the client received, the last segment's stop reason, and the
 // summed usage (every segment was a separately billed call).

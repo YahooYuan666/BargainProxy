@@ -304,7 +304,18 @@ func main() {
 	// and the panel's login rate limiter read.
 	clientip.SetTrustForwarded(cfg.TrustForwardedFor)
 	if cfg.TrustForwardedFor {
-		log.Printf("client ip: trusting X-Forwarded-For (rightmost hop) — a proxy must be in front")
+		// BP-335 (Coding2API 21879bdd): with forwarding on but no peer
+		// allowlist, ANY caller that can reach the port sets its own source IP —
+		// and therefore its own login rate-limit bucket. An allowlist pins the
+		// header to the proxies that actually append it.
+		if err := clientip.SetTrustedProxies(cfg.TrustedProxies); err != nil {
+			log.Fatalf("client ip: bad trusted_proxies entry: %v", err)
+		}
+		if n := clientip.TrustedProxies(); n > 0 {
+			log.Printf("client ip: trusting X-Forwarded-For (rightmost hop) only from %d trusted proxy range(s)", n)
+		} else {
+			log.Printf("client ip: trusting X-Forwarded-For (rightmost hop) from ANY peer — set trusted_proxies to pin it to your proxy")
+		}
 	}
 
 	// HTTP server.

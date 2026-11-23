@@ -39,6 +39,11 @@ type SplitScanner struct {
 	s     *bufio.Scanner
 	queue []string
 	cur   string
+	// BP-335 cross-line assembly: a `data:` payload that does not parse yet is
+	// held here and re-tried with each following data line until it closes (or
+	// the buffer is abandoned at an event boundary).
+	pending     string
+	pendingByte int
 }
 
 // NewSplitScanner wraps r with the glue-splitting scanner.
@@ -64,6 +69,10 @@ func (ss *SplitScanner) Scan() bool {
 		return false
 	}
 	line := ss.s.Text()
+	// Order matters: the glued-frame splitter (BP-318) runs FIRST. A line
+	// holding several complete JSON values is not a "value split across lines"
+	// — it fails json.Valid as a whole, which is exactly the shape the
+	// assembly step would otherwise try to accumulate.
 	if parts, ok := splitGluedDataLine(line); ok {
 		// Field signal (misakano afb5f224): this is the only trace a glued
 		// frame leaves behind — log it, then hand each value its own line.
@@ -74,8 +83,128 @@ func (ss *SplitScanner) Scan() bool {
 		}
 		return ss.Scan()
 	}
+	// BP-335: a JSON value split across several `data:` lines (the upstream
+	// pretty-prints, or a proxy re-wraps) used to fail the per-line decode and
+	// be DROPPED — a mid-stream error frame broken that way was invisible, so
+	// the turn ended as a silent empty success. Assemble it here so every
+	// driver's loop body sees one complete `data:` line per event.
+	if assembled, suppress := ss.assembleCrossLine(line); suppress {
+		return ss.Scan() // fragment consumed; nothing for the driver to see
+	} else if assembled != "" {
+		ss.cur = assembled
+		return true
+	}
 	ss.cur = line
 	return true
+}
+
+// maxAssembledBytes bounds a cross-line assembly. An event that never closes
+// must not accumulate forever; past this the buffer is dropped and the stream
+// continues with whatever follows (the driver's own empty-reply/transport nets
+// then speak for the lost event).
+const maxAssembledBytes = 8 << 20
+
+// assembleCrossLine folds a `data:` line into the pending assembly, or starts
+// one. It returns ok=true with a complete `data:` line when the assembly
+// closes on this call.
+//
+// While an assembly is open, its fragments must NOT reach the driver loop (the
+// per-line decode would fail and log noise, and a driver that tolerates bad
+// frames would see three broken ones). suppressed=true says "this line was
+// consumed by an assembly — yield nothing".
+//
+// Boundaries: a blank line, a `[DONE]`, or a non-data line ends the current
+// event — a pending assembly that has not closed by then is ABANDONED (per the
+// SSE spec an event is delimited by a blank line, so an unterminated value
+// belongs to no event). That keeps one malformed event from swallowing the
+// rest of the stream.
+func (ss *SplitScanner) assembleCrossLine(line string) (assembled string, suppress bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	isData := strings.HasPrefix(trimmed, "data:")
+	payload := ""
+	if isData {
+		payload = strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	}
+	// Event boundary: flush what we have (dropping it) and let the line pass.
+	if !isData || trimmed == "" || payload == "[DONE]" {
+		if ss.pending != "" {
+			log.Printf("WARN: [streamx] abandoning an unterminated multi-line JSON event (%d bytes) at an event boundary", len(ss.pending))
+			ss.pending, ss.pendingByte = "", 0
+		}
+		return "", false
+	}
+	// A payload that already parses is complete on its own; nothing to join.
+	if ss.pending == "" && json.Valid([]byte(payload)) {
+		return "", false
+	}
+	if ss.pending == "" {
+		// Start an assembly only when this payload does NOT parse — otherwise
+		// the line is a normal event and must pass through untouched.
+		if !LooksLikeJSON(payload) {
+			return "", false
+		}
+		ss.pending = payload
+		ss.pendingByte = len(payload)
+		return "", true // fragment consumed: do not hand it to the driver
+	}
+	// Join: the upstream may or may not put a newline between the fragments.
+	joined := ss.pending + payload
+	if len(joined) > maxAssembledBytes {
+		log.Printf("WARN: [streamx] multi-line JSON event exceeded %d bytes — dropping it", maxAssembledBytes)
+		ss.pending, ss.pendingByte = "", 0
+		return "", true
+	}
+	if json.Valid([]byte(joined)) {
+		log.Printf("WARN: [streamx] assembled a JSON event split across data lines (%d bytes)", len(joined))
+		ss.pending, ss.pendingByte = "", 0
+		return "data:" + joined, false
+	}
+	// Still open — but a concatenation that has gone structurally impossible
+	// (unbalanced braces) will never close; drop it rather than poison the
+	// rest of the stream.
+	if !plausiblyOpenJSON(joined) {
+		log.Printf("WARN: [streamx] multi-line JSON event became structurally impossible (%d bytes) — dropping it", len(joined))
+		ss.pending, ss.pendingByte = "", 0
+		return "", true
+	}
+	ss.pending = joined
+	ss.pendingByte = len(joined)
+	return "", true // still accumulating: consume the fragment
+}
+
+// plausiblyOpenJSON reports whether s is a prefix that could still become a
+// valid JSON value: depth never goes negative and it ends inside an object or
+// array (or inside a string).
+func plausiblyOpenJSON(s string) bool {
+	depth := 0
+	inStr := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{', '[':
+			depth++
+		case '}', ']':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+	return depth > 0 || inStr
 }
 
 // Text returns the current logical line.

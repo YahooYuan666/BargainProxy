@@ -38,6 +38,16 @@ func applyModelsDevShape(entry map[string]any, canonical string, natives []strin
 	if len(limit) > 0 {
 		entry["limit"] = limit
 	}
+	// BP-335 (Coding2API 3e5e8aed): Claude Code and several SDKs read the FLAT
+	// names `max_input_tokens` / `max_output_tokens` to size their auto-compact
+	// window, and an alias model is where a guess goes wrong. Same values as
+	// the nested form, omitted when unknown (never a padded default).
+	if spec.ContextLen > 0 {
+		entry["max_input_tokens"] = spec.ContextLen
+	}
+	if spec.MaxOutput > 0 {
+		entry["max_output_tokens"] = spec.MaxOutput
+	}
 	// modalities: what the model accepts in and puts out. Output is always
 	// text for a chat model — an image model never reaches this handler
 	// (BP-186 routes it to /v1/images/generations).

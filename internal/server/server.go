@@ -10,7 +10,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -195,9 +194,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	w = tw
 	start := time.Now()
 	reqID := "chatcmpl-" + randToken(12)
-	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
+	body, status, err := readRequestBody(r, maxInboundBody)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, openai.RenderError("failed to read body", "invalid_request_error", nil))
+		writeJSON(w, statusOr(status, http.StatusBadRequest), openai.RenderError(err.Error(), "invalid_request_error", nil))
 		return
 	}
 	req, err := openai.ParseChatRequest(body)

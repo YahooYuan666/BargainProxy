@@ -21,8 +21,17 @@ type Config struct {
 	// only when a reverse proxy you control sits in front and appends the
 	// header; the RIGHTMOST hop is then used (what that proxy observed), not
 	// the leftmost (what the client typed).
-	TrustForwardedFor bool   `json:"trust_forwarded_for,omitempty"`
-	APIKey            string `json:"api_key"` // empty = no auth (local use)
+	TrustForwardedFor bool `json:"trust_forwarded_for,omitempty"`
+	// TrustedProxies pins X-Forwarded-For to the peers that may append it
+	// (BP-335, Coding2API 21879bdd). Entries are IPs or CIDRs.
+	//
+	// Empty (the default) keeps the old behaviour: when trust_forwarded_for is
+	// on, any peer's XFF is believed. That is fine behind a fixed local proxy
+	// and unsafe the moment the port is reachable from anywhere else — a caller
+	// then chooses its own source IP and its own login rate-limit bucket.
+	// Setting this makes the socket peer itself the gate.
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
+	APIKey         string   `json:"api_key"` // empty = no auth (local use)
 
 	Store       string `json:"store"`         // "memory" | "postgres"
 	Database    string `json:"database"`      // postgres dsn
@@ -345,7 +354,7 @@ type QoderSettings struct {
 	// real device identity).
 	CheckinMachineTokenIntl string `json:"checkin_machine_token_intl"`
 	CheckinMachineTypeIntl  string `json:"checkin_machine_type_intl"`
-	CheckinMachineType  string `json:"checkin_machine_type"`
+	CheckinMachineType      string `json:"checkin_machine_type"`
 }
 
 // OpenAICompatSettings configures the generic fallback channel.

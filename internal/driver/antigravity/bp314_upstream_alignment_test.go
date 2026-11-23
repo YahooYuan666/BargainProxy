@@ -44,12 +44,27 @@ func TestStableSessionIDMatchesReferenceAlgorithm(t *testing.T) {
 		t.Fatalf("buildRequest: %v", err)
 	}
 	sid := sessionIDOf(t, raw)
-	// Reference: sha256("在么") first 8 bytes, & 0x7FFFFFFFFFFFFFFF, "-"+decimal.
-	// Hard-coded so a silent algorithm change (e.g. hashing the wrong message)
-	// shows up here instead of as a cache miss upstream.
-	const want = "-8210116156397361059"
-	if sid != want {
-		t.Fatalf("sessionId = %q, want %q (sha256 of the first USER text, not the system one)", sid, want)
+	// BP-335: the default id is the SIGNED int64 (CLIProxyAPI 55e5a7ea: the
+	// Hub's real ids carry both signs, so an always-positive always-dashed
+	// generator is a fingerprintable deviation). The LEGACY shape is still
+	// available via SetLegacySessionID for rollback.
+	//
+	// Both are hard-coded so a silent algorithm change (e.g. hashing the wrong
+	// message) shows up here instead of as a cache miss upstream.
+	const wantSigned = "8210116156397361059"
+	const wantLegacy = "-8210116156397361059"
+	if sid != wantSigned {
+		t.Fatalf("sessionId = %q, want %q (signed sha256 of the first USER text, not the system one)", sid, wantSigned)
+	}
+
+	SetLegacySessionID(true)
+	defer SetLegacySessionID(false)
+	legacyRaw, err := buildRequest("aicode-consumers", "gemini-3.8-flash-high", req, nil)
+	if err != nil {
+		t.Fatalf("buildRequest (legacy): %v", err)
+	}
+	if legacy := sessionIDOf(t, legacyRaw); legacy != wantLegacy {
+		t.Fatalf("legacy sessionId = %q, want %q", legacy, wantLegacy)
 	}
 }
 

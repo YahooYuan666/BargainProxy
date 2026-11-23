@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -22,9 +21,9 @@ import (
 
 func (s *Server) handleVideoGenerations(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
+	body, status, err := readRequestBody(r, 8<<20)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, openai.RenderError("failed to read body", "invalid_request_error", nil))
+		writeJSON(w, statusOr(status, http.StatusBadRequest), openai.RenderError(err.Error(), "invalid_request_error", nil))
 		return
 	}
 	var in struct {

@@ -232,7 +232,8 @@ func buildBody(call driver.ChatCall) ([]byte, error) {
 }
 
 func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
+	sc := streamx.NewSplitScanner(r)
+	// BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
@@ -594,6 +595,12 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		e := uperr.New(uperr.ClassBadRequest, status, "openaicompat: %s", truncate(body, 300))
 		uperr.MarkOverflow(e, text)
 		return uperr.WithFields(e, body)
+	case status == 408:
+		// BP-335 (sub2api #8968): a 408 is the upstream timing out on
+		// THIS request — not the account's fault, and another account hits
+		// the same slow upstream. The generic default used to charge a
+		// strike for it.
+		return uperr.RequestTimeout(status, "%s", truncate(body, 300))
 	case status >= 500:
 		return uperr.WithFields(uperr.New(uperr.ClassTransport, status, "openaicompat: %s", truncate(body, 300)), body)
 	default:

@@ -130,6 +130,35 @@ var functionsTrae = []string{
 	"solo_agent_remote", "solo_coder",
 }
 
+// soloAgentOnlyModels lists the models that publish themselves ONLY under
+// fn=solo_agent_remote (trae2api-hub 32961736 + 93d24a14, 2026-11-20/21: the
+// catalogue's per-function model lists). Sending one of these under the
+// default solo_work_lite is a GUARANTEED 4001 — the error text talks about
+// max_tokens/messages and looks like a payload bug, but the real cause is the
+// function group. Reordering the walk for these models saves one doomed
+// upstream round trip per request; the ladder itself is untouched (the wrong
+// function still falls through to the rest in the same order).
+var soloAgentOnlyModels = map[string]bool{
+	"doubao-seed-code": true,
+	"qwen3.8-flash":    true,
+}
+
+// preferredFunctionsFor puts the models' own function group first for the
+// models that need it, and leaves every other model's walk unchanged.
+func preferredFunctionsFor(model string) []string {
+	if !soloAgentOnlyModels[strings.ToLower(model)] {
+		return functionsTrae
+	}
+	out := make([]string, 0, len(functionsTrae))
+	out = append(out, "solo_agent_remote")
+	for _, fn := range functionsTrae {
+		if fn != "solo_agent_remote" {
+			out = append(out, fn)
+		}
+	}
+	return out
+}
+
 // Creds is the persisted credential shape for a trae account.
 type Creds struct {
 	AccessToken  string `json:"access_token"` // Cloud-IDE-JWT
@@ -352,7 +381,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	var resp *ir.ChatResponse
 	var lastBody []byte
 	lastFn := functionsTrae[0]
-	for _, fn := range functionsTrae {
+	for _, fn := range preferredFunctionsFor(call.UpstreamModel) {
 		body, berr := buildSOLOBody(call, fn)
 		if berr != nil {
 			return nil, uperr.New(uperr.ClassBadRequest, 400, "trae: build body: %v", berr)
@@ -819,6 +848,25 @@ func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit drive
 				toolOrder = append(toolOrder, idx)
 			}
 			if v, ok := tc["id"].(string); ok && v != "" {
+				// BP-335 (Trae2api-cn f6eeeba6, 2026-11-22): a native model can
+				// CLOSE call A and then reuse the same transport index for call
+				// B — the index is a fragment-association slot, not a logical
+				// identity. An explicit NEW id on an index whose accumulated
+				// arguments are already complete JSON therefore opens a new
+				// public call (fresh slot, fresh order entry), exactly like the
+				// same-index-new-id rule in streamx.ToolFolder. The old
+				// behaviour appended B's arguments onto A's.
+				if acc, exists := toolAcc[idx]; exists && acc.ID != "" && acc.ID != v && wholeJSON(acc.Arguments) {
+					if fn, isObj := tc["function"].(map[string]any); isObj {
+						if args, _ := fn["arguments"].(string); args != "" && wholeJSON(args) &&
+							args != acc.Arguments {
+							idx = len(toolAcc) + firstFreeToolIndex(toolAcc)
+							acc = &ir.ToolCall{}
+							toolAcc[idx] = acc
+							toolOrder = append(toolOrder, idx)
+						}
+					}
+				}
 				acc.ID = v
 			}
 			fn, _ := tc["function"].(map[string]any)
@@ -1298,6 +1346,28 @@ func classifyBusiness(code int, msg string) *uperr.Error {
 		// rejected (stale/rotated). ClassAuth so Stream can self-heal with a
 		// forced token exchange (ticket 37).
 		return uperr.New(uperr.ClassAuth, 401, "trae: %s", msg)
+	case 4015, 4019:
+		// BP-335 (trae2api-hub 683a3385 + b2243de2, 2026-11-20/21): a
+		// RISK-CONTROL 403 — 4015 (upstream rejected the request) and 4019
+		// (risk-control hit) are decided by the DEVICE FINGERPRINT and the
+		// egress IP, both of which every account in this pool shares. The next
+		// account therefore gets the identical answer, and the old path (code
+		// not recognised → ClassInternal → rotatable) walked the whole pool,
+		// charging each account a strike: one request could leave every trae
+		// account cooling for 30 minutes.
+		//
+		// ClassAccountRestricted is the class for exactly this (BP-146,
+		// workbuddy 11140): Rotatable=false, so the same channel is not
+		// re-walked, while the binding loop may still cascade to a DIFFERENT
+		// upstream — a different device/egress is a different verdict.
+		//
+		// The upstream wording is NOT forwarded: risk-control copy is
+		// sensitive and names internal signals.
+		e := uperr.New(uperr.ClassAccountRestricted, 403,
+			"trae: risk control blocked this device/egress (code=%d) — switching accounts cannot help; parked for 30 minutes", code)
+		e.Code = fmt.Sprint(code)
+		e.ResetAt = time.Now().Add(30 * time.Minute)
+		return e
 	case 1005, 4008, 4011:
 		// The plan-entitlement family: 1005 CN/Global, 4008 CN, 4011 Global
 		// (magpie 0.2.19 site tables). Field evidence from traework2api-panel
@@ -1353,6 +1423,18 @@ func classifyBusiness(code int, msg string) *uperr.Error {
 		e.Code = fmt.Sprint(code)
 		e.ContextOverflow = true
 		return e
+	case 4054:
+		// BP-335 (TraeWorkAssistant 6f8a8cbf, 2026-11-20, issue #212/#151):
+		// 4054 is "模型请求失败，请稍后重试" — a TRANSIENT overload, not a
+		// client error and not an account fault. It used to fall to `default`
+		// → ClassInternal, so every account in the pool took a strike for one
+		// busy moment; on a small pool that starves the channel into a 503.
+		// ClassSoftRate with a short model-scoped hold is the honest verdict:
+		// wait a little, the same account will serve.
+		e := uperr.New(uperr.ClassSoftRate, 429, "trae: model temporarily unavailable (4054): %s", msg)
+		e.Code = "4054"
+		e.ResetAt = time.Now().Add(60 * time.Second)
+		return e
 	default:
 		return uperr.New(uperr.ClassInternal, 200, "trae: code=%d %s", code, msg)
 	}
@@ -1386,9 +1468,27 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		if uperr.IsEdgeBlock(body) {
 			return uperr.EdgeBlocked(status, "trae: edge blocked: %s", truncate(body, 300))
 		}
+		// BP-335: a 403 whose body carries no parseable business code can still
+		// be a risk-control hit — the upstream sometimes words it as
+		// "risk_control" or "unusual activity" with no numeric code. Same
+		// verdict as 4015/4019: the device/egress is flagged, so the rest of
+		// the pool answers identically and must not be walked.
+		if lower := strings.ToLower(string(body)); strings.Contains(lower, "risk_control") ||
+			strings.Contains(lower, "risk control") || strings.Contains(lower, "unusual activity") {
+			e := uperr.New(uperr.ClassAccountRestricted, 403,
+				"trae: risk control blocked this device/egress — switching accounts cannot help; parked for 30 minutes")
+			e.ResetAt = time.Now().Add(30 * time.Minute)
+			return e
+		}
 		return uperr.New(uperr.ClassWAF, status, "trae: %s", truncate(body, 300))
 	case status == 400:
 		return uperr.New(uperr.ClassBadRequest, status, "trae: %s", truncate(body, 300))
+	case status == 408:
+		// BP-335 (sub2api #8968): a 408 is the upstream timing out on
+		// THIS request — not the account's fault, and another account hits
+		// the same slow upstream. The generic default used to charge a
+		// strike for it.
+		return uperr.RequestTimeout(status, "%s", truncate(body, 300))
 	case status >= 500:
 		return uperr.New(uperr.ClassTransport, status, "trae: %s", truncate(body, 300))
 	default:
@@ -2219,4 +2319,14 @@ func truncate(b []byte, n int) string {
 		return string(b)
 	}
 	return string(b[:n]) + "…"
+}
+
+// firstFreeToolIndex finds the smallest unused accumulator index so a
+// re-opened call gets its own slot without colliding with the existing ones.
+func firstFreeToolIndex(acc map[int]*ir.ToolCall) int {
+	for i := 0; ; i++ {
+		if _, taken := acc[i]; !taken {
+			return i
+		}
+	}
 }

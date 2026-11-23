@@ -1170,6 +1170,14 @@ func (p *Pool) restAccount(a *model.Account, until time.Time, reason, by string,
 	// wall.go.
 	until = onWall(until)
 	if until.After(a.AccountCooldownUntil) {
+		// BP-335 (Coding2API c83ccc6d): a state-TRANSITION line, so "why was
+		// this account unavailable at 14:00 yesterday" is one grep instead of
+		// a log-archaeology session. Logged only when the wall moves LATER —
+		// re-arming with an earlier one is a no-op and must not double-log.
+		log.Printf("pool: %s (%s) cooldown extended %s → %s (%s, by %s)",
+			a.ID, a.Nickname,
+			a.AccountCooldownUntil.Format("2006-01-02 15:04:05"),
+			until.Format("2006-01-02 15:04:05"), reason, by)
 		a.AccountCooldownUntil = until
 		a.AccountCooldownReason = reason
 		a.AccountCooldownBy = by
@@ -1349,7 +1357,17 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		// panel shows the cooldown with its end time, the account rejoins
 		// routing on its own, and a fresh hit while resting simply pushes the
 		// wall out again (restAccount keeps the later of the two).
-		p.restAccount(a, now.Add(7*24*time.Hour), "restricted by upstream", "fixed", now)
+		//
+		// BP-335: a caller that KNOWS the restriction's length says so with
+		// ResetAt. Trae's risk-control 403 (4015/4019) is a device/egress flag
+		// that clears in about 30 minutes, not a week — parking the account for
+		// 7 days for it would take a healthy pool offline over a transient
+		// fingerprint hit. workbuddy 11140 sets no ResetAt and keeps the week.
+		until := now.Add(7 * 24 * time.Hour)
+		if !upstreamErr.ResetAt.IsZero() && upstreamErr.ResetAt.After(now) {
+			until = upstreamErr.ResetAt
+		}
+		p.restAccount(a, until, "restricted by upstream", "fixed", now)
 		a.Paused = false
 		a.ConsecutiveFails = 0
 		a.BreakerFails = 0
@@ -1438,6 +1456,16 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 		if d := p.params.UpstreamBusyCooldown; d > 0 {
 			p.markChannelBusyLocked(a.Channel, upstreamErr.Model, now.Add(d))
 		}
+		return
+	case uperr.ClassEmptyReply, uperr.ClassProtocol:
+		// BP-335: the upstream answered nothing (empty_reply) or answered with
+		// something that is not its own protocol (protocol: non-JSON body,
+		// oversized frame, a task that failed after acceptance). Neither says
+		// anything about the ACCOUNT — another turn on the same account may
+		// well succeed, and the request ledger keeps the row either way. Before
+		// this branch both shapes fell here to the generic default and fed
+		// ConsecutiveFails, so upstream protocol garbage benched healthy
+		// accounts (Coding2API 31ce9b03, 2026-11-23). No penalty.
 		return
 	default:
 		// BP-194: the same no-double-count guard the SoftRate branch has —
