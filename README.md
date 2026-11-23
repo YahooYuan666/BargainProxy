@@ -178,7 +178,7 @@ open http://127.0.0.1:13140/panel/
 - **Antigravity（窗口型）**：按「剩余配额 / 距重置秒数」的贪婪系数排序，优先烧即将重置的窗口；单号并发 3，会话粘性强绑定，429 按上游给出的精确重置时间冷却。
 - **WorkBuddy / Trae / ZCode（积分型）**：健康过滤 → 成本分层（实测限免 > 未知 > 实测收费，ε-greedy 定期探索未知档）→ 快过期积分加权 → Top5 洗牌加权随机 → 0.1s 并发避让；6004 模型级冷却只屏蔽该模型，402 冷却至次日 04:00（北京时间）。
 - **跨渠道**：同名模型绑定多个渠道时按「能力 → 免积分 → 渠道优先序 → 会话粘性」选择；渠道忙/冷却时自动降级并回写 `X-BP-Served-Channel`。
-- **Trae 两条通道**：带 tools 的请求走 `llm_utils_chat`（实测支持至 1,024,000 token，工具可正常往返）；不带 tools 且超长请求亦可走 `chat_sessions`（上限 1,000,000，但那条路上游跑自己的 agent、不认单次请求里的 tools）；带 tools 且超过 1.02M 的请求在发出去之前判定本渠道装不下、直接交给下一个渠道，不再白等必然的 4022。
+- **Trae 单一通道**：所有请求（带不带 tools 都一样）走 `llm_utils_chat` + function 阶梯（`solo_work_lite` → `chat_v3` → `solo_agent` → `solo_agent_lite` → `solo_agent_remote` → `solo_coder`）。实测带 tools 可到 1,020,179 token（needle 回显证明整段被读），1,800,000 才回 4022。**不做本地体积闸门**：真装不下时由上游回 4022/4026，网关如实转成 400 并标记 `ContextOverflow`，让客户端自己压缩重试。（早期版本按「带 tools 走 `llm_utils_chat`、不带 tools 且超长走 `chat_sessions`」分流并在超限前本地拒发；`chat_sessions` 会跑上游自己的 agent、忽略调用方 tools，且该分支从未被真实请求走到，已整体移除。）
 - **不轮换的情形**：内容级拒绝（含 HTTP 200 哨兵正文、`first_buddy` 类业务门槛）不换号，直接按协议返回错误。
 
 ## 任务中心
