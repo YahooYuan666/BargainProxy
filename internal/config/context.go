@@ -34,6 +34,13 @@ var contextLengths = map[string]int{
 
 	// Google.
 	"gemini-3.5-flash": 1048576, // models.dev 共识
+
+	// Hy4（混元4，workbuddy CN+global 2026-11-23 /v3/config）:
+	// contextWindow.defaultLength=300000，supportedLengths 300k/600k/960k，
+	// maxInputTokens=960000。网关不协商扩展长度，只发布客户端展示的 300K。
+	"hy4std":        300000,
+	"hy4flash":      300000,
+	"hy4flash-free": 300000,
 }
 
 // ContextLength returns the advertised context window (in tokens) for a model

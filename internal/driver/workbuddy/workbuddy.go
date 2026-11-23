@@ -2409,12 +2409,15 @@ func (d *Driver) Models(ctx context.Context) ([]string, error) {
 		// which reads like an account-type limit but is a name error.
 		"kimi-k2.6", "kimi-k2.7", "kimi-k3", "kimi-k3-1", "kimi-k3.1-pro", "minimax-m3",
 		"hy3", "hy3-preview",
-		// BP-311: the CN /v3/config catalogue (2026-11-11) names the Hy4 family
-		// as two separate ids — hy4std is the flagship, hy4free the limited-time
-		// free tier the desktop client shows at 0.00×. Older entries like
-		// step-5-preview / mimo-v2.6-pro / space-bunny are listed there too but
-		// have no route of their own yet.
-		"hy4std", "hy4free",
+		// BP-336: both realms' /v3/config catalogues (2026-11-23) name the Hy4
+		// family as hy4std (flagship, 0.29×), hy4flash-free (limited-time free
+		// tier, 0.00×, 11-16~11-30 daily allowance) and hy4flash (paid tier,
+		// 0.03×). The BP-311-era `hy4free` is gone as a catalogue id — on CN it
+		// only survives as an alias of hy4std, and the global catalogue does not
+		// mention it at all, so listing it would send global accounts to 11102.
+		// Other CN entries (step-5-preview / mimo-v2.6-pro / space-bunny) still
+		// have no route of their own.
+		"hy4std", "hy4flash", "hy4flash-free",
 		"gemini-3.5-flash",
 	}, nil
 }

@@ -83,6 +83,16 @@ const DEFAULT_MAX_OUTPUT = 32768;
 const ACCEPTED_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
 const DEFAULT_EFFORTS = ["minimal", "low", "medium", "high"];
 
+// 网关自有模型的实测元数据（models.dev 没有这些 id，中性默认会把能力说小）。
+// 值来自上游 /v3/config 的一手目录（workbuddy CN+global，2026-11-23，BP-336）：
+//   contextWindow.defaultLength=300000 / maxOutputTokens=64000 / supportsImages=true /
+//   onlyReasoning 且 supportedEfforts 仅 high（canDisableThinking=false）。
+// 这些模型每次同步都会按本表刷新已知字段，其余字段（含用户改过的）保留。
+const LOCAL_MODEL_METADATA = {
+  hy4: { contextWindow: 300000, maxOutputTokens: 64000, supportsImage: true, efforts: ["high"] },
+  "hy4-flash": { contextWindow: 300000, maxOutputTokens: 64000, supportsImage: true, efforts: ["high"] },
+};
+
 const HTTP_TIMEOUT_MS = 5000;
 const TAG = "bargainproxy-opencode";
 
@@ -246,6 +256,8 @@ function pickModelMetaRaw(id, data) {
 }
 
 function metadataFor(id, modelsDev) {
+  const local = LOCAL_MODEL_METADATA[id];
+  if (local) return { ...local, efforts: [...local.efforts] };
   const raw = modelsDev ? pickModelMetaRaw(id, modelsDev) : null;
   const limit = raw?.limit ?? {};
   const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
@@ -439,7 +451,10 @@ function buildDoc(existing, base, apiKey, plan, metaFor, prevState, opts = {}) {
       for (const id of effective) {
         const reused = existingByKey.get(`${p.id}\u0000${id}`);
         if (reused) {
-          ourModelRules.push({ ...reused, providerId: p.id, modelId: id });
+          // 已存在的规则整条复用（保留用户写入的其它字段），但本地实测元数据
+          // 覆盖的已知字段要刷新——否则一旦写过中性默认，后续补上的实测值
+          // 永远进不去（hy4/hy4-flash 的 300K/64K/图片 曾因此被写成 262K/32K/无图）。
+          ourModelRules.push(refreshLocalMetadata({ ...reused, providerId: p.id, modelId: id }, id, metaFor(id)));
         } else {
           ourModelRules.push(buildModelRule(p.id, id, metaFor(id)));
         }
@@ -466,6 +481,34 @@ function buildDoc(existing, base, apiKey, plan, metaFor, prevState, opts = {}) {
   modelRules.providerModelRules = [...keptModelRules, ...ourModelRules];
   modelRules.manualProviderModelRules = [...keptManualRules];
   return doc;
+}
+
+/**
+ * 已存在模型规则的本地元数据刷新：只覆盖 LOCAL_MODEL_METADATA 声明过的字段，
+ * 其它键（用户写的隐藏字段 / 位置参数等）原样保留。未收录的模型直接返回原规则。
+ */
+function refreshLocalMetadata(rule, id, meta) {
+  if (!LOCAL_MODEL_METADATA[id]) return rule;
+  const out = JSON.parse(JSON.stringify(rule));
+  const cfg = out.config && typeof out.config === "object" ? out.config : (out.config = {});
+  const props = cfg.properties && typeof cfg.properties === "object" ? cfg.properties : (cfg.properties = {});
+  props.contextWindow = meta.contextWindow;
+  props.inputFormat = {
+    ...(props.inputFormat && typeof props.inputFormat === "object" ? props.inputFormat : {}),
+    supportsImage: meta.supportsImage,
+  };
+  const specs = cfg.optionSpecs && typeof cfg.optionSpecs === "object" ? cfg.optionSpecs : (cfg.optionSpecs = {});
+  specs.maxOutputTokens = {
+    ...(specs.maxOutputTokens && typeof specs.maxOutputTokens === "object" ? specs.maxOutputTokens : {}),
+    max: meta.maxOutputTokens,
+  };
+  if (meta.efforts.length > 0) {
+    specs.reasoningLevel = {
+      ...(specs.reasoningLevel && typeof specs.reasoningLevel === "object" ? specs.reasoningLevel : {}),
+      values: [...meta.efforts],
+    };
+  }
+  return out;
 }
 
 function buildModelRule(providerId, id, meta) {
