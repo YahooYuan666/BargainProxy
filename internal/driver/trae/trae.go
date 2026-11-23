@@ -65,19 +65,12 @@ const (
 	soloUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TraeCN/" +
 		uaBaseVersion + " Chrome/142.0.7444.235 Electron/39.2.7 Safari/537.36"
 
-	// traeToolInputCeiling is the input ceiling of the tool-bearing surface
-	// (llm_utils_chat), re-measured 2026-11-01.
+	// MEASURED PROMPT CEILING — reference only, not enforced here.
 	//
-	// HISTORY — the old value 262144 was WRONG as a channel ceiling.
-	// research/2026-10-24-trae-dual-channel-1m.md §2.2 recorded 261623 passing
-	// and ~264000 answering 4026, and concluded "channel-wide wall, model
-	// independent". That drove a hard pre-dispatch refusal for any tool-carrying
-	// prompt above 262144 (BP-103), which pushed every large tool turn to
-	// another channel and failed it outright on a Trae-only route.
-	//
-	// 2026-11-01 re-measurement (scripts/tmaxmode; a unique needle near the
-	// prompt's start is echoed back, so a silent truncation cannot pass as
-	// success):
+	// llm_utils_chat carries a tool-bearing prompt to ~1.02M tokens: the
+	// 2026-11-01 probes (scripts/tmaxmode, with a unique needle near the
+	// prompt's start echoed back so a silent truncation cannot pass as
+	// success) went
 	//
 	//	 300,501 tokens + tools -> 200
 	//	 453,481 tokens + tools -> 200
@@ -87,17 +80,21 @@ const (
 	//	1,020,179 tokens + tools -> 200   (needle echoed: whole prompt read)
 	//	1,800,000 tokens + tools -> 4022 "prompt tokens exceeded the maximum limit"
 	//
-	// Two facts settle it: (a) a tool-bearing prompt reaches ~1.02M tokens on
-	// this surface, and (b) probes WITHOUT is_max_mode got exactly as far as
-	// those with it — Max Mode is NOT what lifts the ceiling; the surface
-	// simply allows ~1M now. The remaining wall is 4022 (a different code from
-	// the 4026 seen on 10-23), at ~1.02M.
+	// and probes WITHOUT is_max_mode got exactly as far as those with it — Max
+	// Mode is NOT what lifts the ceiling; the surface simply allows ~1M.
 	//
-	// So the ceiling is the catalogue's own context_window_tokens.max
-	// (1000000) plus a tokenizer allowance, with tools supported all the way
-	// to it. Keeping 262144 here would keep discarding ~4x the context the
-	// channel actually serves.
-	traeToolInputCeiling = 1024000
+	// This number is NOT a dispatch gate. The driver sends every prompt and
+	// lets the upstream answer 4022/4026, which classifyBusiness turns into an
+	// honest 400 naming the prompt rather than the account. Two earlier
+	// generations of this driver got that wrong: BP-103 refused above 262144
+	// (a wall that never existed as a channel ceiling — research/
+	// 2026-10-24-trae-dual-channel-1m.md §2.2 had measured a DIFFERENT
+	// surface), and the 2026-11-23 field failure refused a real request at
+	// this number because the estimator fed to it counted history thinking
+	// that buildSOLOBody never sends (393434 real tokens read as 1120971).
+	// State it here so the measurement stays on the record, and enforce
+	// nothing with it.
+	traeMeasuredPromptCeiling = 1024000
 
 	// functionsTrae is the ladder of SOLO functions, tried in order. A model
 	// or tool set that one function refuses is often taken by the next: the
@@ -322,37 +319,33 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	if err != nil {
 		return nil, uperr.New(uperr.ClassAuth, 0, "%v", err)
 	}
-	// The channel has two surfaces (see sessions.go):
-	// llm_utils_chat serves our tools and, re-measured 2026-11-01, carries a
-	// tool-bearing prompt to ~1.02M tokens; chat_sessions reaches 1M but runs
-	// the vendor's own agent and ignores our tool declarations.
+	// ONE surface: llm_utils_chat, walked over the function ladder.
 	//
-	// llm_utils_chat stays the DEFAULT because it is the only surface that
-	// speaks our protocol (tool calls round-trip, sampling params, the function
-	// ladder). The session surface is entered only for a tool-FREE request too
-	// large for the ladder — using it for ordinary traffic would silently change
-	// how every answer is produced.
-	est := estimateInputTokens(call.Request)
-	hasTools := len(call.Request.Tools) > 0
-	switch {
-	case est <= traeToolInputCeiling:
-		// Fits the ladder, with or without tools: unchanged behaviour.
-	case hasTools:
-		// Above ~1.02M even for tools: the upstream answers 4022 and no
-		// account can fix it, so fail before dispatch instead of burning a
-		// leg. (This branch used to fire at 262144, which was wrong — the
-		// measurement above shows tools survive to ~1.02M.)
-		return nil, uperr.New(uperr.ClassModelUnavailable, 400,
-			"trae: %d-token prompt with tools exceeds this channel's %d-token ceiling; another channel is required",
-			est, traeToolInputCeiling)
-	case est > chatSessionMaxInput:
-		return nil, uperr.New(uperr.ClassModelUnavailable, 400,
-			"trae: %d-token prompt exceeds the %d-token session ceiling; another channel is required",
-			est, chatSessionMaxInput)
-	default:
-		// Tool-free and too large for the ladder: the session surface serves it.
-		return d.streamViaSessions(ctx, call, emit)
-	}
+	// HISTORY — this used to be a two-surface split (BP-103, 2026-10-24):
+	// requests carrying tools stayed on llm_utils_chat (then believed capped at
+	// 262144), tool-free ones above that were routed to /api/remote/v1/
+	// chat_sessions (1M). Both premises are gone:
+	//
+	//  1. llm_utils_chat's ceiling was re-measured 2026-11-01 at ~1.02M tokens
+	//     WITH tools (1020179 passed with the needle echoed back; 1800000
+	//     answered 4022). The split existed to dodge a 262144 wall that does
+	//     not exist.
+	//  2. chat_sessions runs the vendor's OWN agent — different tools, different
+	//     behaviour, and it ignores our tool declarations entirely. Routing
+	//     "large" requests there silently changed how every answer was
+	//     produced, which is the opposite of a transparent gateway.
+	//
+	// The branch was also dead in practice: it fires only for tool-free prompts
+	// above ~1M, and no such request has ever reached this driver.
+	//
+	// So: no local size gate, no second surface. Every request walks the same
+	// ladder. A prompt the upstream really cannot take answers 4220/4026/4022,
+	// which classifyBusiness already turns into an honest 400 that names the
+	// prompt (not the account) — see the 4022/4026 case there. That is the
+	// behaviour all three live reference projects share (misakano7545/
+	// traework2api-panel, magpie-community/plugins, autumnsentiment/Trae2api-cn
+	// all use llm_utils_chat only; none gated on a local token estimate).
+	//
 	// Walk the SOLO function ladder: an upstream 400 whose business code says
 	// "this function does not take this payload" is retried on the next
 	// function, not reported as a bad request (relay parity, 2026-10-21).
@@ -723,7 +716,7 @@ func buildSOLOBody(call driver.ChatCall, function string) ([]byte, error) {
 // model answers with named events — a chunks-only parser silently produced
 // empty completions (live 2026-10-16).
 func parseSSE(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
+	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 	out := &ir.ChatResponse{Model: call.Request.Model, CreatedAt: time.Now().Unix(), Message: ir.Message{Role: ir.RoleAssistant}}
 	var (
@@ -1348,8 +1341,17 @@ func classifyBusiness(code int, msg string) *uperr.Error {
 		// impossible request as a transient internal error and could re-walk
 		// other bindings for the same oversized body. ClassBadRequest is
 		// honest (the request is at fault) and carries no account penalty.
+		//
+		// ContextOverflow is set so the protocol writer can tell the client in
+		// the vocabulary it acts on: a client that knows the prompt did not fit
+		// COMPACTS and retries; one that does not resends the identical
+		// oversized body until it gives up (BP-244 established this for
+		// WorkBuddy's 11115; Trae's 4022/4026 are the same event and were
+		// missing the flag). Field 2026-11-23: ZCode read the bare 400 as
+		// reason=unknown retryable=false and never compacted.
 		e := uperr.New(uperr.ClassBadRequest, 400, "trae: prompt too long for this surface (code=%d): %s", code, msg)
 		e.Code = fmt.Sprint(code)
+		e.ContextOverflow = true
 		return e
 	default:
 		return uperr.New(uperr.ClassInternal, 200, "trae: code=%d %s", code, msg)

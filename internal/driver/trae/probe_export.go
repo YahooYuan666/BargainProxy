@@ -2,12 +2,12 @@ package trae
 
 // Diagnostic exports used by scripts/tmaxmode (2026-10-31).
 //
-// WHY THESE EXIST: answering "can llm_utils_chat carry a tool-bearing prompt
-// past 262144 when Max Mode is asked for?" requires sending a body the driver
-// itself would REFUSE to build (Stream() rejects tools+oversize before
-// dispatch), while still sending it over the driver's exact header set and
-// wire shape. Re-implementing the headers in a probe would measure a different
-// request and settle nothing, so the driver hands out its own builders here.
+// WHY THESE EXIST: settling "how big a prompt does llm_utils_chat really carry?"
+// needs a body built over the driver's exact header set and wire shape, with
+// extra fields (Max Mode's is_max_mode / prompt_max_tokens) the driver never
+// sends itself. Re-implementing the headers in a probe would measure a
+// different request and settle nothing, so the driver hands out its own
+// builders here.
 //
 // These are read-only: they build a body and issue one request. They touch no
 // pool, no cooldown, no store, no config, and change no driver state. Nothing
@@ -15,6 +15,7 @@ package trae
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -59,6 +60,43 @@ func ProbePostSOLO(ctx context.Context, d *Driver, creds *Creds, raw []byte) (in
 	return resp.StatusCode, string(body), nil
 }
 
-// ProbeEstimator exposes the driver's own prompt-size estimate so a probe can
-// report the same number the dispatch decision would use.
-func ProbeEstimator(req *ir.ChatRequest) int { return estimateInputTokens(req) }
+// ProbeEstimator exposes a coarse prompt-size estimate so a probe can print
+// "we thought it was N tokens" beside "the upstream said M" — the comparison
+// that corrected the 262144 myth on 2026-11-01.
+//
+// DIAGNOSTIC ONLY. No dispatch decision uses it: the driver no longer gates on
+// a local estimate at all (the two-surface split it served was removed — see
+// the comment in Stream).
+//
+// It counts what buildSOLOBody actually puts on the wire: content text, image
+// tiles (never their base64 length), tool-call arguments, and the tool
+// declarations. History THINKING is deliberately excluded — this driver never
+// sends it (buildSOLOBody walks m.Content only), and counting it inflated a
+// real 2026-11-23 request 2.85× (393434 tokens read as 1120971).
+func ProbeEstimator(req *ir.ChatRequest) int {
+	if req == nil {
+		return 0
+	}
+	chars, images := 0, 0
+	for _, m := range req.Messages {
+		for _, p := range m.Content {
+			switch p.Kind {
+			case "text":
+				chars += len(p.Text)
+			case "image":
+				images++
+			}
+		}
+		for _, tc := range m.ToolCalls {
+			chars += len(tc.Arguments)
+		}
+	}
+	tools := 0
+	for _, td := range req.Tools {
+		tools += len(td.Name) + len(td.Description)
+		if td.Parameters != nil {
+			tools += len(fmt.Sprint(td.Parameters))
+		}
+	}
+	return (chars+tools)/3 + images*768
+}
