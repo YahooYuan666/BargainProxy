@@ -462,20 +462,28 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 	}
 	// Rebuild the message array with prompt replacement applied.
 	messages := make([]map[string]any, 0, len(req.Messages))
-	// BP-308: images returned BY A TOOL (the Read tool's picture) cannot ride
-	// an OpenAI tool message, whose content must be a plain string. They used
-	// to be dropped outright, and the model answered "the read returned no
-	// image data" — a blank read with no error anywhere (2026-11-11 report).
-	// Park them here and re-attach them to the next user turn as ordinary
-	// multimodal parts, which is the shape this upstream does accept.
+	// BP-308 / BP-337: images returned BY A TOOL (the Read tool's picture)
+	// cannot ride an OpenAI tool message, whose content must be a plain
+	// string. They used to be dropped outright, and the model answered "the
+	// read returned no image data" — a blank read with no error anywhere
+	// (2026-11-11 report). They ride the next user turn instead.
+	//
+	// BP-337: they ride it ATTRIBUTED. A bare carrier line made the message
+	// read as a fresh user turn, and the model re-litigated who sent the
+	// pictures on every request (2026-11-23 deepseek-v4.1-flash: eight turns
+	// of "the user is showing them back to me", the same four screenshots
+	// restated each turn). The tool text now announces the images that
+	// follow, and the carrier names the tool call they came from — magpie's
+	// Chat shape (internal/gateway/chat.go seeLater / showSeen).
 	var pendingToolImages []map[string]any
+	pendingToolLabel := "" // the carrier line for the images parked above
 	flushToolImages := func() {
 		if len(pendingToolImages) == 0 {
 			return
 		}
-		parts := append([]map[string]any{{"type": "text", "text": toolImageCarrier}}, pendingToolImages...)
+		parts := append([]map[string]any{{"type": "text", "text": pendingToolLabel}}, pendingToolImages...)
 		messages = append(messages, map[string]any{"role": string(ir.RoleUser), "content": parts})
-		pendingToolImages = nil
+		pendingToolImages, pendingToolLabel = nil, ""
 	}
 	for _, m := range req.Messages {
 		if m.Role == ir.RoleTool && badIDs[m.ToolCallID] {
@@ -488,28 +496,41 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 			// BP-299: a string that sniffs as a parts array with an empty text
 			// block (scraped form JSON) dies at the upstream with 11151 — pad
 			// before it leaves.
-			wire["content"] = padSniffedString(ir.TextOf(m.Content))
+			text := ir.TextOf(m.Content)
+			var parked []map[string]any
 			for _, p := range m.Content {
 				if p.Kind == "image" && p.ImageB64 != "" {
 					mime := p.ImageMIME
 					if mime == "" {
 						mime = "image/png"
 					}
-					pendingToolImages = append(pendingToolImages, map[string]any{
+					parked = append(parked, map[string]any{
 						"type":      "image_url",
 						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
 					})
 				}
 			}
+			if len(parked) > 0 {
+				// BP-337: say in the result itself that the pictures follow —
+				// the model then meets them already knowing whose they are.
+				note := toolImageFollows(len(parked))
+				if strings.TrimSpace(text) != "" {
+					text += "\n\n"
+				}
+				text += note
+				pendingToolImages = append(pendingToolImages, parked...)
+				pendingToolLabel = toolImageLabel(m.ToolName, m.ToolCallID)
+			}
+			wire["content"] = padSniffedString(text)
 		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
 			wire["content"] = padSniffedString(m.Content[0].Text)
 			// A tool's images attach to this user turn, in front of its text,
 			// so the model meets them as ordinary multimodal input.
 			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
 				wire["content"] = append(append([]map[string]any{
-					{"type": "text", "text": toolImageCarrier},
+					{"type": "text", "text": pendingToolLabel},
 				}, pendingToolImages...), map[string]any{"type": "text", "text": m.Content[0].Text})
-				pendingToolImages = nil
+				pendingToolImages, pendingToolLabel = nil, ""
 			}
 		} else {
 			var parts []map[string]any
@@ -536,9 +557,9 @@ func (d *Driver) buildBodyOpts(call driver.ChatCall, creds *Creds, opts bodyOpts
 		if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
 			if parts, ok := wire["content"].([]map[string]any); ok {
 				wire["content"] = append(append([]map[string]any{
-					{"type": "text", "text": toolImageCarrier},
+					{"type": "text", "text": pendingToolLabel},
 				}, pendingToolImages...), parts...)
-				pendingToolImages = nil
+				pendingToolImages, pendingToolLabel = nil, ""
 			}
 		}
 		if len(m.ToolCalls) > 0 {

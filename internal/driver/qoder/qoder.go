@@ -842,38 +842,53 @@ func irPayload(call driver.ChatCall) (map[string]any, error) {
 	// result with no error anywhere. Park them and re-attach to the next user
 	// turn as ordinary multimodal parts.
 	var pendingToolImages []any
+	pendingToolLabel := ""
 	flushToolImages := func() {
 		if len(pendingToolImages) == 0 {
 			return
 		}
-		parts := append([]any{map[string]any{"type": "text", "text": toolImageCarrier}}, pendingToolImages...)
+		parts := append([]any{map[string]any{"type": "text", "text": pendingToolLabel}}, pendingToolImages...)
 		msgs = append(msgs, map[string]any{"role": string(ir.RoleUser), "content": parts})
-		pendingToolImages = nil
+		pendingToolImages, pendingToolLabel = nil, ""
 	}
 	for _, m := range req.Messages {
 		wire := map[string]any{"role": string(m.Role)}
 		switch {
 		case m.Role == ir.RoleTool:
-			wire["content"] = ir.TextOf(m.Content)
+			text := ir.TextOf(m.Content)
+			var parked []any
 			for _, p := range m.Content {
 				if p.Kind == "image" && p.ImageB64 != "" {
 					mime := p.ImageMIME
 					if mime == "" {
 						mime = "image/png"
 					}
-					pendingToolImages = append(pendingToolImages, map[string]any{
+					parked = append(parked, map[string]any{
 						"type":      "image_url",
 						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
 					})
 				}
 			}
+			if len(parked) > 0 {
+				// BP-337: say in the result itself that the pictures follow,
+				// and name the call they came from when they do — see the
+				// workbuddy driver for the full rationale (magpie's Chat
+				// path, seeLater/showSeen).
+				if strings.TrimSpace(text) != "" {
+					text += "\n\n"
+				}
+				text += toolImageFollows(len(parked))
+				pendingToolImages = append(pendingToolImages, parked...)
+				pendingToolLabel = toolImageLabel(m.ToolName, m.ToolCallID)
+			}
+			wire["content"] = text
 		case len(m.Content) == 1 && m.Content[0].Kind == "text":
 			wire["content"] = m.Content[0].Text
 			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
 				wire["content"] = append(append([]any{
-					map[string]any{"type": "text", "text": toolImageCarrier},
+					map[string]any{"type": "text", "text": pendingToolLabel},
 				}, pendingToolImages...), map[string]any{"type": "text", "text": m.Content[0].Text})
-				pendingToolImages = nil
+				pendingToolImages, pendingToolLabel = nil, ""
 			}
 		case len(m.Content) > 0:
 			parts := make([]any, 0, len(m.Content))
@@ -891,9 +906,9 @@ func irPayload(call driver.ChatCall) (map[string]any, error) {
 			wire["content"] = parts
 			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
 				wire["content"] = append(append([]any{
-					map[string]any{"type": "text", "text": toolImageCarrier},
+					map[string]any{"type": "text", "text": pendingToolLabel},
 				}, pendingToolImages...), parts...)
-				pendingToolImages = nil
+				pendingToolImages, pendingToolLabel = nil, ""
 			}
 		}
 		if len(m.ToolCalls) > 0 {
@@ -1526,10 +1541,36 @@ func checkinHeaders(bearer, uid, machineToken, machineType, identSource string, 
 // tooling).
 const campaignUserAgent = "Qoder"
 
-// toolImageCarrier introduces the images a tool returned, once they have been
-// moved onto a user turn (BP-308). Chinese deliberately: it rides a real user
-// message on a domestic channel.
-const toolImageCarrier = "（工具返回的图片如下）"
+// toolImageCarrierFmt introduces the images a tool returned, once they have
+// been moved onto a user turn (BP-308, BP-337). It NAMES the tool result the
+// images belong to: a bare line read as a fresh user turn and had the model
+// re-litigate who sent the pictures every request (2026-11-23
+// deepseek-v4.1-flash on the workbuddy channel: eight turns of "the user is
+// showing them back to me"). The shape follows magpie's Chat path
+// (internal/gateway/chat.go seeLater / showSeen).
+//
+// toolImageCarrierFmt takes the tool name and the tool call id.
+const toolImageCarrierFmt = "[From the result of %s (tool call %s):]"
+
+// toolImageLabel is the carrier line naming the tool result the parked images
+// came from. An unnamed result keeps a generic word rather than an empty slot.
+func toolImageLabel(toolName, callID string) string {
+	name := strings.TrimSpace(toolName)
+	if name == "" {
+		name = "tool"
+	}
+	return fmt.Sprintf(toolImageCarrierFmt, name, callID)
+}
+
+// toolImageFollows announces, at the END of the tool message, that its
+// result's images follow as the next message — so the model meets the
+// pictures already knowing whose they are (BP-337).
+func toolImageFollows(n int) string {
+	if n == 1 {
+		return "[The tool returned an image; it follows in the next message.]"
+	}
+	return fmt.Sprintf("[The tool returned %d images; they follow in the next message.]", n)
+}
 
 // campaignPath is where Qoder lists the account's campaigns — the daily
 // credits among them (actionType CLAIM_BENEFIT) — and claims one

@@ -2,6 +2,7 @@ package workbuddy
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"bargainproxy/internal/driver"
@@ -48,8 +49,15 @@ func TestBuildBodyToolMessageIsPlainText(t *testing.T) {
 		if err := json.Unmarshal(m.Content, &s); err != nil {
 			t.Fatalf("tool content must be a plain string, got %s", m.Content)
 		}
-		if s != "done" {
-			t.Fatalf("tool content = %q, want %q (image dropped)", s, "done")
+		// BP-337: the result now announces that its images follow, so the
+		// text is the result's own words plus that one line — never the
+		// image data itself. The BP-70 contract this test guards is the
+		// SHAPE (a plain string, no image part), which still holds.
+		if !strings.HasPrefix(s, "done") {
+			t.Fatalf("tool content = %q, want it to open with %q", s, "done")
+		}
+		if strings.Contains(s, "QUJD") || strings.Contains(s, "image_url") {
+			t.Fatalf("image data leaked into the tool content: %q", s)
 		}
 	}
 	if !found {

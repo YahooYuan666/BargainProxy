@@ -111,7 +111,9 @@ func TestBP308PlainToolResultUnchanged(t *testing.T) {
 		t.Fatalf("payload: %v", err)
 	}
 	raw, _ := json.Marshal(payload)
-	if strings.Contains(string(raw), toolImageCarrier) {
+	// BP-337: the carrier now names its tool call, so match the attribution
+	// prefix rather than one fixed string.
+	if strings.Contains(string(raw), "From the result of") {
 		t.Fatal("a text-only tool result grew a carrier turn")
 	}
 }

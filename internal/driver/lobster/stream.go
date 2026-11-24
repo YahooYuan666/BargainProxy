@@ -110,13 +110,14 @@ func (d *Driver) buildBody(ctx context.Context, call driver.ChatCall, c *Creds) 
 	// result with no error anywhere. Park them and re-attach to the next user
 	// turn as ordinary multimodal parts.
 	var pendingToolImages []map[string]any
+	pendingToolLabel := ""
 	flushToolImages := func() {
 		if len(pendingToolImages) == 0 {
 			return
 		}
-		parts := append([]map[string]any{{"type": "text", "text": toolImageCarrier}}, pendingToolImages...)
+		parts := append([]map[string]any{{"type": "text", "text": pendingToolLabel}}, pendingToolImages...)
 		messages = append(messages, map[string]any{"role": string(ir.RoleUser), "content": parts})
-		pendingToolImages = nil
+		pendingToolImages, pendingToolLabel = nil, ""
 	}
 	for _, m := range req.Messages {
 		wire := map[string]any{"role": string(m.Role)}
@@ -124,27 +125,39 @@ func (d *Driver) buildBody(ctx context.Context, call driver.ChatCall, c *Creds) 
 		case m.Role == ir.RoleTool:
 			// Tool results are plain strings; image parts in a tool message
 			// would be rejected (BP-70 lesson from workbuddy). BP-308 carries
-			// those images on a user turn instead of losing them.
-			wire["content"] = ir.TextOf(m.Content)
+			// those images on a user turn instead of losing them, and BP-337
+			// says in the result itself that they follow, attributed to this
+			// call (magpie's Chat path, seeLater/showSeen).
+			text := ir.TextOf(m.Content)
+			var parked []map[string]any
 			for _, p := range m.Content {
 				if p.Kind == "image" && p.ImageB64 != "" {
 					mime := p.ImageMIME
 					if mime == "" {
 						mime = "image/png"
 					}
-					pendingToolImages = append(pendingToolImages, map[string]any{
+					parked = append(parked, map[string]any{
 						"type":      "image_url",
 						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
 					})
 				}
 			}
+			if len(parked) > 0 {
+				if strings.TrimSpace(text) != "" {
+					text += "\n\n"
+				}
+				text += toolImageFollows(len(parked))
+				pendingToolImages = append(pendingToolImages, parked...)
+				pendingToolLabel = toolImageLabel(m.ToolName, m.ToolCallID)
+			}
+			wire["content"] = text
 		case len(m.Content) == 1 && m.Content[0].Kind == "text":
 			wire["content"] = m.Content[0].Text
 			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
 				wire["content"] = append(append([]map[string]any{
-					{"type": "text", "text": toolImageCarrier},
+					{"type": "text", "text": pendingToolLabel},
 				}, pendingToolImages...), map[string]any{"type": "text", "text": m.Content[0].Text})
-				pendingToolImages = nil
+				pendingToolImages, pendingToolLabel = nil, ""
 			}
 		case len(m.Content) > 0:
 			parts := make([]map[string]any, 0, len(m.Content))
@@ -164,9 +177,9 @@ func (d *Driver) buildBody(ctx context.Context, call driver.ChatCall, c *Creds) 
 			wire["content"] = parts
 			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
 				wire["content"] = append(append([]map[string]any{
-					{"type": "text", "text": toolImageCarrier},
+					{"type": "text", "text": pendingToolLabel},
 				}, pendingToolImages...), parts...)
-				pendingToolImages = nil
+				pendingToolImages, pendingToolLabel = nil, ""
 			}
 		}
 		if len(m.ToolCalls) > 0 {
@@ -259,10 +272,33 @@ const (
 	optionsVersion = 1
 )
 
-// toolImageCarrier introduces the images a tool returned, once they have been
-// moved onto a user turn (BP-308). Chinese deliberately: it rides a real user
-// message on a domestic channel.
-const toolImageCarrier = "（工具返回的图片如下）"
+// toolImageCarrierFmt introduces the images a tool returned, once they have
+// been moved onto a user turn (BP-308, BP-337). It NAMES the tool result the
+// images belong to: a bare line read as a fresh user turn and had the model
+// re-litigate who sent the pictures every request. The shape follows magpie's
+// Chat path (internal/gateway/chat.go seeLater / showSeen). Takes the tool
+// name and the tool call id.
+const toolImageCarrierFmt = "[From the result of %s (tool call %s):]"
+
+// toolImageLabel is the carrier line naming the tool result the parked images
+// came from. An unnamed result keeps a generic word rather than an empty slot.
+func toolImageLabel(toolName, callID string) string {
+	name := strings.TrimSpace(toolName)
+	if name == "" {
+		name = "tool"
+	}
+	return fmt.Sprintf(toolImageCarrierFmt, name, callID)
+}
+
+// toolImageFollows announces, at the END of the tool message, that its
+// result's images follow as the next message — so the model meets the
+// pictures already knowing whose they are (BP-337).
+func toolImageFollows(n int) string {
+	if n == 1 {
+		return "[The tool returned an image; it follows in the next message.]"
+	}
+	return fmt.Sprintf("[The tool returned %d images; they follow in the next message.]", n)
+}
 
 // Hard upstream ceilings probed on 2026-10-24 (BP-103). The proxy returns an
 // empty 500 after 17-67s for requests over either limit, so both are gated
@@ -336,7 +372,8 @@ func isKimiK3(model string) bool {
 
 // parseStream consumes the upstream SSE stream.
 func parseStream(ctx context.Context, r io.Reader, call driver.ChatCall, emit driver.Emit) (*ir.ChatResponse, error) {
-	sc := streamx.NewSplitScanner(r) // BP-318: 粘帧 data 行在行级拆成多次 Scan
+	sc := streamx.NewSplitScanner(r)
+	// BP-318: 粘帧 data 行在行级拆成多次 Scan
 	sc.Buffer(make([]byte, 0, 64*1024), 8<<20)
 
 	out := &ir.ChatResponse{

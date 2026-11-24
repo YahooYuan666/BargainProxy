@@ -99,37 +99,51 @@ func buildBody(call driver.ChatCall) ([]byte, error) {
 	// result with no error anywhere. Park them and re-attach to the next user
 	// turn as ordinary multimodal parts.
 	var pendingToolImages []map[string]any
+	pendingToolLabel := ""
 	flushToolImages := func() {
 		if len(pendingToolImages) == 0 {
 			return
 		}
-		parts := append([]map[string]any{{"type": "text", "text": toolImageCarrier}}, pendingToolImages...)
+		parts := append([]map[string]any{{"type": "text", "text": pendingToolLabel}}, pendingToolImages...)
 		messages = append(messages, map[string]any{"role": string(ir.RoleUser), "content": parts})
-		pendingToolImages = nil
+		pendingToolImages, pendingToolLabel = nil, ""
 	}
 	for _, m := range req.Messages {
 		wire := map[string]any{"role": string(m.Role)}
 		if m.Role == ir.RoleTool {
-			wire["content"] = ir.TextOf(m.Content)
+			// BP-337: the result says its images follow, attributed to this
+			// call — magpie's Chat path (seeLater/showSeen). Without that the
+			// carrying user message read as a fresh user turn.
+			text := ir.TextOf(m.Content)
+			var parked []map[string]any
 			for _, p := range m.Content {
 				if p.Kind == "image" && p.ImageB64 != "" {
 					mime := p.ImageMIME
 					if mime == "" {
 						mime = "image/png"
 					}
-					pendingToolImages = append(pendingToolImages, map[string]any{
+					parked = append(parked, map[string]any{
 						"type":      "image_url",
 						"image_url": map[string]any{"url": "data:" + mime + ";base64," + p.ImageB64},
 					})
 				}
 			}
+			if len(parked) > 0 {
+				if strings.TrimSpace(text) != "" {
+					text += "\n\n"
+				}
+				text += toolImageFollows(len(parked))
+				pendingToolImages = append(pendingToolImages, parked...)
+				pendingToolLabel = toolImageLabel(m.ToolName, m.ToolCallID)
+			}
+			wire["content"] = text
 		} else if len(m.Content) == 1 && m.Content[0].Kind == "text" {
 			wire["content"] = m.Content[0].Text
 			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
 				wire["content"] = append(append([]map[string]any{
-					{"type": "text", "text": toolImageCarrier},
+					{"type": "text", "text": pendingToolLabel},
 				}, pendingToolImages...), map[string]any{"type": "text", "text": m.Content[0].Text})
-				pendingToolImages = nil
+				pendingToolImages, pendingToolLabel = nil, ""
 			}
 		} else if len(m.Content) > 0 {
 			// BP-179 (magpie 4cc331b): a content list made ONLY of text parts
@@ -167,9 +181,9 @@ func buildBody(call driver.ChatCall) ([]byte, error) {
 			if m.Role == ir.RoleUser && len(pendingToolImages) > 0 {
 				if parts, ok := wire["content"].([]map[string]any); ok {
 					wire["content"] = append(append([]map[string]any{
-						{"type": "text", "text": toolImageCarrier},
+						{"type": "text", "text": pendingToolLabel},
 					}, pendingToolImages...), parts...)
-					pendingToolImages = nil
+					pendingToolImages, pendingToolLabel = nil, ""
 				}
 			}
 		}
@@ -480,10 +494,33 @@ func toStr(v any) string {
 // turn one into a balance death.
 var urlNoise = regexp.MustCompile(`https?://\S+`)
 
-// toolImageCarrier introduces the images a tool returned, once they have been
-// moved onto a user turn (BP-308). Chinese deliberately: it rides a real user
-// message on a domestic channel.
-const toolImageCarrier = "（工具返回的图片如下）"
+// toolImageCarrierFmt introduces the images a tool returned, once they have
+// been moved onto a user turn (BP-308, BP-337). It NAMES the tool result the
+// images belong to: a bare line read as a fresh user turn and had the model
+// re-litigate who sent the pictures every request. The shape follows magpie's
+// Chat path (internal/gateway/chat.go seeLater / showSeen). Takes the tool
+// name and the tool call id.
+const toolImageCarrierFmt = "[From the result of %s (tool call %s):]"
+
+// toolImageLabel is the carrier line naming the tool result the parked images
+// came from. An unnamed result keeps a generic word rather than an empty slot.
+func toolImageLabel(toolName, callID string) string {
+	name := strings.TrimSpace(toolName)
+	if name == "" {
+		name = "tool"
+	}
+	return fmt.Sprintf(toolImageCarrierFmt, name, callID)
+}
+
+// toolImageFollows announces, at the END of the tool message, that its
+// result's images follow as the next message — so the model meets the
+// pictures already knowing whose they are (BP-337).
+func toolImageFollows(n int) string {
+	if n == 1 {
+		return "[The tool returned an image; it follows in the next message.]"
+	}
+	return fmt.Sprintf("[The tool returned %d images; they follow in the next message.]", n)
+}
 
 var minuteMarkers = regexp.MustCompile(
 	`(?i)\bper[ -_]?minute\b|\bper[ -_]?second\b|\bperminute\b|requests?_per_minute|tokens? per minute|` +

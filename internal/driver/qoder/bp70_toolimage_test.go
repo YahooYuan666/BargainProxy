@@ -1,6 +1,7 @@
 package qoder
 
 import (
+	"strings"
 	"testing"
 
 	"bargainproxy/internal/driver"
@@ -29,8 +30,15 @@ func TestIRPayloadToolMessageIsPlainText(t *testing.T) {
 		if mm["role"] != "tool" {
 			continue
 		}
-		if s, ok := mm["content"].(string); !ok || s != "done" {
-			t.Fatalf("tool content = %#v, want plain string %q", mm["content"], "done")
+		if s, ok := mm["content"].(string); !ok || !strings.HasPrefix(s, "done") {
+			t.Fatalf("tool content = %#v, want a plain string opening with %q", mm["content"], "done")
+		}
+		// BP-337: the result now announces its images that follow. The BP-70
+		// contract this test guards is the SHAPE (a plain string, no image
+		// part), which still holds — the image data never rides the content.
+		if s, _ := mm["content"].(string); strings.Contains(s, "QUJD") ||
+			strings.Contains(s, "image_url") {
+			t.Fatalf("image data leaked into the tool content: %q", s)
 		}
 		return
 	}

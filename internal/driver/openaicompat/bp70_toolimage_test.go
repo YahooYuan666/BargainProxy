@@ -2,6 +2,7 @@ package openaicompat
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"bargainproxy/internal/driver"
@@ -44,7 +45,13 @@ func TestBuildBodyToolMessageIsPlainText(t *testing.T) {
 			}
 		}
 	}
-	if toolContent != "done" {
-		t.Fatalf("tool content = %q, want %q (text only, image dropped)", toolContent, "done")
+	// BP-337: the result now announces that its images follow. The BP-70
+	// contract this test guards is the SHAPE (a plain string, no image part),
+	// which still holds — the image data never rides the content.
+	if !strings.HasPrefix(toolContent, "done") {
+		t.Fatalf("tool content = %q, want it to open with %q", toolContent, "done")
+	}
+	if strings.Contains(toolContent, "QUJD") || strings.Contains(toolContent, "image_url") {
+		t.Fatalf("image data leaked into the tool content: %q", toolContent)
 	}
 }

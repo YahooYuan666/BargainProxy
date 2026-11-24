@@ -15,6 +15,7 @@ package workbuddy
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -23,11 +24,41 @@ import (
 // for the model to read anyway.
 const emptyTextFill = " "
 
-// toolImageCarrier introduces the images a tool returned, once they have been
-// moved onto a user turn (BP-308). Chinese deliberately: it rides a real user
-// message on domestic channels, and a bare English label there reads as the
-// client talking rather than the gateway annotating.
-const toolImageCarrier = "（工具返回的图片如下）"
+// toolImageCarrierFmt introduces the images a tool returned, once they have
+// been moved onto a user turn (BP-308, BP-337). It NAMES the tool result the
+// images belong to: without that, the carrying message reads as a fresh user
+// turn and the model re-litigates who sent the pictures on every request
+// (2026-11-23 deepseek-v4.1-flash: eight turns of "the user is showing them
+// back to me", the same four screenshots restated each turn).
+//
+// The shape follows magpie's Chat path (internal/gateway/chat.go seeLater and
+// showSeen): the tool message announces what follows, and the carrier names
+// its source. A tool result is the harness speaking, not the user, so the
+// label is English and takes the tool name and the tool call id.
+const toolImageCarrierFmt = "[From the result of %s (tool call %s):]"
+
+// toolImageFollows announces, at the END of the tool message, that its
+// result's images follow as the next message. Written into the tool text so
+// the model meets the pictures already knowing whose they are. Singular and
+// plural read as English, not as a count glued to a fixed noun.
+func toolImageFollows(n int) string {
+	if n == 1 {
+		return "[The tool returned an image; it follows in the next message.]"
+	}
+	return fmt.Sprintf("[The tool returned %d images; they follow in the next message.]", n)
+}
+
+// toolImageLabel is the carrier line naming the tool result the parked images
+// came from. An unnamed result keeps a generic word rather than an empty slot:
+// the id is what ties the pictures to the call, and the name is what the model
+// reads.
+func toolImageLabel(toolName, callID string) string {
+	name := strings.TrimSpace(toolName)
+	if name == "" {
+		name = "tool"
+	}
+	return fmt.Sprintf(toolImageCarrierFmt, name, callID)
+}
 
 // padSniffedString repairs string content the upstream would sniff into a
 // parts array. Returns s unchanged when the sniff does not fire or no part
