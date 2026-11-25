@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/md5"
@@ -38,6 +39,13 @@ const (
 	baseURL = "https://autoglm-acceleration-api.zhipuai.cn"
 	chatPth = "/autoclaw-proxy/proxy/autoclaw/chat/completions"
 	sysLine = "You are AutoClaw. Answer the user directly and concisely."
+
+	// The overseas lane is a separate credential universe: a CN token gets 401
+	// there and vice versa. Its chat path carries a /v1 segment the CN gateway
+	// does not answer, and its fingerprint is the official 2.0.3 desktop one
+	// (channel "official", en lang, version 2.0.3).
+	overseasBaseURL = "https://autoglm-api.autoglm.ai"
+	overseasChatPth = "/autoclaw-proxy/proxy/autoclaw/v1/chat/completions"
 )
 
 type creds struct {
@@ -62,6 +70,8 @@ func main() {
 	prefixFile := flag.String("prefix-file", "", "read the prefix from a file (a 13k prefix exceeds the Windows command line limit)")
 	sysMode := flag.String("system", "ours", "system prompt shape: ours (prefix merged) | exact (AutoClaw line only) | user (system moved into the first user turn) | none (no system message)")
 	padTokens := flag.Int("pad", 0, "pad the history to roughly this many prompt tokens (chars/2), to reproduce a long ZCode session")
+	overseas := flag.Bool("overseas", false, "send to the overseas 1.x gateway (needs an overseas account's token)")
+	wantText := flag.Bool("text", false, "drain the SSE stream and print the reply text instead of the first bytes")
 	flag.Parse()
 
 	if *prefixFile != "" {
@@ -97,8 +107,12 @@ func main() {
 		log.Fatalf("unknown variant %q; have: %s", *variant, variantNames())
 	}
 
+	// -overseas sends the same body to the overseas 1.x gateway with the
+	// official 2.0.3 fingerprint. Only an overseas account's token works
+	// there; a CN token answers 401.
+	endpoint := endpointFor(*overseas)
 	for i := 0; i < *runs; i++ {
-		st, body, elapsed, err := one(context.Background(), v, sec, tok, *model, *turns, *toolTurns, *promptPrefix, *sysMode, *padTokens)
+		st, body, elapsed, err := one(context.Background(), v, sec, tok, *model, *turns, *toolTurns, *promptPrefix, *sysMode, *padTokens, endpoint, *wantText)
 		if err != nil {
 			// Elapsed matters: a drop at a near-constant wall time is a
 			// server-side cap, not network jitter (2026-10-23: the gateway's
@@ -111,6 +125,16 @@ func main() {
 			time.Sleep(1200 * time.Millisecond)
 		}
 	}
+}
+
+// endpoint is the host+path a probe run goes to.
+type endpoint struct{ base, path string }
+
+func endpointFor(overseas bool) endpoint {
+	if overseas {
+		return endpoint{overseasBaseURL, overseasChatPth}
+	}
+	return endpoint{baseURL, chatPth}
 }
 
 // variant is one header/body shape to try.
@@ -141,6 +165,42 @@ func variants() map[string]variant {
 			base(h, tok, sec, model)
 			h.Set("X-Channel", "official")
 			delete(b, "max_completion_tokens")
+		}},
+		// The identity-API shape: standard Authorization instead of
+		// X-Authorization. The catalog endpoint (autoclaw-model-config) takes
+		// ONLY this one — the same token that reads 200 here answers
+		// 401 "Invalid token" through X-Authorization, so a chat leg that
+		// inherits the X- form may be talking to a differently-gated route.
+		"auth-header": {desc: "Authorization (not X-Authorization), AutoClaw26 channel", apply: func(h http.Header, b map[string]any, tok, sec, model string, _ bool) {
+			base(h, tok, sec, model)
+			h.Del("X-Authorization")
+			h.Set("Authorization", "Bearer "+tok)
+			h.Set("X-Channel", "AutoClaw26")
+			h.Set("X-Version", "2.5.3")
+			h.Set("User-Agent", "AutoClaw/2.5.3 (win-x64)")
+			delete(b, "max_completion_tokens")
+			delete(b, "user")
+		}},
+		// The overseas official 2.0.3 desktop fingerprint: channel "official",
+		// version 2.0.3, en lang, no Origin/Referer, a one-segment UA. Its model
+		// calls go through OpenAI SDK 6.26.0, whose X-Stainless-* family the
+		// gateway sees on every official request.
+		"overseas-official": {desc: "official 2.0.3 desktop shape for the overseas gateway", apply: func(h http.Header, b map[string]any, tok, sec, model string, _ bool) {
+			base(h, tok, sec, model)
+			h.Set("X-Version", "2.0.3")
+			h.Set("X-Channel", "official")
+			h.Set("X-Lang", "en")
+			h.Set("User-Agent", "OpenAI/JS 6.26.0")
+			h.Set("x-stainless-lang", "js")
+			h.Set("x-stainless-package-version", "6.26.0")
+			h.Set("x-stainless-os", "Windows")
+			h.Set("x-stainless-arch", "x64")
+			h.Set("x-stainless-runtime", "node")
+			h.Set("x-stainless-runtime-version", "v24.18.0")
+			h.Del("Origin")
+			h.Del("Referer")
+			delete(b, "max_completion_tokens")
+			delete(b, "user")
 		}},
 		"with-session": {desc: "adds X-Session-Id (two repos say its absence is 406)", apply: func(h http.Header, b map[string]any, tok, sec, model string, _ bool) {
 			base(h, tok, sec, model)
@@ -223,7 +283,7 @@ func base(h http.Header, tok, secret, routeModel string) {
 
 // one sends one request and returns the status plus the first bytes of the
 // reply (or of the first SSE frame).
-func one(ctx context.Context, v variant, secret, tok, model string, turns int, tools bool, promptPrefix, sysMode string, padTokens int) (int, string, time.Duration, error) {
+func one(ctx context.Context, v variant, secret, tok, model string, turns int, tools bool, promptPrefix, sysMode string, padTokens int, ep endpoint, wantText bool) (int, string, time.Duration, error) {
 	body := buildBody(model, turns, tools, promptPrefix, sysMode, padTokens)
 	h := http.Header{}
 	v.apply(h, body, tok, secret, model, true)
@@ -233,7 +293,7 @@ func one(ctx context.Context, v variant, secret, tok, model string, turns int, t
 		return 0, "", 0, err
 	}
 	fmt.Printf("  request: %d bytes (~%dk prompt tokens by chars/2)\n", len(raw), len(raw)/2/1000)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+chatPth, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ep.base+ep.path, bytes.NewReader(raw))
 	if err != nil {
 		return 0, "", 0, err
 	}
@@ -245,6 +305,9 @@ func one(ctx context.Context, v variant, secret, tok, model string, turns int, t
 		return 0, "", time.Since(start), err
 	}
 	defer resp.Body.Close()
+	if wantText {
+		return resp.StatusCode, readSSEText(resp.Body), time.Since(start), nil
+	}
 	// Read a bounded slice: a healthy answer is an SSE stream that never ends
 	// on its own, so taking the whole body would hang.
 	buf := make([]byte, 2000)
@@ -253,6 +316,57 @@ func one(ctx context.Context, v variant, secret, tok, model string, turns int, t
 		n, _ = resp.Body.Read(buf)
 	}
 	return resp.StatusCode, string(buf[:n]), time.Since(start), nil
+}
+
+// readSSEText drains an SSE stream and returns the concatenated delta content
+// plus any reasoning, so a probe can see WHAT the model said rather than only
+// that it answered. Bounded by a hard byte cap: a runaway stream must not hang
+// the probe.
+func readSSEText(r io.Reader) string {
+	var out, reason strings.Builder
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	total := 0
+	for sc.Scan() {
+		line := sc.Text()
+		total += len(line)
+		if total > 4<<20 {
+			break
+		}
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			if payload == "[DONE]" {
+				break
+			}
+			continue
+		}
+		var fr struct {
+			Choices []struct {
+				Delta struct {
+					Content   string `json:"content"`
+					Reasoning string `json:"reasoning_content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(payload), &fr) != nil {
+			continue
+		}
+		for _, ch := range fr.Choices {
+			out.WriteString(ch.Delta.Content)
+			reason.WriteString(ch.Delta.Reasoning)
+		}
+	}
+	text := strings.TrimSpace(out.String())
+	if p := strings.TrimSpace(reason.String()); p != "" {
+		text = "[reasoning] " + p + " [/reasoning] " + text
+	}
+	if len(text) > 600 {
+		text = text[:600] + "…"
+	}
+	return text
 }
 
 // buildBody makes a realistic multi-turn conversation: system + alternating

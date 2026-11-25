@@ -21,6 +21,7 @@ import (
 func main() {
 	dsn := flag.String("dsn", "", "database dsn")
 	sql := flag.String("sql", "", "read-only sql")
+	maxLen := flag.Int("max", 160, "truncate string cells longer than this (0 = no truncation)")
 	flag.Parse()
 	if *dsn == "" || *sql == "" {
 		fmt.Fprintln(os.Stderr, "usage: pgq -dsn <dsn> -sql <query>")
@@ -52,8 +53,8 @@ func main() {
 		for i, f := range fields {
 			v := vals[i]
 			// Truncate long strings for readable evidence dumps.
-			if s, ok := v.(string); ok && len(s) > 160 {
-				v = s[:160] + "…(truncated)"
+			if s, ok := v.(string); ok && *maxLen > 0 && len(s) > *maxLen {
+				v = s[:*maxLen] + "…(truncated)"
 			}
 			row[string(f.Name)] = v
 		}

@@ -162,10 +162,95 @@ const (
 //
 // The reference project keeps them in a fallback list; that list is not proof
 // they work today.
+//
+// REBUILT 2026-11-25 against the live catalog endpoint
+// (GET /autoclaw-proxy/proxy/autoclaw-model-config, X-Channel: AutoClaw26).
+// The gateway returned exactly six entries; here they are with the display
+// names it reports, which are where the version numbers actually live:
+//
+//	zai_auto                  Auto                  ctx 1M   out 393216 cost 0.40
+//	zai_auto-fast             Auto-Fast             ctx 1M   out 131072 cost 1.00
+//	zai_glm-x-preview         GLM-5.4               ctx 1M   out 307200 cost 2.25
+//	zaicoding_glm-5.3         GLM-5.3               ctx 1M   out 307200 cost 2.25
+//	zai_glm-5.3-flash         GLM-5.3-Flash         ctx 1M   out 131072 cost 0.50
+//	zai_glm-5.3-flashx-legal  GLM-5.3-FlashX-Legal  ctx 307k  out 131072 cost 1.40
+//
+// GLM-5.4 ships under the id zai_glm-x-preview. The display name is the only
+// place "5.4" appears, which is why every guessed id (zai_glm-5.4, glm-5.4,
+// zai_glm-5.4-flash, zaicoding_glm-5.4) is refused 400 "非法模型" on both
+// lanes while the model itself answers 200. The real id must be used.
+//
+// Dropped because the catalog does not list them: "openclaw"/"openclaw/default"
+// (never a chat route) and "glm-5.2" (gone upstream). Kept "zai_glm-5.3-flash"
+// only under its prefixed name — the bare "glm-5.3-flash" is the BODY form the
+// overseas lane wants, not a route id.
 var CNModels = []string{
-	"openclaw", "openclaw/default",
-	"glm-5.3-flash", "glm-5.2",
-	"zai_auto", "zai_auto-fast", "zai_glm-5.3-flash", "zaicoding_glm-5.3",
+	"zai_glm-x-preview",
+	"zaicoding_glm-5.3",
+	"zai_glm-5.3-flash",
+	"zai_glm-5.3-flashx-legal",
+	"zai_auto", "zai_auto-fast",
+}
+
+// catalogPath serves the catalogue the official client builds its model picker
+// from (AutoClaw 2.5.3 reads it at start instead of shipping a table).
+//
+// It answers only with a standard Authorization header: the very same token
+// sent as X-Authorization gets 401 "Invalid token" (measured 2026-11-25, one
+// variable per run, both lanes). The chat routes are the opposite way round.
+const catalogPath = "/autoclaw-proxy/proxy/autoclaw-model-config"
+
+// CatalogEntry is one model as the gateway describes it.
+type CatalogEntry struct {
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	ContextWindow  int      `json:"contextWindow"`
+	MaxTokens      int      `json:"maxTokens"`
+	CreditCost     float64  `json:"creditCostFactor"`
+	Input          []string `json:"input"`
+	ReasoningLevel []string `json:"reasoningLevel"`
+	Reasoning      bool     `json:"reasoning"`
+}
+
+// fetchCatalog asks the gateway for the account's live catalogue.
+//
+// A failure here is not an account-health signal: a 401, a non-2xx or a shape
+// we cannot parse only means "fall back to the static table", never "this
+// account is broken". Callers must not mark the account down on this.
+func (d *Driver) fetchCatalog(ctx context.Context, cr *Creds) ([]CatalogEntry, error) {
+	secret := strings.TrimSpace(d.cfg.AppSecret)
+	if secret == "" {
+		return nil, fmt.Errorf("autoclaw: app_secret not configured")
+	}
+	overseas := cr.Region == realmOverseas
+	host := d.base()
+	if overseas {
+		host = d.overseasBase()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, host+catalogPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = catalogHeadersFor(cr.bearer(), secret, overseas)
+	resp, err := d.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("autoclaw catalog: HTTP %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 512<<10))
+	if err != nil {
+		return nil, err
+	}
+	var doc struct {
+		Models []CatalogEntry `json:"models"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return nil, fmt.Errorf("autoclaw catalog: %w", err)
+	}
+	return doc.Models, nil
 }
 
 // Creds is the persisted credential blob (canonical snake_case keys; the
@@ -367,6 +452,47 @@ func managedChatHeaders(token, secret, model string) http.Header {
 // prefix regardless of the token's own shape (BP-87). Verified live
 // 2026-10-24 with a real overseas account; the fingerprint itself is from
 // magpie-community/plugins 744e1e2.
+// catalogHeadersFor builds the header set the catalog endpoint accepts.
+//
+// The one thing that matters: the token rides a standard `Authorization`
+// header here, while the chat routes require `X-Authorization`. Measured
+// 2026-11-25 on both lanes, same account, same second:
+//
+//	X-Authorization: Bearer <tok>  -> 401 {"code":401001,"message":"Invalid token"}
+//	Authorization:   Bearer <tok>  -> 200, the full catalogue
+//
+// Sending both is not a substitute: the gateway reads X-Authorization first
+// and treats its presence as the credential, so a request carrying a stale one
+// alongside a good Authorization still fails. Only Authorization is set.
+func catalogHeadersFor(token, secret string, overseas bool) http.Header {
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	h.Set("Accept", "*/*")
+	h.Set("X-Auth-Appid", appID)
+	h.Set("X-Auth-TimeStamp", ts)
+	h.Set("X-Auth-Sign", sign(ts, secret))
+	h.Set("X-Product", "autoclaw")
+	h.Set("X-Trace-Id", traceID())
+	if overseas {
+		h.Set("User-Agent", "OpenAI/JS "+overseasSDKVersion)
+		h.Set("X-Version", overseasVersion)
+		h.Set("X-Tm", platformTm())
+		h.Set("X-Lang", overseasLang)
+		h.Set("X-Channel", overseasChannel)
+	} else {
+		h.Set("User-Agent", "AutoClaw/"+managedVersion+" (win-amd64)")
+		h.Set("X-Version", managedVersion)
+		h.Set("X-Tm", "win")
+		h.Set("X-Lang", "zh-CN")
+		h.Set("X-Channel", managedChannel)
+	}
+	if tok := strings.TrimSpace(token); tok != "" {
+		h.Set("Authorization", tok)
+	}
+	return h
+}
+
 func managedChatHeadersFor(token, secret, model string, overseas bool, wire []byte) http.Header {
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	h := http.Header{}
@@ -761,7 +887,35 @@ func (d *Driver) Channel() string { return model.ChannelAutoClaw }
 
 // Models implements driver.Driver.
 func (d *Driver) Models(ctx context.Context) ([]string, error) {
+	// Static table only: the driver holds no pool, so it has no credential to
+	// ask the gateway with. Live discovery is CatalogFor below, which the
+	// caller drives with an account it already has. Keeping the two apart is
+	// deliberate — Models() must stay cheap and offline-safe (it is metadata),
+	// while a live catalog read is a network call that can fail.
 	return append([]string(nil), CNModels...), nil
+}
+
+// CatalogFor reads the account's live model catalogue from the gateway.
+//
+// This is the fact source for "what does the upstream actually serve today",
+// as opposed to CNModels ("what we last verified"). The GLM-5.4 miss is the
+// case for it: the model is live, its id is zai_glm-x-preview, and no static
+// table could have guessed that from the display name.
+//
+// Callers use it to SHOW and to CHECK, never to write the route table: one
+// canonical model here can be served by several pools and only the route table
+// knows the order, so a catalog entry is an input to a routing decision, not a
+// routing decision. Entries can also be entitlement-gated (the catalog marks
+// some with metadata.forbiddenNotice), which a catalog cannot evaluate.
+func (d *Driver) CatalogFor(ctx context.Context, account *model.Account) ([]CatalogEntry, error) {
+	if account == nil {
+		return nil, fmt.Errorf("autoclaw catalog: no account")
+	}
+	cr, err := ParseCreds(account.CredsJSON)
+	if err != nil {
+		return nil, fmt.Errorf("autoclaw catalog: %w", err)
+	}
+	return d.fetchCatalog(ctx, cr)
 }
 
 // Stream implements driver.Driver.

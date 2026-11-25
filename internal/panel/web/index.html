@@ -168,9 +168,9 @@ tr:last-child td{border-bottom:none}
       <li><a href="#lobster" data-view="accounts" data-chan="lobster">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M4.5 6.5a3.5 3.5 0 0 1 7 0v4a3.5 3.5 0 0 1-7 0z"/><path d="M2.5 6.5L4.5 8M13.5 6.5L11.5 8M6 3.2V1.8M10 3.2V1.8M8 10.5v2"/></svg>
         Lobster 账号<span class="n" id="nLobster"></span></a></li>
-      <li><a href="#aistudio" data-view="accounts" data-chan="aistudio">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.5l1.8 4.7L14.5 8l-4.7 1.8L8 14.5 6.2 9.8 1.5 8l4.7-1.8z"/></svg>
-        AI Studio 账号<span class="n" id="nAistudio"></span></a></li>
+      <li><a href="#agybridge" data-view="accounts" data-chan="agybridge">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="4" cy="8" r="2"/><circle cx="12" cy="4.5" r="2"/><circle cx="12" cy="11.5" r="2"/><path d="M6 8h4M10 5.5L6 7.5M10 10.5L6 8.5"/></svg>
+        Agy-Bridge 账号<span class="n" id="nAgybridge"></span></a></li>
       <li><a href="#tiers" data-view="tiers">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 12.5h12M2 8h12M2 3.5h12"/><path d="M5 6v2.5M9 10.5V13"/></svg>
         模型与档位</a></li>
@@ -394,7 +394,7 @@ tr:last-child td{border-bottom:none}
           <div class="small"><b>AutoClaw（智谱）</b>：「添加账号 → AutoClaw」输手机号收短信验证码登录；也可用「导入 JSON」粘贴凭据文件。登录/签到/钱包接口需要在 config.json 的 <span class="mono">channels.autoclaw.app_secret</span> 填入客户端签名常量（源码不随附）。</div>
           <div class="small"><b>Qoder（阿里）</b>：「添加账号 → Qoder」粘贴个人访问令牌（<span class="mono">pt-</span> 开头，来自 Qoder 个人设置 → 服务集成 → 个人访问令牌），校验通过即入池。</div>
           <div class="small"><b>Lobster（有道龙虾）</b>：「添加账号 → Lobster」扫码登录或填入 Cookie，自动换取 Token 入池。</div>
-          <div class="small"><b>AI Studio（官方 Gemini API）</b>：「添加账号 → AI Studio」粘贴 aistudio.google.com 创建的 API key（AQ- 开头）。免费层只有 gemini-4-hydrogen，<b>内容会被 Google 用于训练</b>，私密内容别走。</div>
+          <div class="small"><b>Agy-Bridge（官方 agy CLI）</b>：「添加账号 → Agy-Bridge」填 Google 邮箱并完成一次授权，网关通过本机 <span class="mono">agy</span> 客户端转发请求（不伪造客户端指纹）。每个账号独立目录。</div>
           <div class="hint">账号身份规则：主键取上游稳定身份（uid/邮箱/JWT sub），改备注名/换 token 都不会产生重复账号。</div>
           <div class="hint">加号建议：<b>每个号池最多 3 个账号</b>。同 IP 下账号越多，关联风控与封号概率越高；先 1~2 个跑顺，再按并发需要逐个加。</div>
         </div>
@@ -423,7 +423,7 @@ tr:last-child td{border-bottom:none}
           <button class="xs" onclick="copyNetGuide()">复制文档地址</button></header>
         <div style="padding:14px 16px;display:grid;gap:10px">
           <div class="small">国模（WorkBuddy / Trae / ZCode / AutoClaw / Qoder / Lobster）走国内直连；只有
-            <b>Google（Antigravity / AI Studio）</b> 需要出境。若这条链路的第一字耗时异常大
+            <b>Google（Antigravity / Agy-Bridge）</b> 需要出境。若这条链路的第一字耗时异常大
             （比如 >30s），而国模正常，问题几乎都在你自己的代理出口，不在网关。</div>
           <div class="small"><b>最常见的根因</b>：Windows 默认 TCP 拥塞控制是 Cubic，在 150~300ms 的跨国链路上，
             AI 那一两 MB 的上下文上传会被压到 0.5~1 Mbps（几十秒才发完），看起来像模型卡死。</div>
@@ -595,7 +595,7 @@ tr:last-child td{border-bottom:none}
           </div>
           <div class="row">
             <label class="chk">每渠道单号并发 <input id="setMaxInflight" type="text" style="max-width:260px" placeholder='{"workbuddy":3,"zcode":2}'></label>
-            <span class="hint">保护上游账号不被并发冲爆（Trae 固定 1 不可改）。JSON 格式，例：{"antigravity":3,"workbuddy":2,"zcode":2}。改大立即唤醒排队请求。</span>
+            <span class="hint">保护上游账号不被并发冲爆（Trae 固定 1 不可改）。JSON 格式，例：{"antigravity":3,"workbuddy":3,"zcode":2}。WorkBuddy 国际版账号始终按 2 封顶。改大立即唤醒排队请求。</span>
           </div>
           <div class="row">
             <label class="chk"><input type="checkbox" id="setWbGlobal" style="width:auto"> WorkBuddy 国际版账号参与调度</label>
@@ -720,7 +720,7 @@ tr:last-child td{border-bottom:none}
           <button class="tab" data-tab="autoclaw">AutoClaw</button>
           <button class="tab" data-tab="qoder">Qoder</button>
           <button class="tab" data-tab="lobster">Lobster</button>
-          <button class="tab" data-tab="aistudio">AI Studio</button>
+          <button class="tab" data-tab="agybridge">Agy-Bridge</button>
           <button class="tab" data-tab="import">导入 JSON</button>
         </span>
       </h3>
@@ -766,15 +766,28 @@ tr:last-child td{border-bottom:none}
         <hr style="margin:18px 0;border:none;border-top:1px solid #2a2f3a">
         <div class="hint" style="margin-bottom:8px">
           <b>国际区（autoglm.ai）</b>：与国内区是<b>两个独立账号、两套独立积分</b>（国内 token 打国际网关会 401）。
-          国际区只能用<b>邮箱</b>注册，新号送 10000 积分分 7 天到账。
+          国际区只能用 <b>z.ai 账号</b>登录（上游已取消 Google 登录）。
         </div>
         <div class="hint" style="margin-bottom:8px">
-          国际区的应用内授权被上游边缘防护关掉了，所以这里不能直接登录。
-          <b>做法：用官方 AutoClaw 客户端登录一次（国内版或国际版都行），然后点下面的按钮自动读取。</b>
-          不需要找文件、不需要粘贴任何东西——网关会自己解密本机客户端留下的凭据。
+          <b>加号办法：登一个 → 导一个，重复即可。</b>在海外版客户端（AutoClawGlobal）登录后点下面的按钮；
+          前一个号<b>不会掉</b>——导入只是把本机凭据取出来，不碰服务端授权。
         </div>
-        <button class="primary" onclick="acImportLocal()">从本机客户端自动导入</button>
-        <div class="hint" style="margin-top:8px">会同时扫描国内版和国际版两个客户端目录，按来源自动区分线路。导入后需在「设置」里开启「国际版账号」开关，国际区账号才会参与调度。</div>
+        <div class="row" style="margin-bottom:8px">
+          <button class="primary" onclick="acImportOverseas()">导入海外版账号</button>
+        </div>
+        <div class="hint" style="margin-bottom:14px">
+          只读海外版客户端的登录态（<span class="mono">%APPDATA%\AutoClawuth.json</span>），
+          <b>不会碰国内版账号</b>。导入后会上游核实一遍线路，避免把国内号当海外号。
+        </div>
+
+        <div class="hint" style="margin-bottom:8px">
+          国内版是<b>另一套账号、另一套积分</b>，单独导入：
+        </div>
+        <button class="primary" onclick="acImportDomestic()">导入国内版账号</button>
+        <div class="hint" style="margin-top:8px">
+          读国内版客户端的账号库（<span class="mono">%APPDATA%\AutoClaw-officialccounts\</span>）。
+          导入时会把每个号的设备身份记下来；<b>两个号共用同一设备身份会提示你</b>。
+        </div>
       </div>
       <!-- Qoder PAT -->
       <div id="addTabQoder" class="tabp" hidden>
@@ -795,15 +808,24 @@ tr:last-child td{border-bottom:none}
         <div class="hint" style="margin-bottom:8px">说明：这是非官方渠道，走的是桌面客户端自己的接口，需要你自己的账号；额度按账号积分扣。</div>
         <button class="primary" onclick="startLobster()">获取 Lobster 登录链接</button>
       </div>
-      <!-- AI Studio（官方 Gemini API key） -->
-      <div id="addTabAistudio" class="tabp" hidden>
-        <div class="hint" style="margin-bottom:8px">官方通道：aistudio.google.com → Get API key，创建 AQ- 开头的 key 后粘贴到这里（免费层，当前只挂 <span class="mono">gemini-4-hydrogen</span>）。</div>
-        <div class="hint" style="margin-bottom:8px"><b>注意：免费层的内容 Google 会拿去训练</b>（付费层才不会）——私密代码、敏感内容别走这条腿。限速低，适合轻活分流，不适合 agent 重活。</div>
+      <!-- Agy-Bridge（官方 agy CLI 桥接，BP-339） -->
+      <div id="addTabAgybridge" class="tabp" hidden>
+        <div class="hint" style="margin-bottom:8px">走 Google 官方 <span class="mono">agy</span> 命令行客户端：请求由官方客户端自己发出，网关只做 ACP 桥接，不做客户端伪装。每个账号一个独立目录，登录态互不干扰。</div>
+        <div class="hint" style="margin-bottom:8px">⚠️ 浏览器里的账号选择器由 Google 决定，网关无法替你跳过；填的邮箱只用于<b>校验</b>你选中的是不是同一个号。</div>
+        <div class="hint" style="margin-bottom:8px">填 Google 账号邮箱 → 点开始登录 → 在浏览器打开授权链接。<b>Google 一定会弹出账号选择器（这个无法跳过）</b>，请选中你上面填的那个邮箱 —— 选错会被拦下并提示，不会写错账号。</div>
         <div class="row" style="margin-bottom:8px">
-          <input id="asKey" placeholder="AQ.Ab8..." style="min-width:320px">
-          <input id="asLabel" placeholder="备注名（可选）">
+          <input id="agEmail" placeholder="yourname@gmail.com" style="min-width:320px">
+          <input id="agLabel" placeholder="备注名（可选）">
         </div>
-        <button class="primary" onclick="addAistudio()">添加</button>
+        <button class="primary" onclick="startAgybridge()">开始登录</button>
+        <div id="agLoginBox" style="margin-top:12px" hidden>
+          <div class="state">在浏览器打开下面的链接并登录。登录完会自动回到这里，无需粘贴任何东西：</div>
+          <div class="url" id="agLoginUrl" style="word-break:break-all"></div>
+          <div class="row" style="margin-top:8px">
+            <button class="primary" onclick="copyOnboardUrl2()">复制链接</button>
+          </div>
+          <div class="state" id="agLoginState"></div>
+        </div>
       </div>
       <!-- 导入 JSON -->
       <div id="addTabImport" class="tabp" hidden>
@@ -815,7 +837,7 @@ tr:last-child td{border-bottom:none}
             <option value="zcode">zcode（Z.AI）</option>
             <option value="autoclaw">autoclaw（AutoClaw 凭证文件）</option>
             <option value="lobster">lobster（LobsterAI 有道龙虾）</option>
-            <option value="aistudio">aistudio（AI Studio key）</option>
+            <option value="agybridge">agybridge（官方 agy 客户端）</option>
           </select>
           <input id="impLabel" placeholder="备注名（可选）" style="max-width:200px">
         </div>
@@ -933,13 +955,13 @@ function toggleTheme(){ document.body.classList.toggle('light', document.getElem
 // Channel hashes (#google/#workbuddy/#trae/#zcode) map onto the accounts
 // view; #google is the default landing view.
 const titles = {
-  media: '媒体模型（生图 / 生视频）',accounts:'账号池', google:'账号池', workbuddy:'账号池', trae:'账号池', zcode:'账号池', autoclaw:'账号池', qoder:'账号池', lobster:'账号池', aistudio:'账号池', tasks:'任务中心', usage:'用量统计', tiers:'模型与档位', packages:'国模积分情况', logs:'请求日志', guide:'使用指南', settings:'设置'};
-const chanHashes = {google:'antigravity', workbuddy:'workbuddy', trae:'trae', zcode:'zcode', autoclaw:'autoclaw', qoder:'qoder', lobster:'lobster', aistudio:'aistudio'};
-const chanNames = {antigravity:'Google（Antigravity）', workbuddy:'WorkBuddy', trae:'Trae CN', zcode:'ZCode', autoclaw:'AutoClaw', qoder:'Qoder', lobster:'LobsterAI（有道龙虾）', aistudio:'AI Studio（Gemini API）', openaicompat:'OpenAI 兼容兜底'};
+  media: '媒体模型（生图 / 生视频）',accounts:'账号池', google:'账号池', workbuddy:'账号池', trae:'账号池', zcode:'账号池', autoclaw:'账号池', qoder:'账号池', lobster:'账号池', agybridge:'账号池', tasks:'任务中心', usage:'用量统计', tiers:'模型与档位', packages:'国模积分情况', logs:'请求日志', guide:'使用指南', settings:'设置'};
+const chanHashes = {google:'antigravity', workbuddy:'workbuddy', trae:'trae', zcode:'zcode', autoclaw:'autoclaw', qoder:'qoder', lobster:'lobster', agybridge:'agybridge'};
+const chanNames = {antigravity:'Google（Antigravity）', workbuddy:'WorkBuddy', trae:'Trae CN', zcode:'ZCode', autoclaw:'AutoClaw', qoder:'Qoder', lobster:'LobsterAI（有道龙虾）', agybridge:'Agy-Bridge（官方 agy CLI）', openaicompat:'OpenAI 兼容兜底'};
 function switchView(hash){
   const [view, chan] = hash.replace('#','').split('/');
   if (!titles[view]) return;
-  const target = (view === 'google' || view === 'workbuddy' || view === 'trae' || view === 'zcode' || view === 'autoclaw' || view === 'qoder' || view === 'lobster' || view === 'aistudio') ? 'accounts' : view;
+  const target = (view === 'google' || view === 'workbuddy' || view === 'trae' || view === 'zcode' || view === 'autoclaw' || view === 'qoder' || view === 'lobster' || view === 'agybridge') ? 'accounts' : view;
   document.querySelectorAll('.view').forEach(v => v.hidden = v.id !== 'view-'+target);
   document.querySelectorAll('#navList a').forEach(a => {
     const on = a.dataset.view === target &&
@@ -981,7 +1003,7 @@ async function refresh(){
     // nav counters; openaicompat stays hidden when nothing is configured.
     const byChan = {};
     allAccounts.forEach(a => { byChan[a.channel] = (byChan[a.channel]||0)+1; });
-    ['antigravity','workbuddy','trae','zcode','autoclaw','qoder','lobster','aistudio'].forEach(ch => {
+    ['antigravity','workbuddy','trae','zcode','autoclaw','qoder','lobster','agybridge'].forEach(ch => {
       const el = document.getElementById('n'+ch.charAt(0).toUpperCase()+ch.slice(1));
       if (el) el.textContent = byChan[ch] ? String(byChan[ch]) : '';
     });
@@ -1847,7 +1869,7 @@ function renderAccounts(){
     const creditBtn = (a.channel === 'autoclaw' || a.channel === 'qoder')
       ? `<button class="xs" onclick="creditDetail(${i})">积分详情</button>` : '';
     tr.innerHTML = `<td><span class="dot ${st.cls}"></span>${esc(st.txt)}</td>
-      <td>${esc(a.nickname || a.uid || a.id)}<br><small class="muted mono">${esc(a.id)}</small></td>
+      <td>${esc(a.email || a.nickname || a.uid || a.id)}<br><small class="muted mono">${esc([a.email ? a.nickname : '', a.id].filter(Boolean).join(' · '))}</small></td>
       <td>${esc(a.realm ? chanNames[a.channel]+' ('+a.realm+')' : chanNames[a.channel]||a.channel)}</td>
       <td>${barHtml}${quota}${modelCoolHtml(a.model_cooldowns)}</td>
       <td>${a.cooldown_until ? esc(fmtTime(a.cooldown_until)) + (cooldownLabel(a.cooldown_reason, a.cooldown_by) ? '<br><small class="muted">'+esc(cooldownLabel(a.cooldown_reason, a.cooldown_by))+'</small>' : '') : '—'}</td>
@@ -2249,7 +2271,7 @@ function openAdd(){
 function closeAdd(){ document.getElementById('addVeil').classList.remove('on'); stopPoll(); }
 document.querySelectorAll('#addTabs .tab').forEach(b => b.onclick = () => {
   document.querySelectorAll('#addTabs .tab').forEach(x => x.classList.toggle('on', x === b));
-  ['google','wb','trae','zcode','autoclaw','qoder','lobster','aistudio','import'].forEach(t => {
+  ['google','wb','trae','zcode','autoclaw','qoder','lobster','agybridge','import'].forEach(t => {
     document.getElementById('addTab'+t.charAt(0).toUpperCase()+t.slice(1)).hidden = b.dataset.tab !== t;
   });
   ['onboardLoad','onboardReady','onboardDone','onboardErr'].forEach(id => document.getElementById(id).hidden = true);
@@ -2386,6 +2408,25 @@ async function acLogin(){
 // in with the client once; this button does the rest — no file paths, no pasted
 // JSON. The lane (cn/global) is decided by which client directory the account
 // came from.
+async function acImportOverseas(){ await acDoImport('accounts/autoclaw/import-overseas', '海外版'); }
+async function acImportDomestic(){ await acDoImport('accounts/autoclaw/import-domestic', '国内版'); }
+async function acDoImport(path, which){
+  try {
+    const r = await api(path, {method:'POST', body: JSON.stringify({})});
+    if (!r.ok) {
+      onboardFail(r.error || ('没有读到' + which + '的账号'));
+      if ((r.notes||[]).length) console.info('[autoclaw import]', r.notes.join('；'));
+      return;
+    }
+    const parts = [];
+    if ((r.imported||[]).length) parts.push('新增 ' + r.imported.length + ' 个：' + r.imported.join('、'));
+    if ((r.updated||[]).length) parts.push('更新 ' + r.updated.length + ' 个：' + r.updated.join('、'));
+    if ((r.failed||[]).length) parts.push('失败 ' + r.failed.length + ' 个：' + r.failed.join('；'));
+    onboardOk(which + '导入完成。' + parts.join('；'));
+    (r.device_warnings||[]).forEach(w => toast(w, true));
+    if ((r.notes||[]).length) console.info('[autoclaw import]', r.notes.join('；'));
+  } catch(e){ onboardFail(which + '导入失败：' + e.message); }
+}
 async function acImportLocal(){
   try {
     const r = await api('accounts/autoclaw/import-local', {method:'POST', body: JSON.stringify({})});
@@ -2399,6 +2440,9 @@ async function acImportLocal(){
     if ((r.updated||[]).length) parts.push('更新 ' + r.updated.length + ' 个：' + r.updated.join('、'));
     if ((r.failed||[]).length) parts.push('失败 ' + r.failed.length + ' 个：' + r.failed.join('；'));
     onboardOk('导入完成。' + parts.join('；'));
+    // Two accounts on one device identity cost the later one its new-user
+    // grants. The import is still valid, so this is a warning, not a failure.
+    (r.device_warnings||[]).forEach(w => toast(w, true));
     if ((r.notes||[]).length) console.info('[autoclaw import]', r.notes.join('；'));
   } catch(e){ onboardFail('导入失败：' + e.message); }
 }
@@ -2412,18 +2456,46 @@ async function addQoder(){
     onboardOk('已添加：' + (r.id || ''));
   } catch(e){ onboardFail('添加失败：' + e.message); }
 }
-// AI Studio API key onboarding（走通用 import 端点，key 即身份）。
-async function addAistudio(){
-  const key = document.getElementById('asKey').value.trim();
-  const label = document.getElementById('asLabel').value.trim();
-  if (!key) return toast('请粘贴 AQ- 开头的 API key', true);
+// Agy-Bridge 登录：面板起本地回调服务，浏览器登录后自动完成（PKCE 在网关进程内，
+// 所以不需要粘贴授权码；这是照上游 agy-acp 的做法）。
+let agyFlow = '';
+async function startAgybridge(){
+  const email = document.getElementById('agEmail').value.trim();
+  const label = document.getElementById('agLabel').value.trim();
+  if (!email.includes('@')) return toast('请填 Google 账号邮箱', true);
   try {
-    const r = await api('accounts/import', {method:'POST', body: JSON.stringify({channel:'aistudio', label, creds:{api_key:key}})});
-    toast('已添加 ' + (r.id || ''));
-    document.getElementById('asKey').value = '';
-    closeAdd(); refresh();
-  } catch(e){ toast('添加失败：' + e.message, true); }
+    const r = await api('accounts/agybridge/start', {method:'POST', body: JSON.stringify({email, label})});
+    agyFlow = r.flow_id || '';
+    document.getElementById('agLoginBox').hidden = false;
+    document.getElementById('agLoginUrl').textContent = r.url || '（未取到链接）';
+    document.getElementById('agLoginState').textContent = '等待浏览器完成登录…';
+    pollAgybridge(300);
+  } catch(e){ toast('启动失败：' + e.message, true); }
 }
+function copyOnboardUrl2(){
+  navigator.clipboard.writeText(document.getElementById('agLoginUrl').textContent).then(()=>toast('已复制'));
+}
+async function pollAgybridge(tries){
+  if (!agyFlow) return;
+  try {
+    const r = await api('accounts/agybridge/poll?flow_id=' + encodeURIComponent(agyFlow));
+    if (r.status === 'success') {
+      document.getElementById('agLoginState').textContent = '✅ 登录成功，账号已可用于桥接通路';
+      document.getElementById('agEmail').value = '';
+      refresh();
+      return;
+    }
+    if (r.status === 'failed') {
+      document.getElementById('agLoginState').textContent = '❌ 登录失败：' + (r.error || '未知');
+      return;
+    }
+    if (tries > 0) setTimeout(() => pollAgybridge(tries - 1), 2000);
+    else document.getElementById('agLoginState').textContent = '⏱ 等待超时，请重新发起';
+  } catch(e) {
+    if (tries > 0) setTimeout(() => pollAgybridge(tries - 1), 2000);
+  }
+}
+
 async function pollFlow(ep, tries){
   try {
     const r = await api(ep + '?state=' + encodeURIComponent(onboardState));

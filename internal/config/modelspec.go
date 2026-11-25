@@ -53,10 +53,37 @@ type ModelSpec struct {
 // have a recorded source; an absent row is honest.
 var modelSpecs = map[string]ModelSpec{
 	// --- GLM (z-ai) ---
+	// GLM-5.4. Two sources exist and they DISAGREE; the model's own published
+	// figures win over an intermediary's serving limits:
+	//
+	//   models.dev (synced 2026-11-23, release_date 2026-11-23) — the model:
+	//     context 1000000, output 131072,
+	//     input ["text","image","video","pdf"], effort [low,high,max],
+	//     tool_call true, attachment true
+	//     Present in zhipuai-coding-plan and zai-coding-plan; ABSENT from
+	//     zhipuai (pay-as-you-go) — i.e. it is a plan model.
+	//
+	//   AutoClaw's serving catalog (read 2026-11-25) — how AutoClaw serves it
+	//   under the id zai_glm-x-preview: contextWindow 1048576, maxTokens 307200,
+	//   input ["image","text"], 2.25x credit.
+	//
+	// The second is a gate on one channel, the first is the model. Declaring the
+	// channel's numbers would overstate the context (1048576 > 1000000) and the
+	// output (307200 > 131072) for every other channel that serves this name, and
+	// would drop video/pdf; declaring them too small would needlessly clamp
+	// requests. So: the model's figures here, and the channel's own cap is
+	// enforced where it belongs — by that channel's upstream answer.
+	// Previously absent from this table, which made the gateway tell clients the
+	// model was text-only (field 2026-11-25).
+	"glm-5.4":       {ContextLen: 1000000, MaxOutput: 131072, InputModes: []string{"text", "image", "video", "pdf"}, Reasoning: []string{"low", "high", "max"}, ToolCall: true, Structured: true},
 	"glm-5.3":       {ContextLen: 1000000, MaxOutput: 131072, InputModes: []string{"text"}, Reasoning: []string{"low", "high", "max"}, ToolCall: true, Structured: true},
 	"glm-5.3-flash": {ContextLen: 1000000, MaxOutput: 131072, InputModes: []string{"text", "image", "video", "pdf"}, Reasoning: []string{"low", "high", "max"}, ToolCall: true, Structured: true},
-	"glm-5.2":       {ContextLen: 1000000, MaxOutput: 131072, InputModes: []string{"text"}, Reasoning: []string{"high", "max"}, ToolCall: true, Structured: true},
-	"glm-5.1":       {ContextLen: 200000, MaxOutput: 131072, InputModes: []string{"text"}, ToolCall: true, Structured: true},
+	// glm-5.3-flashx-legal exists only on AutoClaw (no models.dev entry), so its
+	// serving catalog IS the only source: ctx 307200, out 131072,
+	// input ["image","text"], 1.40x credit (read 2026-11-25).
+	"glm-5.3-flashx-legal": {ContextLen: 307200, MaxOutput: 131072, InputModes: []string{"text", "image"}, Reasoning: []string{"low", "high", "max"}, ToolCall: true, Structured: true},
+	"glm-5.2":              {ContextLen: 1000000, MaxOutput: 131072, InputModes: []string{"text"}, Reasoning: []string{"high", "max"}, ToolCall: true, Structured: true},
+	"glm-5.1":              {ContextLen: 200000, MaxOutput: 131072, InputModes: []string{"text"}, ToolCall: true, Structured: true},
 
 	// --- DeepSeek ---
 	"deepseek-v4-pro":   {ContextLen: 1000000, MaxOutput: 393216, InputModes: []string{"text"}, Reasoning: []string{"high", "max"}, ThinkingOff: true, ToolCall: true, Structured: true},

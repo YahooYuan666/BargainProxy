@@ -49,7 +49,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 
-// ── 固定身份（2 个模型族 × 3 条协议线；OpenCode 免费通道已下线）─────────
+// ── 固定身份（3 个模型族 × 3 条协议线；OpenCode 免费通道已下线）─────────
 const FAMILIES = [
   {
     key: "cn",
@@ -67,6 +67,18 @@ const FAMILIES = [
       { id: "bargainproxy-gemini-chat", name: "BargainProxy Gemini Chat", apiType: "openai-chat-completions", v1: true },
       { id: "bargainproxy-gemini-responses", name: "BargainProxy Gemini Response", apiType: "openai-responses", v1: true },
       { id: "bargainproxy-gemini-anthropic", name: "BargainProxy Gemini Anthropic", apiType: "anthropic-messages", v1: false },
+    ],
+  },
+  {
+    // BP-339 用户指令：「做成一个单独的模型组」「不要叫Gemini 4 应该叫agy-bridge」。
+    // 组成员 = 网关 Gemini 家族清单里的 gemini-4-* 模型（判据只有前缀这一条，
+    // 与网关内部走哪条通路无关——通路是路由层的事，界面只管按名收模型）。
+    key: "agybridge",
+    label: "Agy-Bridge",
+    providers: [
+      { id: "bargainproxy-agybridge-chat", name: "BargainProxy Agy-Bridge Chat", apiType: "openai-chat-completions", v1: true },
+      { id: "bargainproxy-agybridge-responses", name: "BargainProxy Agy-Bridge Response", apiType: "openai-responses", v1: true },
+      { id: "bargainproxy-agybridge-anthropic", name: "BargainProxy Agy-Bridge Anthropic", apiType: "anthropic-messages", v1: false },
     ],
   },
 ];
@@ -89,8 +101,29 @@ const DEFAULT_EFFORTS = ["minimal", "low", "medium", "high"];
 //   onlyReasoning 且 supportedEfforts 仅 high（canDisableThinking=false）。
 // 这些模型每次同步都会按本表刷新已知字段，其余字段（含用户改过的）保留。
 const LOCAL_MODEL_METADATA = {
+  // GLM 家族。网关的 modelSpecs（internal/config/modelspec.go）就是这些值的
+  // 权威来源——它同时决定 /v1/models 的 modalities，所以插件写进 ZCode 的必须
+  // 与它一致。不收录的模型会一直停在"中性默认"（262144/32768/无图），
+  // glm-5.4 之前就是这样被声明成纯文本的（现场 2026-11-25）。
+  "glm-5.4": { contextWindow: 1000000, maxOutputTokens: 131072, supportsImage: true, efforts: ["low", "high", "max"] },
+  "glm-5.3": { contextWindow: 1000000, maxOutputTokens: 131072, supportsImage: false, efforts: ["low", "high", "max"] },
+  "glm-5.3-flash": { contextWindow: 1000000, maxOutputTokens: 131072, supportsImage: true, efforts: ["low", "high", "max"] },
+  "glm-5.3-flashx": { contextWindow: 1000000, maxOutputTokens: 131072, supportsImage: true, efforts: ["low", "high", "max"] },
+  "glm-5.3-flashx-legal": { contextWindow: 307200, maxOutputTokens: 131072, supportsImage: true, efforts: ["low", "high", "max"] },
   hy4: { contextWindow: 300000, maxOutputTokens: 64000, supportsImage: true, efforts: ["high"] },
   "hy4-flash": { contextWindow: 300000, maxOutputTokens: 64000, supportsImage: true, efforts: ["high"] },
+  // BP-340/341：Gemini 4 / Claude 的实测元数据，两个来源互证：
+  //   - 反重力 App 的模型菜单：思考深度＝低/中/高/极高（low|medium|high|xhigh），
+  //     没有 minimal（之前直连组声明 minimal 是错的）；
+  //   - agy 的 fetchAvailableModels（2026-11-25 实探，账号 Google AI Pro）：
+  //     hydrogen maxTokens=1048576、claude 两个 250000，supportsThinking=true。
+  // 直连（gemini-4-hydrogen）与桥接（*-agy）同名同档，两张表口径必须一致。
+  "gemini-4-hydrogen": { contextWindow: 1000000, maxOutputTokens: 1048576, supportsImage: true, efforts: ["low", "medium", "high", "xhigh"] },
+  "gemini-4-hydrogen-agy": { contextWindow: 1000000, maxOutputTokens: 1048576, supportsImage: true, efforts: ["low", "medium", "high", "xhigh"] },
+  "gemini-claude-sonnet-4-6": { contextWindow: 250000, maxOutputTokens: 250000, supportsImage: true, efforts: ["low", "medium", "high", "xhigh"] },
+  "gemini-claude-sonnet-4-6-agy": { contextWindow: 250000, maxOutputTokens: 250000, supportsImage: true, efforts: ["low", "medium", "high", "xhigh"] },
+  "gemini-claude-opus-4-6-thinking": { contextWindow: 250000, maxOutputTokens: 250000, supportsImage: true, efforts: ["low", "medium", "high", "xhigh"] },
+  "gemini-claude-opus-4-6-thinking-agy": { contextWindow: 250000, maxOutputTokens: 250000, supportsImage: true, efforts: ["low", "medium", "high", "xhigh"] },
 };
 
 const HTTP_TIMEOUT_MS = 5000;
@@ -200,15 +233,18 @@ async function getJson(url, timeoutMs = HTTP_TIMEOUT_MS, apiKey = "") {
   }
 }
 
-// ── 来源：网关 /v1/models → 国模 / Gemini 两类 ─────────────────────────────
+// ── 来源：网关 /v1/models → 国模 / Gemini / Agy-Bridge 三类 ─────────────────
 //
-// 分类判据 = 模型本身是不是 Gemini/Claude，不是渠道名（BP-326 修正）。
-// 旧判据只有 `owner === "antigravity"`：BP-326 之前所有 Gemini 模型恰好都从
-// antigravity 出，渠道名与模型族重合所以碰巧成立；接入 aistudio（官方 Gemini
-// API，owned_by=aistudio）后 gemini-4-hydrogen 被兜底扫进国模族——模型在
-// ZCode 里归错组。现改为「Gemini 渠道集合 OR 模型 id 前缀」双判据，新渠道
-// 只要命名沿 gemini-* 就自动归位，不必再改这张表。
+// 分类判据（BP-339 定稿：组跟**通路**走，不跟模型名走）：
+//   - owned_by 含 agybridge（桥接通路专属模型，网关侧用 -agy 后缀命名区分）
+//     → Agy-Bridge 组；
+//   - 其余 gemini-* / claude-*（渠道 ∈ {antigravity, aistudio}）→ Gemini 组；
+//   - 剩下的归国模。
+// 同一个 4 代模型在两个组各有一个名字：直连=gemini-4-hydrogen（原 id），
+// 桥接=gemini-4-hydrogen-agy（网关为桥接通路单设的路由名）——选哪个组就走哪条
+// 反代，网关路由表 1:1 对应。
 const GEMINI_OWNERS = new Set(["antigravity", "aistudio"]);
+const AGYBRIDGE_OWNER = "agybridge";
 const GEMINI_ID = /^gemini-/i;
 
 async function gatewayFamilies(gateway, apiKey) {
@@ -216,19 +252,38 @@ async function gatewayFamilies(gateway, apiKey) {
   if (!doc || !Array.isArray(doc.data)) return null;
   const cn = [];
   const gemini = [];
+  const agybridge = [];
+  // capability per model id, straight from the gateway's own declaration.
+  // This is the authoritative source: the gateway builds it from the project's
+  // model spec table, so whatever /v1/models says about a model IS the spec.
+  const capability = new Map();
   for (const m of doc.data) {
     const id = typeof m?.id === "string" ? m.id : "";
     if (!id) continue;
+    const inputs = Array.isArray(m?.modalities?.input)
+      ? m.modalities.input.filter((x) => typeof x === "string")
+      : [];
+    const ctx = Number.isFinite(m?.context_length) ? m.context_length : null;
+    const out = Number.isFinite(m?.max_output_tokens) ? m.max_output_tokens : null;
+    const efforts = [];
+    for (const opt of Array.isArray(m?.reasoning_options) ? m.reasoning_options : []) {
+      if (opt && opt.type === "effort" && Array.isArray(opt.values)) {
+        for (const v of opt.values) if (typeof v === "string" && !efforts.includes(v)) efforts.push(v);
+      }
+    }
+    if (inputs.length > 0 || ctx || out || efforts.length > 0) {
+      capability.set(id, { inputs, contextWindow: ctx, maxOutputTokens: out, efforts });
+    }
     const owner = String(m?.owned_by ?? "");
-    // owned_by 是 "+" 连接的渠道清单（多渠道路由时形如 "qoder+trae+lobster"），
-    // 只要其中任一渠道属于 Gemini 家族就归 Gemini。
+    // owned_by 是 "+" 连接的渠道清单（多渠道路由时形如 "qoder+trae+lobster"）。
     const owners = owner.split("+").map((s) => s.trim().toLowerCase());
     if (owners.includes("opencodezen")) continue; // 由 OpenCode 族单独维护
-    if (owners.some((o) => GEMINI_OWNERS.has(o)) || GEMINI_ID.test(id)) gemini.push(id);
+    if (owners.includes(AGYBRIDGE_OWNER)) agybridge.push(id);
+    else if (owners.some((o) => GEMINI_OWNERS.has(o)) || GEMINI_ID.test(id)) gemini.push(id);
     else cn.push(id);
   }
   const uniq = (arr) => [...new Set(arr)].sort();
-  return { cn: uniq(cn), gemini: uniq(gemini) };
+  return { cn: uniq(cn), gemini: uniq(gemini), agybridge: uniq(agybridge), capability };
 }
 
 // ── models.dev 元数据（尽力而为；拿不到就中性默认，绝不编造）────────────────
@@ -255,9 +310,27 @@ function pickModelMetaRaw(id, data) {
   return null;
 }
 
-function metadataFor(id, modelsDev) {
+function metadataFor(id, modelsDev, gatewayCap) {
+  // The gateway's own declaration wins over everything else: it is built from
+  // the project's model spec table, so it cannot drift from what the gateway
+  // actually enforces (models.dev lags by a release and does not carry
+  // AutoClaw-only ids at all — that is how glm-5.4 ended up declared text-only).
+  const gw = gatewayCap instanceof Map ? gatewayCap.get(id) : null;
+  if (gw && gw.inputs.length > 0) {
+    return {
+      contextWindow: gw.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
+      maxOutputTokens: gw.maxOutputTokens ?? DEFAULT_MAX_OUTPUT,
+      supportsImage: gw.inputs.includes("image"),
+      efforts: gw.efforts.length > 0 ? [...gw.efforts] : [...DEFAULT_EFFORTS],
+    };
+  }
   const local = LOCAL_MODEL_METADATA[id];
-  if (local) return { ...local, efforts: [...local.efforts] };
+  if (local) {
+    // efforts 缺省 = 中性默认档位（gemini-4-* 条目不声明档位：上游按账号档位
+    // 裁决，官方 effort 枚举未在免费档文档化，不编造）。
+    const efforts = Array.isArray(local.efforts) ? [...local.efforts] : [...DEFAULT_EFFORTS];
+    return { ...local, efforts };
+  }
   const raw = modelsDev ? pickModelMetaRaw(id, modelsDev) : null;
   const limit = raw?.limit ?? {};
   const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : null);
@@ -502,10 +575,11 @@ function refreshLocalMetadata(rule, id, meta) {
     ...(specs.maxOutputTokens && typeof specs.maxOutputTokens === "object" ? specs.maxOutputTokens : {}),
     max: meta.maxOutputTokens,
   };
-  if (meta.efforts.length > 0) {
+  const efforts = Array.isArray(meta?.efforts) ? meta.efforts : [];
+  if (efforts.length > 0) {
     specs.reasoningLevel = {
       ...(specs.reasoningLevel && typeof specs.reasoningLevel === "object" ? specs.reasoningLevel : {}),
-      values: [...meta.efforts],
+      values: [...efforts],
     };
   }
   return out;
@@ -517,7 +591,8 @@ function buildModelRule(providerId, id, meta) {
     inputFormat: { supportsImage: meta.supportsImage },
   };
   const optionSpecs = {};
-  if (meta.efforts.length > 0) optionSpecs.reasoningLevel = { values: [...meta.efforts] };
+  const efforts = Array.isArray(meta?.efforts) ? meta.efforts : [];
+  if (efforts.length > 0) optionSpecs.reasoningLevel = { values: [...efforts] };
   if (Number.isFinite(meta.maxOutputTokens)) optionSpecs.maxOutputTokens = { max: meta.maxOutputTokens };
   const config = { properties };
   if (Object.keys(optionSpecs).length > 0) config.optionSpecs = optionSpecs;
@@ -787,7 +862,7 @@ async function main(argv) {
     modelsDev = await getJson(MODELS_DEV_URL, HTTP_TIMEOUT_MS);
     note(`新模型 ${newIds.length} 个，元数据${modelsDev ? "已取到" : "不可得（用中性默认）"}`, args.verbose);
   }
-  const metaFor = (id) => metadataFor(id, modelsDev);
+  const metaFor = (id) => metadataFor(id, modelsDev, gw?.capability);
 
   const planWithState = plan.map((f) => ({ ...f }));
   planWithState.prevState = prevState;

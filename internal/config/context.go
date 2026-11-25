@@ -13,10 +13,12 @@ import "strings"
 
 var contextLengths = map[string]int{
 	// GLM (z-ai): 实测 CN maxInputTokens + models.dev 共识.
-	"glm-5.3":       1000000,
-	"glm-5.3-flash": 1000000,
-	"glm-5.2":       1000000,
-	"glm-5.1":       200000,
+	"glm-5.4":              1000000, // models.dev 2026-11-23 (the model); AutoClaw serves 1048576 on its own channel only
+	"glm-5.3-flashx-legal": 307200,  // same catalog read
+	"glm-5.3":              1000000,
+	"glm-5.3-flash":        1000000,
+	"glm-5.2":              1000000,
+	"glm-5.1":              200000,
 
 	// Kimi (moonshot).
 	"kimi-k3":   1048576, // models.dev 官方

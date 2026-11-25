@@ -40,21 +40,72 @@ func TestImportFromClientDirWalksAccounts(t *testing.T) {
 	}
 }
 
-// TestClientDirsCoverBothLanes pins the two directories that decide the lane.
-// If one is dropped, that lane's accounts silently disappear from the import.
+// TestClientDirsCoverBothLanes pins the directories scanned. Both spellings of
+// the overseas directory are listed because our code and the reference tooling
+// disagree on it; if one is dropped, a client installed under that name
+// silently disappears from the import.
 func TestClientDirsCoverBothLanes(t *testing.T) {
-	realms := map[string]string{}
+	dirs := map[string]string{} // dir -> fallback realm
 	for _, cd := range clientDirs {
-		realms[cd.realm] = cd.dir
+		dirs[cd.dir] = cd.realm
 	}
-	if realms["cn"] != "AutoClaw-official" {
-		t.Fatalf("the CN client directory changed: %q", realms["cn"])
+	if dirs["AutoClaw-official"] != "cn" {
+		t.Fatalf("the CN client directory changed: %v", dirs)
 	}
-	if realms[realmOverseas] != "AutoClaw-oversea-official" {
-		t.Fatalf("the oversea client directory changed: %q", realms[realmOverseas])
+	for _, name := range []string{"AutoClaw-overseas-official", "AutoClaw-oversea-official"} {
+		if dirs[name] != realmOverseas {
+			t.Fatalf("the overseas client directory %q is missing or misclassified: %v", name, dirs)
+		}
 	}
-	if len(clientDirs) != 2 {
-		t.Fatalf("expected exactly two client directories, got %d", len(clientDirs))
+}
+
+// TestRealmIsDecidedByTheAccountNotByChannelJSON is the corrected rule.
+//
+// The first version of this read channel.json as the lane and treated
+// "official" as overseas. That is wrong: channel.json is the RELEASE channel
+// ("official"/"production"/"test"/"pre"), written by every build including the
+// CN one. It showed immediately on this machine — AutoClaw-official has
+// {"channel":"official"} and holds a CN phone account (181****7452,
+// numericUserId 880098), which the first version imported as global.
+//
+// What decides the lane is what the account IS: a phone means the CN SMS flow,
+// an email means the overseas Google/z.ai flow.
+func TestRealmIsDecidedByTheAccountNotByChannelJSON(t *testing.T) {
+	cases := []struct {
+		name     string
+		phone    string
+		email    string
+		fallback string
+		want     string
+	}{
+		// A phone number is NOT a CN signal: an overseas z.ai account signs in
+		// with a phone number too. Treating it as one imported a fresh overseas
+		// z.ai account as cn (field 2026-11-25), so the prior no longer fires.
+		{"a phone with no email keeps the fallback (probe must decide)", "181****7452", "", realmOverseas, realmOverseas},
+		{"a phone with no email keeps a cn fallback", "181****7452", "", "cn", "cn"},
+		{"an email is a weak overseas prior", "", "a@b.com", "cn", realmOverseas},
+		{"no signal keeps the fallback", "", "", "cn", "cn"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := realmFromIdentity(c.phone, c.email, "", c.fallback); got != c.want {
+				t.Fatalf("realmFromIdentity = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestRealmForIgnoresChannelJSON pins that channel.json no longer moves the
+// lane, so nobody reintroduces it by accident: the file is a release channel.
+func TestRealmForIgnoresChannelJSON(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "channel.json"), []byte(`{"channel":"official"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, fallback := range []string{"cn", realmOverseas} {
+		if got := realmFor(dir, fallback); got != fallback {
+			t.Fatalf("realmFor returned %q for fallback %q; channel.json must not decide the lane", got, fallback)
+		}
 	}
 }
 

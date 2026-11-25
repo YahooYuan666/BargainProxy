@@ -66,11 +66,13 @@ var outputLimits = map[string]int{
 
 	// GLM-5.3 family: 131072 across every official entry (zai, zhipuai,
 	// zai-coding-plan, zhipuai-coding-plan, alibaba-cn, ...).
-	"glm-5.3":        131072,
-	"glm-5.3-flash":  131072,
-	"glm-5.3-flashx": 131072,
-	"glm-5.2":        131072,
-	"glm-5.1":        131072,
+	"glm-5.4":              131072, // models.dev 2026-11-23 (the model); AutoClaw serves 307200 on its channel only
+	"glm-5.3-flashx-legal": 131072, // same catalog read
+	"glm-5.3":              131072,
+	"glm-5.3-flash":        131072,
+	"glm-5.3-flashx":       131072,
+	"glm-5.2":              131072,
+	"glm-5.1":              131072,
 
 	// Kimi K3: moonshotai / moonshotai-cn register 1048576; the many resellers
 	// cap at 131072. Use the vendor's own figure.
