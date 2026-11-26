@@ -308,6 +308,16 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 	// with 11148 and kill the session on every account (ticket 35,
 	// agentpoints 0d0e509). Idempotent when the ingress already merged.
 	req.Messages, _ = ir.MergeAdjacentToolCalls(req.Messages)
+	// BP-350 (magpie 33b04b64, #7565): a replayed history carrying a tool call
+	// whose name is "" is poisoned — the upstream refuses that turn AND every
+	// later turn of the session with "function_call is missing name", and no
+	// account or channel change helps. The call and the tool result answering
+	// it by id go together, so what remains still pairs.
+	if cleaned, changed := ir.WithoutNamelessCalls(req.Messages); changed {
+		log.Printf("gateway: dropped nameless tool call(s) from the replayed history (%d → %d messages)",
+			len(req.Messages), len(cleaned))
+		req.Messages = cleaned
+	}
 	// Strict upstreams (the workbuddy/zcode DeepSeek family) reject any history
 	// whose assistant tool_calls and tool results do not pair up, with
 	// code=11148 and no way to resume the conversation. Repair the pairing so
@@ -584,7 +594,12 @@ func (g *Gateway) Execute(ctx context.Context, req *ir.ChatRequest, emit driver.
 		// A bound conversation falls through to Acquire, whose sticky path
 		// either serves it on the bound account or returns "wait" — which is
 		// the intended no-drift queue.
-		if busy, who := g.pool.ChannelBusy(binding.Channel); busy {
+		// BP-345: the question is asked for THIS model. A holder that cannot
+		// serve the model at all (its glm-5.4 is walled while it runs
+		// glm-5.3-flash) does not make the pool busy for this request — the
+		// request falls through to Acquire, waits for the holder to finish and
+		// moves to a standby account. Skipping here instead ended the turn.
+		if busy, who := g.pool.ChannelBusy(binding.Channel, req.Model); busy {
 			if bound, _ := g.sessionBoundTo(binding.Channel, req.SessionKey); !bound {
 				busyCount++
 				lastErr = concurrencyError(binding.Channel, who)

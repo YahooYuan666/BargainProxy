@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -69,6 +70,11 @@ type Driver struct {
 	// Off by default; toggled from the panel settings page.
 	sigCache  *thoughtSigCache
 	sigReplay atomic.Bool
+
+	// BP-340: per-account model catalog (id → upstream model enum), the
+	// credential-specific identifier the Gemini 4 band gates on.
+	catalogOnce sync.Once
+	catalog     *modelCatalogs
 }
 
 // New builds the driver. httpClient may be nil (default client).
@@ -250,7 +256,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 	}
 
 	lookup, sigUsed := d.sigLookup(call.UpstreamModel, acc.ID)
-	body, err := buildRequest(project, call.UpstreamModel, call.Request, lookup)
+	body, err := buildRequestWithEnvelope(project, call.UpstreamModel, call.Request, lookup, d.envelopeFor(ctx, acc, creds.AccessToken, call.UpstreamModel))
 	if err != nil {
 		return nil, uperr.New(uperr.ClassBadRequest, 400, "antigravity: build payload: %v", err)
 	}
@@ -293,7 +299,7 @@ func (d *Driver) Stream(ctx context.Context, call driver.ChatCall, emit driver.E
 			return nil, ue
 		}
 		log.Printf("antigravity: replayed thought_signature rejected by upstream; retrying with placeholder")
-		body, err = buildRequest(project, call.UpstreamModel, call.Request, nil)
+		body, err = buildRequestWithEnvelope(project, call.UpstreamModel, call.Request, nil, d.envelopeFor(ctx, acc, creds.AccessToken, call.UpstreamModel))
 		if err != nil {
 			return nil, ue
 		}
@@ -852,10 +858,30 @@ const antigravityUA = "antigravity/2.8.1 windows/amd64"
 // gemini-4-argon-* must come from the CLI fingerprint, not the IDE one.
 const argonCLIUA = "antigravity/cli/1.4.2 darwin/arm64"
 
+// antigravityHubUA is the hub-family identity (BP-338): the upstream gates
+// Gemini 4 models to clients at or above version 2.23.0 (CLIProxyAPI
+// antigravity_version.go), and our 2.8.1 chat identity gets a bare 404
+// NOT_FOUND for every gemini-4-* id while the SAME account answers claude-*
+// with 200 in the same second (live 2026-11-25 04:09/06:01). The first hub
+// attempt ("antigravity/hub/2.29.0 windows/amd64", bare) ALSO 404ed — the
+// real format from CLIProxyAPI's AntigravityUserAgent() is
+//
+//	antigravity/hub/<ver> (aidev_client; os_type=<os>; arch=<arch>; cl=<changelist>)
+//
+// version+cl pairs come from their mapped table (2.34.0 → cl=1026637980,
+// the current fallback release); the parenthesized metadata is required.
+const antigravityHubUA = "antigravity/hub/2.34.0 (aidev_client; os_type=windows; arch=amd64; cl=1026637980)"
+
 // uaForModel picks the request identity for a model.
 func uaForModel(upstreamModel string) string {
-	if strings.HasPrefix(upstreamModelName(upstreamModel), "gemini-4-argon") {
+	name := upstreamModelName(upstreamModel)
+	if strings.HasPrefix(name, "gemini-4-argon") {
 		return argonCLIUA
+	}
+	// BP-338: the Gemini 4 band sits behind a client-version gate; the old
+	// chat identity is rejected with 404 before tier is even considered.
+	if strings.HasPrefix(name, "gemini-4-") {
+		return antigravityHubUA
 	}
 	return antigravityUA
 }
@@ -1235,7 +1261,17 @@ func planToolImageBudget(msgs []ir.Message, max int) map[[2]int]bool {
 // buildRequest assembles the v1internal payload. replay (may be nil) resolves
 // a real thought_signature for a replayed tool call — nil or a miss falls back
 // to the documented placeholder (BP-42/BP-44).
+// buildRequest keeps the historical 4-argument shape for tests and callers that
+// do not need the agent envelope; buildRequestWithEnvelope is the live path.
+// sepDouble joins the system blocks the way a client would have sent them:
+// one blank line between messages.
+const sepDouble = "\n\n"
+
 func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay func(callID, name string) (string, bool)) ([]byte, error) {
+	return buildRequestWithEnvelope(project, upstreamModel, req, replay, nil)
+}
+
+func buildRequestWithEnvelope(project, upstreamModel string, req *ir.ChatRequest, replay func(callID, name string) (string, bool), env *requestEnvelope) ([]byte, error) {
 	upstreamModel = upstreamModelName(upstreamModel)
 	var (
 		contents   []geminiContent
@@ -1278,11 +1314,12 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 			c := geminiContent{Role: "model"}
 			c.Parts = append(c.Parts, toGeminiParts(msg.Content)...)
 			for _, tc := range msg.ToolCalls {
-				var args map[string]any
-				_ = json.Unmarshal([]byte(tc.Arguments), &args)
-				if args == nil {
-					args = map[string]any{}
-				}
+				// BP-356 (CLIProxyAPI c975104f/f7137853): Unmarshal into a map
+				// silently yields nil for an array, a scalar or a TRUNCATED
+				// fragment, and the old code then sent {} — the whole argument
+				// set vanished. ArgsAsObject wraps a non-object as
+				// {"params": …} so the model still sees what was asked.
+				args := ir.ArgsAsObject(tc.Arguments)
 				part := geminiPart{FunctionCall: &geminiFnCall{ID: tc.ID, Name: tc.Name, Args: args}}
 				// Real signature when the experimental replay cache has one
 				// (BP-44); placeholder otherwise (never nothing — the upstream
@@ -1405,16 +1442,38 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 		tools = append(tools, map[string]any{"functionDeclarations": decls})
 	}
 	if len(tools) > 0 {
-		mode := "AUTO"
-		if s, ok := req.ToolChoice.(string); ok {
-			switch strings.ToLower(s) {
-			case "none":
-				mode = "NONE"
-			case "required", "any":
-				mode = "ANY"
+		// BP-356 (CLIProxyAPI aa1389a3/c8419674): a NAMED tool_choice must
+		// become allowedFunctionNames. The old code read only
+		// req.ToolChoice.(string), so "required" became mode:ANY with no name
+		// — the model was free to call ANY tool even when the client asked for
+		// one specific function (Anthropic's {"type":"tool","name":"x"} lost
+		// its name entirely). aistudio has always written it (BP-326).
+		//
+		// The two shapes differ too: a bare string normalizes to "required"
+		// with no name, and req.ToolChoiceName carries a separately-parsed
+		// name (Anthropic ingress). NormalizeToolChoice covers the map shape
+		// clients send natively.
+		choice, name, _ := ir.NormalizeToolChoice(req.ToolChoice)
+		if name == "" {
+			name = req.ToolChoiceName
+		}
+		fc := map[string]any{"mode": "AUTO"}
+		switch choice {
+		case "none":
+			fc["mode"] = "NONE"
+		case "required", "any":
+			fc["mode"] = "ANY"
+			if name != "" {
+				fc["allowedFunctionNames"] = []string{name}
 			}
 		}
-		toolConfig = map[string]any{"functionCallingConfig": map[string]any{"mode": mode}}
+		// A name with no choice at all still means "call this one" — the
+		// Anthropic ingress fills ToolChoiceName without a ToolChoice string.
+		if name != "" && fc["mode"] == "AUTO" {
+			fc["mode"] = "ANY"
+			fc["allowedFunctionNames"] = []string{name}
+		}
+		toolConfig = map[string]any{"functionCallingConfig": fc}
 	}
 	if req.Temperature != nil {
 		genConfig["temperature"] = *req.Temperature
@@ -1509,7 +1568,21 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 		inner["sessionId"] = sid
 	}
 	if len(sysParts) > 0 {
-		inner["systemInstruction"] = map[string]any{"parts": sysParts}
+		// BP-358 (CLIProxyAPI 38067a29): the upstream expects the same shape a
+		// content turn has — an explicit role plus exactly ONE part — and the
+		// role-less multi-part form was accepted only by luck. Join the texts
+		// (the same string a client would have sent as one system message) and
+		// send it as a single part.
+		texts := make([]string, 0, len(sysParts))
+		for _, p := range sysParts {
+			if p.Text != "" {
+				texts = append(texts, p.Text)
+			}
+		}
+		inner["systemInstruction"] = map[string]any{
+			"role":  "user",
+			"parts": []geminiPart{{Text: strings.Join(texts, sepDouble)}},
+		}
 	}
 	if len(tools) > 0 {
 		inner["tools"] = tools
@@ -1524,13 +1597,46 @@ func buildRequest(project, upstreamModel string, req *ir.ChatRequest, replay fun
 	if err != nil {
 		return nil, err
 	}
+	// BP-340: the agent envelope (requestId shape + labels, including the
+	// credential's own model enum) is what the Gemini 4 band validates. A bare
+	// hex requestId without labels answers 404 NOT_FOUND on a healthy account
+	// even with the right User-Agent (measured 2026-11-25).
+	ids := newAgentIDs(1)
+	requestID := ids.requestID()
+	labels := ids.labels(upstreamModel, "")
+	if env != nil {
+		if env.RequestID != "" {
+			requestID = env.RequestID
+		}
+		if env.Labels != nil {
+			labels = env.Labels
+		}
+	}
+	// BP-340: the catalog id wins over the routed id for the Gemini 4 band.
+	wireModel := upstreamModel
+	if env != nil && env.UpstreamID != "" {
+		wireModel = env.UpstreamID
+	}
+	// Fold the labels into the inner request document.
+	var innerDoc map[string]json.RawMessage
+	if err := json.Unmarshal(innerRaw, &innerDoc); err == nil {
+		if lb, err := json.Marshal(labels); err == nil {
+			innerDoc["labels"] = lb
+			if merged, err := json.Marshal(innerDoc); err == nil {
+				innerRaw = merged
+			}
+		}
+	}
 	outer := v1InternalRequest{
 		Project:     project,
-		Model:       upstreamModel,
+		Model:       wireModel,
 		RequestType: "agent",
-		UserAgent:   "antigravity",
-		RequestID:   randHex(16),
-		Request:     innerRaw,
+		// BP-338: the body-level identity must match the HTTP User-Agent —
+		// the version gate reads the client identity, and a hub-UA header
+		// with a bare "antigravity" body field is a mixed fingerprint.
+		UserAgent: uaForModel(upstreamModel),
+		RequestID: requestID,
+		Request:   innerRaw,
 	}
 	return json.Marshal(outer)
 }
@@ -1657,6 +1763,14 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		if upstreamModel != "" {
 			e.Model = upstreamModel
 		}
+		// BP-358 (CLIProxyAPI ae3d80f7): the capacity 503 carries its own
+		// RetryInfo in the BODY ("retryDelay": "17s") — the header is often
+		// absent through a middlebox. Applying the body's own number is what
+		// turns "wait, don't switch" into a precise pause instead of the
+		// channel's default.
+		if reset := parseQuotaReset(text); !reset.IsZero() {
+			e.ResetAt = reset
+		}
 		return e
 	case status == 429 || strings.Contains(lower, "resource_exhausted") || strings.Contains(lower, "quota"):
 		reset := parseQuotaReset(text)
@@ -1708,7 +1822,14 @@ func classifyHTTP(status int, body []byte, upstreamModel string) *uperr.Error {
 		}
 		return uperr.New(uperr.ClassWAF, status, "antigravity: %s", truncate(body, 300))
 	case status == 400:
-		return uperr.New(uperr.ClassBadRequest, status, "antigravity: %s", truncate(body, 300))
+		// BP-357 (CLIProxyAPI ff9339fe): an INPUT-TOO-LONG 400 is not an
+		// ordinary bad request — no account, no retry and no smaller model can
+		// make the prompt fit, and a client that does not hear "compact and
+		// retry" resends the identical oversized body until it gives up.
+		// MarkOverflow recognises Google's families ("input token count
+		// exceeds the maximum", "prompt is too long", the Chinese forms) and
+		// leaves a pace worded sentence alone (BP-232 decides first).
+		return uperr.MarkOverflow(uperr.New(uperr.ClassBadRequest, status, "antigravity: %s", truncate(body, 300)), text)
 	case status == 408:
 		// BP-335 (sub2api #8968): a 408 is the upstream timing out on
 		// THIS request — not the account's fault, and another account hits

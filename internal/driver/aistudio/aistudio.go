@@ -169,9 +169,10 @@ func buildContents(req *ir.ChatRequest) (contents []reqContent, sysParts []reqPa
 				parts = append(parts, reqPart{Text: t})
 			}
 			for _, tc := range msg.ToolCalls {
-				args := map[string]any{}
-				_ = json.Unmarshal([]byte(tc.Arguments), &args)
-				parts = append(parts, reqPart{FunctionCall: &reqFuncCall{Name: tc.Name, Args: args}})
+				// BP-356 (CLIProxyAPI c975104f/f7137853): a non-object or
+				// truncated argument body used to become {} — every argument
+				// lost with no trace. ArgsAsObject wraps it as {"params": …}.
+				parts = append(parts, reqPart{FunctionCall: &reqFuncCall{Name: tc.Name, Args: ir.ArgsAsObject(tc.Arguments)}})
 			}
 			if len(parts) > 0 {
 				contents = append(contents, reqContent{Role: "model", Parts: parts})

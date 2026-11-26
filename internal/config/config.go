@@ -159,6 +159,23 @@ type ChannelSettings struct {
 	OpenCodeZen  OpenCodeZenSettings  `json:"opencodezen"`
 	Lobster      LobsterSettings      `json:"lobster"`
 	AIStudio     AIStudioSettings     `json:"aistudio"`
+	AgyBridge    AgyBridgeSettings    `json:"agybridge"`
+}
+
+// AgyBridgeSettings configures the agy-bridge channel (BP-339): requests are
+// served by Google's official `agy acp` subprocess. AccountsDir holds one
+// isolated home per account (each login's token file stays in its own home);
+// AgyPath empty = "agy" resolved from PATH.
+//
+// No Enabled flag: like every channel in this gateway, the account pool is
+// filled by per-account logins from the panel, and an empty pool is inert —
+// a channel whose nobody logged into takes no traffic and makes no noise
+// (lobster precedent). The user ruled the default-off switch redundant
+// 2026-11-25: "我们所有的号池不都得每个号去自己登录吗".
+type AgyBridgeSettings struct {
+	AgyPath     string `json:"agy_path"`
+	AccountsDir string `json:"accounts_dir"`
+	MaxInFlight int    `json:"max_in_flight"` // per-account; agy sessions are serial
 }
 
 // AntigravitySettings configures the Google Cloud Code Assist channel.
@@ -217,7 +234,7 @@ type WorkBuddySettings struct {
 	ChatBaseCN  string `json:"chat_base_cn"`  // default https://www.workbuddy.cn (BP-130: the official desktop client's primary CN endpoint; copilot.tencent.com is only the fallback)
 	ChatBaseGL  string `json:"chat_base_gl"`  // default https://www.workbuddy.ai
 	WebBaseCN   string `json:"web_base_cn"`   // default https://www.workbuddy.cn (growth claim / web events)
-	MaxInFlight int    `json:"max_in_flight"` // default 2
+	MaxInFlight int    `json:"max_in_flight"` // default 3; the global realm is still capped at pool.GlobalMaxInFlight (2)
 	// PromptMode decides what happens to the caller's system prompt:
 	//   passthrough (default) — forwarded untouched; only a missing leading
 	//                           system message is filled in, because the
@@ -463,11 +480,16 @@ func Default() *Config {
 				MaxInFlight:  3,
 			},
 			WorkBuddy: WorkBuddySettings{
-				Enabled:     true,
-				ChatBaseCN:  "https://www.workbuddy.cn",
-				ChatBaseGL:  "https://www.workbuddy.ai",
-				WebBaseCN:   "https://www.workbuddy.cn",
-				MaxInFlight: 2,
+				Enabled:    true,
+				ChatBaseCN: "https://www.workbuddy.cn",
+				ChatBaseGL: "https://www.workbuddy.ai",
+				WebBaseCN:  "https://www.workbuddy.cn",
+				// 3 for the CN edge, matching misakano7545/workbuddy2api-panel's
+				// pool.max_in_flight=3 (verified 2026-11-25 against snapshot
+				// bd79d5b): its "one account may run 2-3 tasks" reading is what
+				// single-active mode already assumes. The tighter international
+				// ceiling stays separate in pool.GlobalMaxInFlight (2).
+				MaxInFlight: 3,
 				// passthrough, not custom: replacing the caller's system
 				// prompt silently deletes the agent's identity, tool rules
 				// and output format (see WorkBuddySettings.PromptMode).
@@ -519,6 +541,11 @@ func Default() *Config {
 				Enabled:     true,
 				BaseURL:     "https://generativelanguage.googleapis.com/v1beta",
 				MaxInFlight: 2,
+			},
+			AgyBridge: AgyBridgeSettings{
+				AgyPath:     "",
+				AccountsDir: "",
+				MaxInFlight: 3, // per-account cap (user ruling: 3 concurrent turns)
 			},
 		},
 		MaxQueueWait: Duration(120 * time.Second),

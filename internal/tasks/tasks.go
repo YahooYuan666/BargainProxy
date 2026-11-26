@@ -1344,6 +1344,32 @@ func (s *Scheduler) checkinAutoClaw(ctx context.Context, acc *model.Account) (st
 	if !ok {
 		return "", fmt.Errorf("autoclaw driver not installed")
 	}
+	// BP-346: raise the login-active event BEFORE the check-in, the way the
+	// official desktop client does as it signs in. This is what pays the
+	// login campaign (10x the daily check-in reward on our accounts), and it
+	// is best-effort: a refusal here must not cost the account its check-in.
+	loginNote := ""
+	if err := drv.ReportLoginActive(ctx, acc); err != nil {
+		loginNote = "；登录奖励未触发（" + clipNote(err.Error()) + "）"
+	}
+	// BP-349: the overseas lane has one more client task — entering the
+	// inspiration centre completes `daily_inspiration_center`. The CN build
+	// has no such task, so this only runs on the global lane. The credential's
+	// own region decides (the account row's Realm is a display copy).
+	inspirationNote := ""
+	if drv.Overseas(acc) {
+		already, reward, ierr := drv.CompleteInspiration(ctx, acc)
+		switch {
+		case ierr != nil:
+			inspirationNote = "；灵感中心未完成（" + clipNote(ierr.Error()) + "）"
+		case already:
+			inspirationNote = "；灵感中心今日已完成"
+		case reward > 0:
+			inspirationNote = fmt.Sprintf("；灵感中心 +%d 分", reward)
+		default:
+			inspirationNote = "；灵感中心已完成"
+		}
+	}
 	checkedIn, credits, enable, err := drv.Checkin(ctx, acc)
 	if err != nil {
 		// agentpoints recoverToken parity: a dead access token is refreshed
@@ -1356,7 +1382,7 @@ func (s *Scheduler) checkinAutoClaw(ctx context.Context, acc *model.Account) (st
 		}
 	}
 	if err != nil {
-		return "autoclaw checkin failed: " + err.Error(), err
+		return "autoclaw checkin failed: " + err.Error() + loginNote + inspirationNote, err
 	}
 	if prober, ok := s.gw.Driver(model.ChannelAutoClaw).(driver.Prober); ok {
 		if res, perr := prober.Probe(ctx, acc); perr == nil {
@@ -1366,12 +1392,24 @@ func (s *Scheduler) checkinAutoClaw(ctx context.Context, acc *model.Account) (st
 	}
 	switch {
 	case checkedIn:
-		return "already checked in today", nil
+		return "already checked in today" + loginNote + inspirationNote, nil
 	case enable:
-		return fmt.Sprintf("checkin ok (reward %d points)", credits), nil
+		return fmt.Sprintf("checkin ok (reward %d points)%s%s", credits, loginNote, inspirationNote), nil
 	default:
-		return "autoclaw checkin not available", nil
+		return "autoclaw checkin not available" + loginNote + inspirationNote, nil
 	}
+}
+
+// clipNote trims an upstream or config error to something that fits one
+// task-ledger line: the ledger row is read by a human, and the interesting
+// part of a refusal is at the front. Rune-wise, so a Chinese refusal is not cut
+// in the middle of a character.
+func clipNote(s string) string {
+	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", " "))
+	if r := []rune(s); len(r) > 90 {
+		return string(r[:90]) + "…"
+	}
+	return s
 }
 
 func (s *Scheduler) checkinQoder(ctx context.Context, acc *model.Account) (string, error) {

@@ -51,6 +51,14 @@ type CreditDetail struct {
 	Expiring *ExpiringPoints `json:"expiring,omitempty"`
 	Entries  []LedgerEntry   `json:"entries"`
 	Total    int64           `json:"total"`
+	// Wallets is BP-347: every wallet with its own balance and expiry, so the
+	// drawer can answer "which points burn on 11-29" instead of only a total.
+	// A failure to read them leaves the section out — the balance and ledger
+	// above are still worth showing.
+	Wallets []WalletInstance `json:"wallets,omitempty"`
+	// WalletError keeps that failure visible instead of looking like "this
+	// account has no wallets".
+	WalletError string `json:"wallet_error,omitempty"`
 }
 
 // CreditDetail fetches balance, the latest ledger page and expiring points.
@@ -109,6 +117,16 @@ func (d *Driver) CreditDetail(ctx context.Context, acc *model.Account, page, pag
 				Days:   toInt64Any(exp.Days),
 				Text:   exp.Text,
 			}
+		}
+		// BP-347: per-wallet balance + expiry. Best-effort: this is an extra
+		// section, and a failure here must not cost the caller the balance and
+		// ledger it already has. The message is left raw (status + body) for
+		// the panel to clean — the same path every other probe error takes, so
+		// an HTML gateway page never reaches the drawer.
+		if wallets, werr := d.WalletInstances(ctx, acc); werr == nil {
+			out.Wallets = wallets
+		} else {
+			out.WalletError = werr.Error()
 		}
 		return out, nil
 	}

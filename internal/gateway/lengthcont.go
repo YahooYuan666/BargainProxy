@@ -119,6 +119,23 @@ var traeCutCaps = map[string]int{
 	"deepseek-v4.1-flash": 32000,
 }
 
+// traeEnterpriseCutCap (BP-353, magpie-community/plugins #1366, 0.2.48 and
+// 0.2.49): the ENTERPRISE models on this upstream cut at exactly 2000
+// completion tokens — not the 32000 the consumer path gives. The reference
+// measured it before it found the root cause (0.2.53: those models carry a
+// custom_config and should be dialled DIRECTLY; through llm_utils_chat they
+// truncate at 2000). We have one surface only (BP-334), so the cut is real
+// here and a 2000-token ending that looks clean is the same disguised
+// truncation. It is not in traeCutCaps because that table is keyed by MODEL
+// and this cap is a property of the channel path, not of one model name.
+const traeEnterpriseCutCap = 2000
+
+// traeThinkingStarvedCap: an ending at this number with reasoning that ate
+// essentially the whole segment and NO answer bytes. plugins #1366 0.2.50
+// measured the shape ("一轮全花在思考上"): completion 2000, reasoning 1983,
+// text 0 — the upstream stops cleanly and the client gets nothing.
+const traeThinkingStarvedCap = 2000
+
 // traeCutPlateau: the smallest output at which an exact multiple of 1000 is
 // treated as a suspected cap (twp fe0b0cdb's capPlateau — natural endings
 // almost never land exactly on a round thousand).
@@ -232,12 +249,30 @@ func traeCutContinuationPlan(upstreamModel string, req *ir.ChatRequest, ledger *
 		// semantics. Leave it truncated.
 		return nil, "", false
 	}
-	if ledger.sawTool || ledger.text.Len() == 0 {
+	// BP-353 (plugins #1366 0.2.50): a segment that spent the WHOLE 2000-token
+	// cut on reasoning and produced no answer bytes. The upstream called it a
+	// clean stop, so the client sees an empty reply. This shape has no prose to
+	// anchor on, which is why the prose rules below refuse it — it is rescued
+	// with thinking OFF instead, the one thing that ate the budget (the same
+	// move BP-112 makes on the length path).
+	if ledger.text.Len() == 0 {
+		return traeThinkingStarvedPlan(req, ledger, resp)
+	}
+	if ledger.sawTool {
 		return nil, "", false
 	}
 	out := ledger.usage.OutputTokens
 	name := strings.ToLower(strings.TrimSpace(upstreamModel))
 	cap, known := traeCutCaps[name]
+	if !known || out < cap {
+		// BP-353 (plugins 0.2.48/0.2.49): the enterprise path on this upstream
+		// cuts at 2000, and those models are NOT in the table (the table holds
+		// only the consumer-path measurements). An ending that lands exactly on
+		// the enterprise cap is the same disguised cut with a smaller number.
+		if out == traeEnterpriseCutCap {
+			cap, known = traeEnterpriseCutCap, true
+		}
+	}
 	if !known || out < cap {
 		// Plateau detector (twp fe0b0cdb): the upstream cuts on round
 		// thousand-token boundaries; a natural ending almost never lands
@@ -276,6 +311,61 @@ func traeCutContinuationPlan(upstreamModel string, req *ir.ChatRequest, ledger *
 		contReq.MaxTokens = cap
 	}
 	return contReq, fmt.Sprintf("output %d hit the trae cut cap %d (upstream reports it as stop)", out, cap), true
+}
+
+// traeThinkingStarvedPlan (BP-353, plugins #1366 0.2.50) rescues the segment
+// that spent the whole cut on reasoning and wrote no answer at all: the
+// upstream says stop, the client sees nothing, and every prose-anchored rescue
+// refuses it for lack of text.
+//
+// The retry is the same shape BP-112 uses on the length path — same account,
+// thinking OFF, the effort gear dropped (a gear asks FOR thinking) — because
+// thinking is the only thing that ate the budget. It reads the ledger for
+// "reasoning actually streamed": a segment with NO reasoning either is the
+// BP-335 empty reply, which belongs to the cascade, not here.
+//
+// The budget is raised to one full cut cap when the client named less: a
+// continuation carrying the same tiny number would be re-cut at once.
+func traeThinkingStarvedPlan(req *ir.ChatRequest, ledger *streamLedger, resp *ir.ChatResponse) (*ir.ChatRequest, string, bool) {
+	if req == nil || ledger == nil {
+		return nil, "", false
+	}
+	if ledger.sawTool {
+		return nil, "", false
+	}
+	if ledger.thinking.Len() == 0 {
+		// Nothing at all: the empty-reply net owns this one.
+		return nil, "", false
+	}
+	out := ledger.usage.OutputTokens
+	if out == 0 {
+		// The upstream reported no token count — the shape is unconfirmed, and
+		// a continuation without a budget anchor risks a loop.
+		return nil, "", false
+	}
+	if req.Thinking != nil && !req.Thinking.Enabled {
+		// Already off: freeing the budget cannot change anything.
+		return nil, "", false
+	}
+	floor := effortFloor(req)
+	capTokens := defaultContinueTotalCap
+	if floor > 0 {
+		capTokens = floor * continueTotalCapRatio
+	}
+	if out >= capTokens {
+		log.Printf("gateway: trae thinking-starved segment already spent %d of the continuation cap %d — leaving it empty", out, capTokens)
+		return nil, "", false
+	}
+	contReq := continuationRequest(req, ledger, false)
+	contReq.Thinking = &ir.ThinkingConfig{Enabled: false}
+	if req.Thinking != nil {
+		contReq.Thinking.Include = req.Thinking.Include
+	}
+	contReq.RequestedEffort = ""
+	if contReq.MaxTokens < traeThinkingStarvedCap {
+		contReq.MaxTokens = traeThinkingStarvedCap
+	}
+	return contReq, fmt.Sprintf("reasoning spent the whole segment (%d tokens, no answer bytes) and the upstream reported stop", out), true
 }
 
 // runLengthContinuation drives the same-account continuation loop and returns

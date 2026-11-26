@@ -558,6 +558,20 @@ type Usage struct {
 	CacheCreationInputTokens *int `json:"cache_creation_input_tokens,omitempty"`
 	CacheReadInputTokens     *int `json:"cache_read_input_tokens,omitempty"`
 	OutputTokens             int  `json:"output_tokens"`
+	// OutputTokensDetails carries the thinking subset (BP-355, qoder2api-hub
+	// 71b9f40f/732fb0db). Anthropic does not define it; proxy implementations
+	// publish it so a client can see how much of the output was reasoning, and
+	// clients read EITHER name — so both go out ("both is cheap insurance").
+	// Absent when the upstream reported no reasoning at all: an explicit 0
+	// would claim a measurement we never made (same rule as the cache fields).
+	OutputTokensDetails *OutputTokensDetails `json:"output_tokens_details,omitempty"`
+}
+
+// OutputTokensDetails is the Anthropic-surface reasoning subset. Both field
+// names are proxy extensions; they always carry the same number.
+type OutputTokensDetails struct {
+	ThinkingTokens  int `json:"thinking_tokens"`
+	ReasoningTokens int `json:"reasoning_tokens"`
 }
 
 // UsageFromIR converts IR accounting into the Anthropic split: input_tokens
@@ -567,6 +581,13 @@ type Usage struct {
 // client-side total (input + creation + read) is preserved without it.
 func UsageFromIR(u ir.Usage) Usage {
 	out := Usage{InputTokens: u.InputTokens, OutputTokens: u.OutputTokens}
+	// BP-355: the thinking subset, published under both extension names.
+	if u.ReasoningTokens > 0 {
+		out.OutputTokensDetails = &OutputTokensDetails{
+			ThinkingTokens:  u.ReasoningTokens,
+			ReasoningTokens: u.ReasoningTokens,
+		}
+	}
 	if !u.CacheKnown {
 		return out
 	}
@@ -607,7 +628,14 @@ func RenderMessage(id, model string, resp *ir.ChatResponse) *MessageResponse {
 	if text != "" {
 		out.Content = append(out.Content, ContentBlock{Type: "text", Text: text})
 	}
-	for _, tc := range resp.Message.ToolCalls {
+	named, nameless, calls := ir.SplitNameless(resp.Message.ToolCalls)
+	if nameless {
+		// BP-350: a reply whose only calls named nothing ends as an ordinary
+		// turn — telling the client "stop for tools" with no block to run
+		// leaves an agent waiting on nothing.
+		reason = mapStop(ir.ReplyStopForNameless(resp.StopReason, named, nameless))
+	}
+	for _, tc := range calls {
 		// BP-128: pass the arguments through as raw JSON. Unmarshalling into
 		// map[string]any turned every number into float64, so a 64-bit id
 		// like 9007199254740993 reached the client rounded to …992 (new-api
@@ -656,6 +684,25 @@ func RenderError(kind, message string) *ErrorBody {
 	e.Error.Type = kind
 	e.Error.Message = message
 	return e
+}
+
+// RenderContextOverflow builds the envelope for "the prompt did not fit".
+//
+// BP-357 (CLIProxyAPI ff9339fe): the Anthropic surface has no dedicated code
+// for this — Claude Code recognises the event by the message wording, "prompt
+// is too long", and compacts. With a generic 400 it treats the turn as
+// unexpected and resends the identical oversized body (the same failure mode
+// BP-244 fixed on the Responses surface, where Codex acts on the CODE).
+//
+// The kind stays invalid_request_error: the request, not the account or the
+// gateway, is what does not fit. The prefix is added only when the upstream's
+// own words do not already carry an equivalent phrase — MarkOverflow's
+// recogniser is broader than the one sentence Claude Code matches.
+func RenderContextOverflow(message string) *ErrorBody {
+	if !strings.Contains(strings.ToLower(message), "prompt is too long") {
+		message = "prompt is too long: " + message
+	}
+	return RenderError("invalid_request_error", message)
 }
 
 // CountTokensResponse is the count_tokens response shape.

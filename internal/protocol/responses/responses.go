@@ -408,7 +408,12 @@ func Render(id, model string, createdAt int64, resp *ir.ChatResponse, outputText
 		},
 	}
 	out.Output = append(out.Output, msgItem)
-	for _, tc := range resp.Message.ToolCalls {
+	// BP-350 (magpie 33b04b64, #7565): a function_call with "name":"" is
+	// replayed by the client and 400s the turn — and every later turn of the
+	// session. Drop it; the reply then ends as an ordinary turn if nothing
+	// callable is left.
+	_, _, calls := ir.SplitNameless(resp.Message.ToolCalls)
+	for _, tc := range calls {
 		out.Output = append(out.Output, map[string]any{
 			"type":      "function_call",
 			"id":        "fc_" + tc.ID,

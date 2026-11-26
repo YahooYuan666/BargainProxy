@@ -461,20 +461,15 @@ func FinishReason(r ir.StopReason) string {
 
 // RenderCompletion renders a full ChatCompletion.
 func RenderCompletion(id, model string, created int64, resp *ir.ChatResponse) *ChatCompletion {
-	finish := FinishReason(resp.StopReason)
+	named, nameless, calls := ir.SplitNameless(resp.Message.ToolCalls)
+	finish := FinishReason(ir.ReplyStopForNameless(resp.StopReason, named, nameless))
 	msg := &RespMessage{Role: "assistant", Content: textOf(resp.Message.Content)}
 	// Aggregated reasoning surfaces as reasoning_content — DeepSeek-style
 	// clients expect it in non-streamed completions too (BP-41).
 	if resp.Thinking != "" {
 		msg.ReasoningContent = resp.Thinking
 	}
-	for _, tc := range resp.Message.ToolCalls {
-		// BP-274 (traework2api-panel c5aec914ff): a fully-empty tool call is
-		// a parallel-call placeholder — strict clients fail the whole round
-		// on it. Real shapes (named but argless etc.) always stay.
-		if tc.ID == "" && tc.Name == "" && tc.Arguments == "" {
-			continue
-		}
+	for _, tc := range calls {
 		var rtc RespToolCall
 		rtc.ID = tc.ID
 		rtc.Type = "function"

@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -784,6 +785,72 @@ func (d *Driver) parseAnthropicSSE(ctx context.Context, r io.Reader, call driver
 // quotaFamilyCodes are the upstream 429-family model-exhaustion codes.
 var quotaFamilyCodes = map[int]bool{1113: true, 1308: true, 1310: true, 1311: true, 1312: true, 1313: true, 1314: true, 1315: true, 1316: true, 1317: true, 1318: true, 1319: true, 1320: true, 1321: true}
 
+// zhipuResetRe reads the moment Zhipu names in a 1308/1310 refusal. Both forms
+// appear: the Chinese one through the Anthropic endpoint, the English one from
+// the OpenAI-shaped surfaces — 「已达到 5 小时的使用上限。您的限额将在
+// 2026-11-10 16:01:04 重置。」/ "Your limit will reset at …". BP-352 (magpie
+// 82127a85, #3013).
+//
+// The time carries NO zone, and it is Beijing's: a 1308 received at
+// 2026-09-21T17:17:32Z said 01:18:11 — 39 seconds later read as UTC+8, eight
+// hours later if read as UTC. Parsing it in time.Local (this box is UTC+8
+// today, but the gateway also runs on other hosts) would land hours off.
+var zhipuResetRe = regexp.MustCompile(`(?:您的限额将在|Your limit will reset at)\s*(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?`)
+
+// zhipuZone is the zone Zhipu writes its reset times in.
+var zhipuZone = time.FixedZone("UTC+8", 8*3600)
+
+// zhipuResetAt parses the reset moment a Zhipu quota refusal names, in
+// Beijing's time. ok=false when the body names none or names one already past:
+// a stale sentence is worse than our own fallback, because it would rest the
+// account on a moment that has already come and gone.
+func zhipuResetAt(msg string, now time.Time) (time.Time, bool) {
+	m := zhipuResetRe.FindStringSubmatch(msg)
+	if m == nil {
+		return time.Time{}, false
+	}
+	n := make([]int, 6)
+	for i := 0; i < 6; i++ {
+		if m[i+1] == "" {
+			continue
+		}
+		n[i], _ = strconv.Atoi(m[i+1])
+	}
+	t := time.Date(n[0], time.Month(n[1]), n[2], n[3], n[4], n[5], 0, zhipuZone)
+	// Reject a date time.Date had to normalize (2026-02-30, 25:00 …).
+	if t.Year() != n[0] || int(t.Month()) != n[1] || t.Day() != n[2] || t.Hour() != n[3] || t.Minute() != n[4] {
+		return time.Time{}, false
+	}
+	if !t.After(now) {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// zhipuWindowFallback is how long to rest an account when the refusal names no
+// usable moment: the window's own length, not a flat guess. 1308 is the
+// 5-hour window, 1310 the weekly/monthly one (BP-352).
+func zhipuWindowFallback(code int) time.Duration {
+	switch code {
+	case 1308:
+		return 5 * time.Hour
+	case 1310:
+		return 7 * 24 * time.Hour
+	}
+	return 6 * time.Hour
+}
+
+// minuteRateWords say the limit is a PER-MINUTE one. A 1302 ("每分钟使用上限
+// 已达到"/"rate limit per minute") is a momentary cap the same key passes a
+// minute later, NOT the 5-hour window — classifying it as quota would rest the
+// account for hours over a one-minute blip. The check runs FIRST, because
+// 「每分钟使用上限」 also contains 「使用上限」 (BP-352, magpie 82127a85's test).
+var minuteRateWords = regexp.MustCompile(`(?i)每分钟|per\s*minute|\bRPM\b|rate.?limit|频次|频率|速率`)
+
+// isQuotaFamily reports whether the code belongs to the quota-exhaustion family
+// whose wording may still name a per-minute cap.
+func isQuotaFamily(code int) bool { return quotaFamilyCodes[code] }
+
 func detectBusinessError(raw []byte) (int, string, bool) {
 	var doc struct {
 		Code    any    `json:"code"`
@@ -828,10 +895,33 @@ func toInt(v any) int {
 
 func classifyBusiness(code int, msg, upstreamModel string) *uperr.Error {
 	switch {
+	case code == 1302 || (minuteRateWords.MatchString(msg) && isQuotaFamily(code)):
+		// BP-352: a PER-MINUTE cap is back in a minute on the same key. The
+		// old code had no 1302 branch at all, so it fell to ClassInternal —
+		// a 500-class verdict that rotates the account and charges it a strike
+		// over a one-minute blip. 「每分钟使用上限」 also contains 「使用上限」,
+		// so this branch has to come before the window family below.
+		e := uperr.New(uperr.ClassSoftRate, 429, "zcode: per-minute rate limit: %s", msg)
+		e.Model = ResolveModel(upstreamModel)
+		e.ResetAt = time.Now().Add(time.Minute)
+		return e
 	case code == 1005 || quotaFamilyCodes[code]:
 		e := uperr.New(uperr.ClassSoftRate, 200, "zcode: quota exhausted: %s", msg)
 		e.Model = ResolveModel(upstreamModel) // model-scoped: other models stay live
-		e.ResetAt = time.Now().Add(6 * time.Hour)
+		// BP-352 (magpie 82127a85, #3013): the refusal NAMES when the window
+		// reopens, and resting past that moment refuses an account Zhipu has
+		// already released (the old flat now+6h could sit 6 hours past a 5-hour
+		// window that reset at 16:01). Read the named moment; fall back to the
+		// window's own length, not a flat guess.
+		now := time.Now()
+		if at, ok := zhipuResetAt(msg, now); ok {
+			e.ResetAt = at
+			// ResetAt is the QPS bucket's own boundary — a hard number stated
+			// by the vendor, not our estimate.
+			e.ResetHard = true
+		} else {
+			e.ResetAt = now.Add(zhipuWindowFallback(code))
+		}
 		return e
 	case code == 3012:
 		// 405 {"code":3012,"msg":"request has been blocked due to unusual

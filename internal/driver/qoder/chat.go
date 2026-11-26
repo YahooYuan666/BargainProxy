@@ -682,6 +682,14 @@ func buildQoderMessages(incomingMessages []map[string]interface{}, prompt string
 	for i, message := range incomingMessages {
 		allowStructured := toolsEnabled && hasResolvedToolResponse(incomingMessages, i)
 		if converted := convertIncomingMessage(message, toolsEnabled, allowStructured); converted != nil {
+			// BP-354: two identity sentences in a SYSTEM prompt make Qoder
+			// refuse the request outright — Claude Code's own line (400
+			// "Cannot find model" on any model) and DeepSeek Harness's opener
+			// (a 10605 queue that never moves). Only the system text is
+			// rewritten; the user's messages go as written.
+			if isSystemRole(converted.Role) {
+				converted.Content = sanitizeSystemText(converted.Content)
+			}
 			rebuilt = append(rebuilt, *converted)
 		}
 	}

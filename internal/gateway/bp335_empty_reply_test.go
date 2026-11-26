@@ -32,10 +32,26 @@ func TestEmptyReplyDetected(t *testing.T) {
 
 // A liveness probe (max_tokens=1) is SUPPOSED to answer nothing; retrying it
 // would burn a second request to learn the same thing.
+//
+// BP-351 (CLIProxyAPI 20be744e): max_tokens=0 is NOT a probe. "No budget
+// stated" means the upstream default applies and an answer is owed — clients
+// that omit max_tokens (ZCode and several SDKs do) were exactly the ones
+// silently served an empty 200. The exemption covers only a DECLARED budget
+// below the probe floor.
 func TestEmptyReplySkipsProbes(t *testing.T) {
-	for _, mt := range []int{0, 1, 8, minStarvedBudget - 1} {
+	for _, mt := range []int{1, 8, minStarvedBudget - 1} {
 		if emptyReplyOf(emptyReq(mt), &streamLedger{}) {
 			t.Fatalf("max_tokens=%d must not be treated as an empty reply", mt)
+		}
+	}
+}
+
+// BP-351: a client that named no budget still gets a real answer or a real
+// error — never a silent empty success.
+func TestEmptyReplyDetectedWithoutDeclaredBudget(t *testing.T) {
+	for _, mt := range []int{0, -1} {
+		if !emptyReplyOf(emptyReq(mt), &streamLedger{}) {
+			t.Fatalf("max_tokens=%d (no budget declared) must still be an empty reply", mt)
 		}
 	}
 }

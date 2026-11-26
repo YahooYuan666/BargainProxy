@@ -100,6 +100,26 @@ func TestBP162ArgonMappingAndUA(t *testing.T) {
 	}
 }
 
+// BP-338: the Gemini 4 band (argon excepted — it keeps its CLI identity) is
+// version-gated upstream; the hub family identity is what gets past it.
+func TestBP338Gemini4HubUA(t *testing.T) {
+	for _, m := range []string{"gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-neon"} {
+		if got := uaForModel(m); got != antigravityHubUA {
+			t.Fatalf("%s UA = %q, want hub identity", m, got)
+		}
+	}
+	// argon judgment runs BEFORE the generic gemini-4 branch.
+	if got := uaForModel("gemini-4-argon-medium"); got != argonCLIUA {
+		t.Fatalf("argon-medium UA = %q, want CLI identity", got)
+	}
+	// 3.x/2.5/claude stay on the chat identity that has never failed.
+	for _, m := range []string{"gemini-3.8-flash-high", "gemini-2.5-pro", "claude-sonnet-4-6"} {
+		if got := uaForModel(m); got != antigravityUA {
+			t.Fatalf("%s UA = %q, want chat identity", m, got)
+		}
+	}
+}
+
 // RotatableForTest mirrors uperr.Rotatable without importing the pool.
 func RotatableForTest(class string) bool {
 	switch class {

@@ -376,6 +376,10 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 		includeUsage = v
 	}
 	var lastUsage *ir.Usage
+	// BP-350: tool indices whose EvToolStart carried no function name. Every
+	// later fragment on such an index belongs to the same unusable call and is
+	// suppressed with it (the client must never see a partial call either).
+	namelessTool := map[int]bool{}
 
 	send := func(v any) error {
 		b, err := json.Marshal(v)
@@ -403,6 +407,16 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 			d := &openai.RespDelta{Role: "assistant", ReasoningContent: ev.Delta}
 			return send(openai.RenderChunk(reqID, req.Model, created, d, nil))
 		case ir.EvToolStart:
+			// BP-350 (magpie 33b04b64, #7565): a call that names no function
+			// is unusable, and streaming it hands the client something it will
+			// replay next turn as "name":"" — which 400s the rest of the
+			// session. Suppress the start (and everything that follows it on
+			// that index) so the client never sees a nameless call.
+			if ev.ToolCall == nil || ir.NamesNoFunction(ev.ToolCall.Name) {
+				namelessTool[ev.ToolIndex] = true
+				return nil
+			}
+			delete(namelessTool, ev.ToolIndex)
 			var tc openai.RespToolCall
 			idx := ev.ToolIndex
 			tc.Index = &idx
@@ -412,6 +426,9 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, req *ir.Chat
 			d := &openai.RespDelta{Role: "assistant", ToolCalls: []openai.RespToolCall{tc}}
 			return send(openai.RenderChunk(reqID, req.Model, created, d, nil))
 		case ir.EvToolArgs:
+			if namelessTool[ev.ToolIndex] {
+				return nil
+			}
 			var tc openai.RespToolCall
 			idx := ev.ToolIndex
 			tc.Index = &idx

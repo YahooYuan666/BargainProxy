@@ -183,6 +183,8 @@ func (p *Panel) Mount(mux *http.ServeMux) {
 	mux.HandleFunc("GET /panel/api/accounts/autoclaw/oauth/poll", p.authed(p.handleAutoClawOAuthPoll, false))
 	mux.HandleFunc("GET /panel/api/accounts/autoclaw/catalog", p.authed(p.handleAutoClawCatalog, false))
 	mux.HandleFunc("POST /panel/api/accounts/qoder/pat", p.authed(p.handleQoderPAT, true))
+	mux.HandleFunc("POST /panel/api/accounts/agybridge/start", p.authed(p.handleAgybridgeStart, true))
+	mux.HandleFunc("GET /panel/api/accounts/agybridge/poll", p.authed(p.handleAgybridgePoll, false))
 	mux.HandleFunc("POST /panel/api/accounts/lobster/start", p.authed(p.handleLobsterStart, true))
 	mux.HandleFunc("GET /panel/api/accounts/lobster/poll", p.authed(p.handleLobsterPoll, false))
 	mux.HandleFunc("GET /panel/api/logs", p.authed(p.handleLogs, false))

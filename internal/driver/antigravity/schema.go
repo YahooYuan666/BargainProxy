@@ -110,6 +110,14 @@ func cleanGeminiSchemaMap(in map[string]any) map[string]any {
 // geminiTypeField normalizes the "type" value: strings upper-cased
 // (OBJECT/STRING/...), arrays like ["string","null"] collapse to
 // ("STRING", true). Returns nil when nothing usable remains.
+//
+// BP-358 (CLIProxyAPI 531aea15): a schema that travelled through a protobuf
+// encoder carries the type as the ENUM's NUMBER — google.api.Type's
+// TYPE_STRING=1, TYPE_NUMBER=2, TYPE_INTEGER=3, TYPE_BOOLEAN=4, TYPE_ARRAY=5,
+// TYPE_OBJECT=6. The old default branch returned nil for those, and the caller
+// DROPS the key when the value is nil, so the whole "type" disappeared and the
+// declaration lost its type. A JSON body that was decoded then re-encoded from
+// a protobuf struct is exactly how a client hands us this shape.
 func geminiTypeField(v any) (any, bool) {
 	switch t := v.(type) {
 	case string:
@@ -122,6 +130,13 @@ func geminiTypeField(v any) (any, bool) {
 		nullable := false
 		var first any
 		for _, e := range t {
+			// An array may mix the string form with the numeric one.
+			if n, ok := protoTypeName(e); ok {
+				if first == nil {
+					first = n
+				}
+				continue
+			}
 			s, ok := e.(string)
 			if !ok {
 				continue
@@ -136,6 +151,44 @@ func geminiTypeField(v any) (any, bool) {
 		}
 		return first, nullable
 	default:
+		if n, ok := protoTypeName(v); ok {
+			return n, false
+		}
 		return nil, false
 	}
+}
+
+// protoTypeName maps google.api.Type's numeric form onto the wire name.
+// Anything outside the enum is not a type (ok=false), so the caller keeps its
+// existing "drop the unusable key" behaviour.
+func protoTypeName(v any) (string, bool) {
+	var n int
+	switch t := v.(type) {
+	case float64:
+		n = int(t)
+		if float64(n) != t {
+			return "", false // 6.5 is not an enum value
+		}
+	case int:
+		n = t
+	case int64:
+		n = int(t)
+	default:
+		return "", false
+	}
+	switch n {
+	case 1:
+		return "STRING", true
+	case 2:
+		return "NUMBER", true
+	case 3:
+		return "INTEGER", true
+	case 4:
+		return "BOOLEAN", true
+	case 5:
+		return "ARRAY", true
+	case 6:
+		return "OBJECT", true
+	}
+	return "", false
 }

@@ -25,7 +25,7 @@
     },
     "workbuddy": {
       "enabled": true,
-      "max_in_flight": 2,
+      "max_in_flight": 3,
       "prompt_mode": "custom"
     },
     "trae": {

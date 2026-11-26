@@ -65,6 +65,11 @@ type accountView struct {
 	Nickname    string `json:"nickname,omitempty"`
 	UID         string `json:"uid,omitempty"`
 	Realm       string `json:"realm,omitempty"`
+	// Email is the Google identity an agybridge account was signed in as.
+	// Without it the row shows only a nickname plus an opaque id hash, which
+	// tells an operator nothing about WHICH Google account it is
+	// (2026-11-25 field: the pool listed "v3 / agybridge:9e759e593f41").
+	Email string `json:"email,omitempty"`
 	Disabled    bool   `json:"disabled"`
 	Paused      bool   `json:"paused"`
 	InFlight    int    `json:"in_flight"`
@@ -126,11 +131,12 @@ func (p *Panel) handleState(w http.ResponseWriter, r *http.Request) {
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae,
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
 		model.ChannelOpenAICompat, model.ChannelOpenCodeZen, model.ChannelLobster,
-		model.ChannelAIStudio,
+		model.ChannelAIStudio, model.ChannelAgyBridge,
 	} {
 		for _, a := range pl.AccountsLocked(ch) {
 			v := accountView{
 				ID: a.ID, Channel: a.Channel, Nickname: a.Nickname, UID: a.UID, Realm: a.Realm,
+				Email: agybridgeEmail(a),
 				Disabled: a.Disabled, Paused: a.Paused, InFlight: pl.InFlightLocked(a.ID),
 			}
 			if a.AccountCooldownUntil.After(time.Now()) {
@@ -551,6 +557,31 @@ func normalizeImport(channel string, raw json.RawMessage, label string) (*model.
 			ID: model.ChannelAIStudio + ":" + shortHash(key), Channel: channel,
 			Nickname: firstNonEmpty(label, "aistudio"), CredsJSON: creds,
 		}, nil
+	case model.ChannelAgyBridge:
+		// BP-339: an agybridge "credential" is just the account's email label
+		// plus its assigned isolated home. The OAuth token never passes
+		// through the gateway — agy keeps it in the home's token file. The
+		// home is provisioned here so the login flow can start immediately.
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("agybridge creds: %w", err)
+		}
+		email := ""
+		if v, ok := m["email"].(string); ok {
+			email = strings.TrimSpace(v)
+		}
+		if email == "" {
+			return nil, fmt.Errorf("agybridge: email required")
+		}
+		home := ""
+		if v, ok := m["home"].(string); ok {
+			home = strings.TrimSpace(v)
+		}
+		creds, _ := json.Marshal(map[string]string{"email": email, "home": home})
+		return &model.Account{
+			ID: model.ChannelAgyBridge + ":" + shortHash(email), Channel: channel,
+			Nickname: firstNonEmpty(label, email), CredsJSON: creds,
+		}, nil
 	case model.ChannelLobster:
 		var m map[string]any
 		if err := json.Unmarshal(raw, &m); err != nil {
@@ -721,7 +752,7 @@ func (p *Panel) findAccount(id string) *model.Account {
 		model.ChannelAntigravity, model.ChannelWorkBuddy, model.ChannelTrae,
 		model.ChannelZCode, model.ChannelAutoClaw, model.ChannelQoder,
 		model.ChannelOpenAICompat, model.ChannelOpenCodeZen, model.ChannelLobster,
-		model.ChannelAIStudio,
+		model.ChannelAIStudio, model.ChannelAgyBridge,
 	} {
 		for _, a := range pl.AccountsLocked(ch) {
 			if a.ID == id {

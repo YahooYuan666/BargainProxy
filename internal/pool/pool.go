@@ -770,8 +770,18 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 	// queue) instead of starting a second account. Only a conversation with no
 	// binding here can start a second account, and that is what this check
 	// forbids.
+	//
+	// BP-345: not when the holder cannot serve THIS model. A holder whose
+	// glm-5.4 is walled while it runs glm-5.3-flash is full for glm-5.3-flash
+	// and out of reach for glm-5.4 alike, and refusing here sent the
+	// glm-5.4 request away before the candidate step could decide that another
+	// account can take it. Let that case through: the candidate step either
+	// queues the request for the pool to open (a standby account exists) or
+	// refuses there with the same ErrChannelBusy.
 	if a, busy := p.activeAccountLocked(channel); busy {
-		return nil, &ErrChannelBusy{Channel: channel, Account: a.Nickname}, false
+		if p.admissionLocked(a, modelName, now) != AdmitNone {
+			return nil, &ErrChannelBusy{Channel: channel, Account: a.Nickname}, false
+		}
 	}
 
 	// 2. Candidate selection by channel strategy. Single-active mode allows
@@ -787,6 +797,10 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 		}
 	}
 	var candidates []*model.Account
+	// blockedOnlyBySingleActive: an account that is fully able to serve this
+	// model right now and is excluded for ONE reason only — another account of
+	// the pool is interacting (BP-345).
+	blockedOnlyBySingleActive := false
 	for _, id := range p.byChan[channel] {
 		a := p.accounts[id]
 		if a == nil || a.Disabled || a.Paused {
@@ -806,6 +820,7 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 			continue // busy but healthy
 		}
 		if holderActive && p.params.SingleActivePerChannel && p.inflight[a.ID] == 0 {
+			blockedOnlyBySingleActive = true
 			continue // idle account = a SECOND account on this pool: forbidden
 		}
 		candidates = append(candidates, a)
@@ -815,6 +830,26 @@ func (p *Pool) tryAcquire(channel, modelName, sessionKey string) (*Lease, error,
 			// The holder exists but has no free slot (or is unusable for this
 			// model). Refuse instead of queueing: the gateway walks to the
 			// next pool, and only a full walk ends as 并行数量超发.
+			//
+			// BP-345 — unless another account could serve this model and is
+			// held back by nothing but the single-active rule. That is the
+			// holder being unusable FOR THIS MODEL while it still runs other
+			// work (a model-scoped daily wall; field 2026-11-25: one account
+			// served glm-5.3-flash for 185 calls while its glm-5.4 was walled,
+			// and the conversation asking for glm-5.4 was refused 18 times in
+			// nine minutes although a healthy account stood by). Refusing
+			// does not keep the rule — waiting does: the request queues until
+			// the holder finishes, and THEN the standby account is the only
+			// one interacting. One account at a time, unchanged; the
+			// conversation no longer ends.
+			//
+			// The ordinary full-holder case (the holder CAN serve this model
+			// but is at max_in_flight) is unchanged: its bound conversations
+			// already wait on it above, and a newcomer has no claim to start
+			// a second account.
+			if blockedOnlyBySingleActive {
+				return nil, nil, true // bounded wait for the pool to open
+			}
 			return nil, &ErrChannelBusy{Channel: channel, Account: p.poolHolderNickname(channel)}, false
 		}
 		if p.hasHealthyButBusy(channel, modelName, now) {
@@ -1045,13 +1080,33 @@ func (p *Pool) activeAccountLocked(channel string) (*model.Account, bool) {
 }
 
 // ChannelBusy reports whether single-active mode currently forbids another
-// request on this channel, and names the account that holds it. The gateway
-// consults it before committing to a binding so a busy pool is skipped
-// immediately instead of turning into a no-capacity wait (2026-10-20).
-func (p *Pool) ChannelBusy(channel string) (bool, string) {
+// request for modelName on this channel, and names the account that holds it.
+// The gateway consults it before committing to a binding so a busy pool is
+// skipped immediately instead of turning into a no-capacity wait (2026-10-20).
+//
+// BP-345: the verdict is per MODEL. "Busy" means "the holder could serve this
+// request itself but is at its slot limit — go elsewhere". When the holder
+// cannot serve this model at all (a model-scoped wall or cooldown), no amount
+// of going elsewhere helps a conversation that has only this pool, and the
+// answer must be "not busy": the request then reaches tryAcquire, which makes
+// it WAIT for the holder to finish and hands it to a standby account (one
+// account at a time, still). Answering "busy" there is what ended 18 turns in
+// nine minutes on 2026-11-25 while a healthy account stood by.
+//
+// An empty modelName asks the channel-wide question and keeps the old answer.
+func (p *Pool) ChannelBusy(channel, modelName string) (bool, string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if a, ok := p.activeAccountLocked(channel); ok {
+	a, ok := p.activeAccountLocked(channel)
+	if ok && modelName != "" {
+		now := p.params.Now()
+		// The holder is out of reach for THIS model: serving it is not an
+		// option, so its fullness is not what blocks the request.
+		if p.admissionLocked(a, modelName, now) == AdmitNone {
+			return false, ""
+		}
+	}
+	if ok {
 		return true, a.Nickname
 	}
 	return false, ""
@@ -1319,7 +1374,13 @@ func (p *Pool) ApplyResult(a *model.Account, model string, upstreamErr *uperr.Er
 			if upstreamErr.Code != "" {
 				reason = upstreamErr.Code + " model allowance used up"
 			}
-			until := p.setModelCooldown(a, upstreamErr.Model, time.Time{}, reason, upstreamErr.Message, now)
+			// BP-345: the driver's moment rides along. Passing time.Time{}
+			// here dropped it, so setModelCooldownHard fell back to the
+			// BP-314 60s probe no matter what the driver had said, and a
+			// wall the driver KNEW was long was re-hit every minute until
+			// MaxQueueWait ran out. A wall with no moment still gets the
+			// probe: that fallback is for a one-minute wobble.
+			until := p.setModelCooldownHard(a, upstreamErr.Model, upstreamErr.ResetAt, upstreamErr.ResetHard, reason, upstreamErr.Message, now)
 			upstreamErr.HoldUntil = until
 			a.BreakerFails = 0
 			break

@@ -34,6 +34,7 @@ import (
 	"bargainproxy/internal/httpx"
 	"bargainproxy/internal/ir"
 	"bargainproxy/internal/model"
+	"bargainproxy/internal/pool"
 	"bargainproxy/internal/uperr"
 )
 
@@ -149,6 +150,26 @@ const (
 	sandboxListPath  = "/agentdr/v2/assistant/sandbox/list"
 	sandboxApplyPath = "/agentdr/v2/assistant/sandbox/apply"
 	taskCompletePath = "/autoclaw-proxy/proxy/autoclaw-task-complete"
+	taskListPath     = "/autoclaw-proxy/proxy/autoclaw-task-list"
+	// userInfoPath is the identity call the desktop client makes as it signs
+	// in. Reaching it with the client's own fingerprint is what raises the
+	// server-side "user active" event that pays the login campaign
+	// (BP-346); the same path answers plain profile data with our usual
+	// headers and pays nothing.
+	userInfoPath = "/userapi/v1/user-info"
+	// walletInstancesPath lists every wallet instance with its own balance
+	// and expiry (BP-347). The CN client calls it as the fallback when
+	// /agent-assetmgr/api/v2/wallets has no per-wallet rows.
+	walletInstancesPath = "/agent-assetmgr/api/v1/wallet-instances?wallet_type=all&wallet_scope=all"
+	// inspirationCompletePath is only used by the overseas lane: opening the
+	// inspiration centre completes `daily_inspiration_center` for the day
+	// (BP-349).
+	inspirationCompletePath = "/agentdr/v1/assistant/inspiration-task-complete"
+	// checkinCardPath / checkinClaimPath are the domestic client's current
+	// check-in protocol (BP-348). The card read is a GET and changes nothing;
+	// the claim spends the day's single claim.
+	checkinCardPath  = "/asset-operation/api/v1/checkin/card"
+	checkinClaimPath = "/asset-operation/api/v1/checkin/claim"
 )
 
 // CNModels is the static CN model catalogue. The tdpsk_deepseek-* ids are
@@ -2336,6 +2357,22 @@ func codeOf(body []byte) string {
 	return ""
 }
 
+// modelLabel names the model an allowance wall belongs to, as the gateway
+// wrote it: the 810000 body opens with the display name ("GLM-5.4 免费额度已
+// 用完…", "GLM-5.3-Flash model usage quota exhausted"). Unknown shapes fall
+// back to a generic noun rather than echoing the upstream sentence, which
+// carries the subscription pitch.
+func modelLabel(text string) string {
+	for _, sep := range []string{" 免费额度", " free", " model usage", " quota", "\""} {
+		if i := strings.Index(text, sep); i > 0 {
+			if name := strings.TrimSpace(text[:i]); name != "" {
+				return name
+			}
+		}
+	}
+	return "该模型"
+}
+
 func classifyHTTP(status int, body []byte) *uperr.Error {
 	text := string(body)
 	return classify(status, "", text, strings.ToLower(text))
@@ -2397,8 +2434,25 @@ func classify(status int, code, text, lower string) *uperr.Error {
 		// Model-scoped, not account-scoped: allowances are per route, so the
 		// error carries the model it ran out on. CooldownScope turns that into
 		// a single-model hold instead of stopping the whole account.
-		e := uperr.New(uperr.ClassHardCredit, 402, "autoclaw: %s allowance used up (%s): %s", clipped, code, clipped)
+		//
+		// BP-345: the allowance is counted PER DAY (user ruling 2026-11-25), so
+		// the hold names the day's boundary instead of leaving the pool to
+		// guess. Without a moment the pool applies its 60s probe (BP-314, meant
+		// for a one-minute capacity wobble), expires, and dispatches the same
+		// walled account again: field 2026-11-25 22:30–22:45, one account
+		// re-hit the wall four times in fifteen minutes and each hit ended a
+		// conversation's turn. ResetHard because the boundary is the
+		// allowance's own, not our guess — the pool must not cap or shorten it.
+		//
+		// The upstream wording ("free allowance used up, subscribe to
+		// continue") is NOT relayed: the account's points are untouched and
+		// keep paying for its other models, which the pitch hides.
+		e := uperr.New(uperr.ClassHardCredit, 402,
+			"autoclaw: %s 今日用量额度已用完（%s）；该号的这个模型歇到明天 04:00，账户积分未受影响、其它模型照常",
+			modelLabel(text), code)
 		e.Code = code
+		e.ResetAt = pool.NextDay4AM(time.Now())
+		e.ResetHard = true
 		return e
 	case busyCodes[code]:
 		// A transient throttle: retry in a moment, no allowance consumed.

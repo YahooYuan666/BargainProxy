@@ -128,6 +128,29 @@ func (p *Panel) handleAccountCredits(w http.ResponseWriter, r *http.Request) {
 		out["detail"] = det
 		out["recent_spent"] = spent
 		out["recent_count"] = n
+		// BP-348: the domestic check-in card, read-only. It shows what the new
+		// protocol would pay today (daily + limited-time events + streak)
+		// without touching the day's single claim — the claim itself stays
+		// unmade while the old daily_signin task still pays. Overseas accounts
+		// have no card (only the CN client speaks it), so the read is skipped
+		// there rather than reported as a failure.
+		if !d.Overseas(acc) {
+			cardCtx, cardCancel := contextWithTimeout(r, 20*time.Second)
+			card, cerr := d.CheckinCard(cardCtx, acc)
+			cardCancel()
+			if cerr != nil {
+				out["checkin_card_error"] = cleanProbeError(cerr.Error())
+			} else {
+				out["checkin_card"] = card
+			}
+		}
+		// The wallet read lives inside CreditDetail (BP-347) and can fail on its
+		// own; clean it here like every other probe error, or a gateway HTML
+		// body lands in the drawer.
+		if det.WalletError != "" {
+			det.WalletError = cleanProbeError(det.WalletError)
+		}
+		out["recent_count"] = n
 	case model.ChannelQoder:
 		d, ok := p.qoderDriver()
 		if !ok {

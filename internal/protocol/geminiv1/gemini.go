@@ -333,7 +333,11 @@ func Render(model string, resp *ir.ChatResponse, includeThoughts bool) *Response
 	if text := textOf(resp.Message.Content); text != "" {
 		parts = append(parts, Part{Text: text})
 	}
-	for _, tc := range resp.Message.ToolCalls {
+	// BP-350 (magpie 33b04b64, #7565): a functionCall naming no function is
+	// unusable — the client replays it and the turn (and every later one)
+	// 400s. Drop it before rendering.
+	named, nameless, calls := ir.SplitNameless(resp.Message.ToolCalls)
+	for _, tc := range calls {
 		var args map[string]any
 		_ = json.Unmarshal([]byte(tc.Arguments), &args)
 		if args == nil {
@@ -341,11 +345,15 @@ func Render(model string, resp *ir.ChatResponse, includeThoughts bool) *Response
 		}
 		parts = append(parts, Part{FunctionCall: &FunctionCall{ID: tc.ID, Name: tc.Name, Args: args}})
 	}
+	stop := resp.StopReason
+	if nameless {
+		stop = ir.ReplyStopForNameless(stop, named, nameless)
+	}
 	return &Response{
 		ModelVersion: model,
 		Candidates: []Candidate{{
 			Content:      Content{Role: "model", Parts: parts},
-			FinishReason: mapFinish(resp.StopReason),
+			FinishReason: mapFinish(stop),
 			Index:        0,
 		}},
 		UsageMetadata: &UsageMetadata{
@@ -518,6 +526,14 @@ func (s *StreamWriter) finalize() error {
 	var parts []Part
 	for _, idx := range s.toolOrder {
 		st := s.tools[idx]
+		if ir.NamesNoFunction(st.name) {
+			// BP-350 (magpie 33b04b64, #7565): a functionCall naming no
+			// function is unusable — drop it rather than hand the client a
+			// call it will replay into a 400 on every later turn. (This
+			// surface has no separate tool finish reason, so nothing else
+			// changes.)
+			continue
+		}
 		raw := st.args.String()
 		if raw == "" {
 			raw = "{}"

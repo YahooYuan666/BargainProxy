@@ -27,7 +27,7 @@
  *   - 未知字段：原 provider / model 规则里的其它键原样保留。
  *
  * 安全轨（对着两次真实事故的根因逐条设防）：
- *   1. 只碰自己那 9 个 providerId，其余供应商、模型声明、排序原样保留（写后逐条深比对）；
+ *   1. 只碰自己那 6 个 providerId，其余供应商、模型声明、排序原样保留（写后逐条深比对）；
  *   2. 所有数组永远写成 []，绝不出现 null（事故一：Go 的 nil 切片序列化成 null）；
  *   3. api.type 只用固定枚举常量（事故三：写了非法的 "anthropic"）；
  *   4. 写前带时间戳备份，临时文件 + rename 原子替换；
@@ -39,7 +39,7 @@
  *   node scripts/session-start.mjs                 # 同步（ZCode SessionStart 钩子默认调用）
  *   node scripts/session-start.mjs --status        # 看当前安装状态（不改动）
  *   node scripts/session-start.mjs --dry-run       # 打印将要发生的改动（不落盘）
- *   node scripts/session-start.mjs --remove        # 从 ZCode 里摘掉这 9 个供应商
+ *   node scripts/session-start.mjs --remove        # 从 ZCode 里摘掉这 6 个供应商
  *   node scripts/session-start.mjs --readd         # 把用户整组删掉的供应商重新加回
  *   node scripts/session-start.mjs --config <path> --gateway <url> --api-key <key> --verbose
  */
@@ -49,7 +49,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 
-// ── 固定身份（3 个模型族 × 3 条协议线；OpenCode 免费通道已下线）─────────
+// ── 固定身份（2 个模型族 × 3 条协议线）─────────────────────────────────
 const FAMILIES = [
   {
     key: "cn",
@@ -67,18 +67,6 @@ const FAMILIES = [
       { id: "bargainproxy-gemini-chat", name: "BargainProxy Gemini Chat", apiType: "openai-chat-completions", v1: true },
       { id: "bargainproxy-gemini-responses", name: "BargainProxy Gemini Response", apiType: "openai-responses", v1: true },
       { id: "bargainproxy-gemini-anthropic", name: "BargainProxy Gemini Anthropic", apiType: "anthropic-messages", v1: false },
-    ],
-  },
-  {
-    // BP-339 用户指令：「做成一个单独的模型组」「不要叫Gemini 4 应该叫agy-bridge」。
-    // 组成员 = 网关 Gemini 家族清单里的 gemini-4-* 模型（判据只有前缀这一条，
-    // 与网关内部走哪条通路无关——通路是路由层的事，界面只管按名收模型）。
-    key: "agybridge",
-    label: "Agy-Bridge",
-    providers: [
-      { id: "bargainproxy-agybridge-chat", name: "BargainProxy Agy-Bridge Chat", apiType: "openai-chat-completions", v1: true },
-      { id: "bargainproxy-agybridge-responses", name: "BargainProxy Agy-Bridge Response", apiType: "openai-responses", v1: true },
-      { id: "bargainproxy-agybridge-anthropic", name: "BargainProxy Agy-Bridge Anthropic", apiType: "anthropic-messages", v1: false },
     ],
   },
 ];

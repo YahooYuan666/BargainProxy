@@ -190,7 +190,7 @@ open http://127.0.0.1:13140/panel/
 - 默认只监听 `127.0.0.1`；面板与数据面 API 分开鉴权（面板用独立密码 + HttpOnly/SameSite=Strict Cookie + CSRF Token，登录限速）。
 - 请求日志**只记录元数据**（协议/模型/渠道/账号/耗时/Token 数），不落 prompt/completion/凭据；默认保留 14 天后自动清理。
 - 不做服务端抓取外部图片 URL（防 SSRF）；`data:` 内联图片正常透传。
-- 所有 SQL 参数绑定；上游并发上限按渠道硬约束（Trae=1、Antigravity=3、WorkBuddy=2、ZCode=2）。
+- 所有 SQL 参数绑定；上游并发上限按渠道硬约束（Trae=1、Antigravity=3、WorkBuddy=3（国际版单号仍压到 2）、ZCode=2）。
 
 ## 目录结构
 

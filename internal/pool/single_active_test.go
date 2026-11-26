@@ -73,7 +73,7 @@ func TestSingleActivePerChannelRoutesAway(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
 		t.Fatalf("busy refusal took %s: it must not queue", elapsed)
 	}
-	if ok, _ := p.ChannelBusy(model.ChannelWorkBuddy); !ok {
+	if ok, _ := p.ChannelBusy(model.ChannelWorkBuddy, ""); !ok {
 		t.Fatal("ChannelBusy must report the pool as interacting")
 	}
 }

@@ -45,7 +45,7 @@ func ProbeHosts(ctx context.Context, d *Driver, call driver.ChatCall, perHost ti
 		return nil, err
 	}
 	lookup, _ := d.sigLookup(call.UpstreamModel, call.Account.ID)
-	body, err := buildRequest(project, call.UpstreamModel, call.Request, lookup)
+	body, err := buildRequestWithEnvelope(project, call.UpstreamModel, call.Request, lookup, d.envelopeFor(ctx, call.Account, creds.AccessToken, call.UpstreamModel))
 	if err != nil {
 		return nil, err
 	}

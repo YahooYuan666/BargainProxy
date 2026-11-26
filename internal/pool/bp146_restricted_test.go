@@ -76,7 +76,7 @@ func TestOneRestrictionPausesNothing(t *testing.T) {
 func TestSecondRestrictionPausesTheChannel(t *testing.T) {
 	p, accts := restrictedPool(t)
 	p.ApplyResult((*accts)[0], "glm-5.3", uperr.New(uperr.ClassAccountRestricted, 403, "11140 request illegal"))
-	if busy, _ := p.ChannelBusy(model.ChannelWorkBuddy); busy {
+	if busy, _ := p.ChannelBusy(model.ChannelWorkBuddy, ""); busy {
 		t.Fatalf("channel paused after the FIRST restriction")
 	}
 	p.ApplyResult((*accts)[1], "glm-5.3", uperr.New(uperr.ClassAccountRestricted, 403, "11140 request illegal"))

@@ -20,6 +20,7 @@ import (
 	"bargainproxy/internal/config"
 	"bargainproxy/internal/cryptox"
 	"bargainproxy/internal/driver"
+	"bargainproxy/internal/driver/agybridge"
 	"bargainproxy/internal/driver/aistudio"
 	"bargainproxy/internal/driver/antigravity"
 	"bargainproxy/internal/driver/autoclaw"
@@ -123,6 +124,7 @@ func main() {
 		model.ChannelOpenCodeZen:  2,
 		model.ChannelLobster:      cfg.Channels.Lobster.MaxInFlight,
 		model.ChannelAIStudio:     cfg.Channels.AIStudio.MaxInFlight,
+		model.ChannelAgyBridge:    3, // per-account cap; the 2026-10-20 rule is one ACCOUNT at a time, that account may run 2-3 tasks
 	}
 	var p *pool.Pool
 	onChange := func(acc *model.Account) {
@@ -214,6 +216,15 @@ func main() {
 		// imported from the panel or scripts/akadd. An unbound pool is inert.
 		drivers[model.ChannelAIStudio] = aistudio.New(cfg.Channels.AIStudio, nil)
 	}
+	// Per-user like lobster: each pool account is one isolated-home agy
+	// login. The pool stays empty until accounts log in from the panel; an
+	// unbound pool is inert, not broken (BP-339). No Enabled flag — every
+	// channel in this gateway is filled by per-account logins.
+	agyCfg := cfg.Channels.AgyBridge
+	if agyCfg.AccountsDir == "" {
+		agyCfg.AccountsDir = filepath.Join(cfg.DataDir, "agybridge", "accounts")
+	}
+	drivers[model.ChannelAgyBridge] = agybridge.New(agyCfg, nil)
 
 	// Router + gateway.
 	r := router.New(cfg)

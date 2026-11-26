@@ -121,7 +121,13 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 			if tw.sent {
 				// Something already reached the client: the status line is
 				// gone, so end the stream with an in-protocol error event.
-				_ = sw.FinishWithError(msg)
+				// BP-357: an overflow still has to carry the wording Claude
+				// Code compacts on, even mid-stream.
+				if ue, ok := uperr.As(err); ok && ue.ContextOverflow {
+					_ = sw.FinishWithErrorBody(anthropic.RenderContextOverflow(msg))
+				} else {
+					_ = sw.FinishWithError(msg)
+				}
 			} else {
 				// BP-327: nothing was written, so the honest status is still
 				// available — answer JSON with it. Returning without writing
@@ -129,7 +135,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 				// the client sees success and an empty assistant turn, so it
 				// neither retries nor switches channels.
 				withRetryAfter(w, status, err)
-				writeJSON(w, status, anthropic.RenderError(kindForClass(class), msg))
+				// BP-357: an overflow must reach Claude Code in the words it
+				// acts on ("prompt is too long"), or it resends the identical
+				// oversized body instead of compacting.
+				if ue, ok := uperr.As(err); ok && ue.ContextOverflow {
+					writeJSON(w, status, anthropic.RenderContextOverflow(msg))
+				} else {
+					writeJSON(w, status, anthropic.RenderError(kindForClass(class), msg))
+				}
 			}
 			logRow.Status, logRow.ErrorClass, logRow.DurationMs = status, class, int(time.Since(start).Milliseconds())
 			s.gw.LogRequest(logRow)
@@ -154,6 +167,12 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		logRow.Status, logRow.ErrorClass, logRow.DurationMs = status, class, int(time.Since(start).Milliseconds())
 		s.gw.LogRequest(logRow)
 		withRetryAfter(w, status, err)
+		// BP-357: same rule as the streamed branch — an overflow has to reach
+		// Claude Code in the words it compacts on.
+		if ue, ok := uperr.As(err); ok && ue.ContextOverflow {
+			writeJSON(w, status, anthropic.RenderContextOverflow(msg))
+			return
+		}
 		writeJSON(w, status, anthropic.RenderError(kindForClass(class), msg))
 		return
 	}

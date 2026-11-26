@@ -253,12 +253,24 @@ func (s *StreamWriter) Send(ev ir.StreamEvent) error {
 // blocks, in first-seen order. Buffering is what makes interleaved upstream
 // deltas safe: Anthropic allows only one open content block at a time, and a
 // tool block must be started and stopped with its own arguments (BP-70).
-func (s *StreamWriter) emitToolBlocks() error {
+//
+// BP-350 (magpie 33b04b64, #7565): a buffered call whose name never arrived
+// names no function, and a `tool_use` with "name":"" makes the client replay
+// an unusable call that 400s every later turn of the session. It is dropped
+// here — the one place the anthropic lane materialises blocks — and the
+// returned named/nameless flags let finish() decide whether the turn still
+// ends "for tools".
+func (s *StreamWriter) emitToolBlocks() (named, nameless bool, err error) {
 	for _, idx := range s.toolOrder {
 		st := s.toolStates[idx]
 		if st == nil {
 			continue
 		}
+		if ir.NamesNoFunction(st.name) {
+			nameless = true
+			continue
+		}
+		named = true
 		id := st.id
 		if id == "" {
 			id = fmt.Sprintf("call_%d", idx)
@@ -268,23 +280,23 @@ func (s *StreamWriter) emitToolBlocks() error {
 			"type": "content_block_start", "index": s.blockIdx,
 			"content_block": map[string]any{"type": "tool_use", "id": id, "name": st.name, "input": map[string]any{}},
 		}); err != nil {
-			return err
+			return named, nameless, err
 		}
 		if args := st.args.String(); args != "" {
 			if err := s.event("content_block_delta", map[string]any{
 				"type": "content_block_delta", "index": s.blockIdx,
 				"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
 			}); err != nil {
-				return err
+				return named, nameless, err
 			}
 		}
 		if err := s.event("content_block_stop", map[string]any{
 			"type": "content_block_stop", "index": s.blockIdx,
 		}); err != nil {
-			return err
+			return named, nameless, err
 		}
 	}
-	return nil
+	return named, nameless, nil
 }
 
 // finish closes open blocks and emits message_delta + message_stop.
@@ -298,10 +310,16 @@ func (s *StreamWriter) finish(stop string) error {
 		}
 		s.started = true
 	}
-	if err := s.emitToolBlocks(); err != nil {
+	named, nameless, err := s.emitToolBlocks()
+	if err != nil {
 		return err
 	}
 	reason := mapStop(ir.StopReason(stop))
+	if nameless {
+		// BP-350: the turn no longer ends "for tools" if the only calls it
+		// carried named nothing — nothing is there for the client to run.
+		reason = mapStop(ir.ReplyStopForNameless(ir.StopReason(stop), named, nameless))
+	}
 	// The final usage is cumulative and authoritative: clients recompute the
 	// prompt as input + cache_creation + cache_read, and the AI SDK overwrites
 	// each field it finds here — so this event is what actually feeds a
@@ -328,6 +346,13 @@ func (s *StreamWriter) finish(stop string) error {
 // FinishWithError closes the stream after an upstream failure mid-stream:
 // Emit an error event without inventing a successful message_stop.
 func (s *StreamWriter) FinishWithError(msg string) error {
+	return s.FinishWithErrorBody(RenderError("api_error", msg))
+}
+
+// FinishWithErrorBody is FinishWithError with a caller-built envelope — used
+// when the error's TYPE or wording carries meaning the client acts on (BP-357:
+// a context overflow must say "prompt is too long" so Claude Code compacts).
+func (s *StreamWriter) FinishWithErrorBody(body *ErrorBody) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -341,7 +366,7 @@ func (s *StreamWriter) FinishWithError(msg string) error {
 	}
 	s.toolStates = map[int]*toolBlock{}
 	s.toolOrder = nil
-	if err := s.event("error", RenderError("api_error", msg)); err != nil {
+	if err := s.event("error", body); err != nil {
 		return err
 	}
 	s.closed = true

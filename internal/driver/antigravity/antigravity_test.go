@@ -217,8 +217,13 @@ func TestBuildRequestShape(t *testing.T) {
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if doc["project"] != "proj-1" || doc["model"] != "gemini-pro-agent" || doc["requestType"] != "agent" || doc["userAgent"] != "antigravity" {
+	if doc["project"] != "proj-1" || doc["model"] != "gemini-pro-agent" || doc["requestType"] != "agent" {
 		t.Fatalf("outer shape wrong: %v", doc)
+	}
+	// BP-338: the body userAgent mirrors uaForModel(model) — a 3.x model
+	// keeps the chat identity.
+	if doc["userAgent"] != antigravityUA {
+		t.Fatalf("body userAgent = %v, want %q", doc["userAgent"], antigravityUA)
 	}
 	inner := doc["request"].(map[string]any)
 	if _, ok := inner["systemInstruction"]; !ok {

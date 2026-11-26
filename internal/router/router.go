@@ -48,6 +48,7 @@ var channelNames = map[string]bool{
 	model.ChannelOpenCodeZen:  true,
 	model.ChannelLobster:      true,
 	model.ChannelAIStudio:     true,
+	model.ChannelAgyBridge:    true,
 }
 
 // ValidChannel reports whether name is a known channel identifier.
@@ -69,6 +70,7 @@ func New(cfg *config.Config) *Router {
 			model.ChannelOpenCodeZen:  cfg.Channels.OpenCodeZen.Enabled,
 			model.ChannelLobster:      cfg.Channels.Lobster.Enabled,
 			model.ChannelAIStudio:     cfg.Channels.AIStudio.Enabled,
+			model.ChannelAgyBridge:    true, // pool fills by per-account login; empty = inert (BP-339)
 		},
 	}
 	for _, m := range cfg.Channels.OpenAICompat.Models {

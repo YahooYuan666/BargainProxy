@@ -105,7 +105,7 @@ func TestBP333PanicDoesNotLeakInflightSlot(t *testing.T) {
 func TestBP333PanicDoesNotLeaveChannelBusy(t *testing.T) {
 	g, p, _ := newBP333Gateway(t, []string{"wb-1"}, true)
 	mustPanic(t, g)
-	if busy, who := p.ChannelBusy(model.ChannelWorkBuddy); busy {
+	if busy, who := p.ChannelBusy(model.ChannelWorkBuddy, ""); busy {
 		t.Fatalf("channel still busy after a panic (holder %q): the next request would cascade away", who)
 	}
 }
@@ -139,7 +139,7 @@ func TestBP333SuccessStillReleasesOnce(t *testing.T) {
 	if got := p.InFlight("wb-1"); got != 0 {
 		t.Fatalf("in-flight after success = %d, want 0 (no leak, no negative count)", got)
 	}
-	if busy, who := p.ChannelBusy(model.ChannelWorkBuddy); busy {
+	if busy, who := p.ChannelBusy(model.ChannelWorkBuddy, ""); busy {
 		t.Fatalf("channel busy after a successful request (holder %q)", who)
 	}
 }

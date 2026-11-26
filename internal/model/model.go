@@ -73,6 +73,12 @@ const (
 	// (Carbon/Argon are paid-only; the catalog still lists them, which is why
 	// this channel exposes a fixed allow-list instead of echoing ListModels).
 	ChannelAIStudio = "aistudio"
+	// ChannelAgyBridge serves requests through Google's official `agy acp`
+	// subprocess (BP-339): the official client talks to Google itself, this
+	// process only bridges ACP JSON-RPC over stdio — zero derived
+	// fingerprints, zero token handling. One isolated home per account keeps
+	// each login's token file separate (agy-acp / t3code-validated recipe).
+	ChannelAgyBridge = "agybridge"
 )
 
 // ImageGenModel is the canonical text-to-image model, served only through

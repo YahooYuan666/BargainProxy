@@ -185,7 +185,22 @@ func (d *compactFake) Stream(ctx context.Context, call driver.ChatCall, emit dri
 		return nil, err
 	}
 	d.seen = append(d.seen, call.Request)
-	return &ir.ChatResponse{StopReason: ir.StopEnd}, nil
+	// BP-351 turned a zero-output turn into a failed leg even when the client
+	// named no budget, so a fake that emits NOTHING is now an empty reply
+	// instead of a silent success. These tests are about tool stripping, not
+	// about the empty-reply net — give the fake a real answer so it stands for
+	// an ordinary turn.
+	const text = "ok"
+	if err := emit(ir.StreamEvent{Kind: ir.EvText, Delta: text}); err != nil {
+		return nil, err
+	}
+	if err := emit(ir.StreamEvent{Kind: ir.EvDone, Stop: ir.StopEnd}); err != nil {
+		return nil, err
+	}
+	return &ir.ChatResponse{
+		StopReason: ir.StopEnd,
+		Message:    ir.Message{Role: ir.RoleAssistant, Content: []ir.ContentPart{{Kind: "text", Text: text}}},
+	}, nil
 }
 
 // newCompactGateway builds a single-binding gateway over the fake driver.

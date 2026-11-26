@@ -1921,9 +1921,49 @@ function renderAutoClawCredits(d){
   const exp = det.expiring
     ? `将过期 ${det.expiring.points}/${det.expiring.total} 点（${det.expiring.days} 天内）`
     : '无到期数据';
+  // BP-347：分钱包余额与到期。每个钱包各有一笔钱和各一个到期时间，总余额看不出
+  // 「哪笔钱哪天作废」——这正是上游 11-14 补上的那块。
+  const wallets = det.wallets || [];
+  const walletSection = det.wallet_error
+    ? `<div class="small bad" style="margin:6px 0">钱包明细读取失败：${esc(det.wallet_error)}</div>`
+    : (wallets.length ? `<div style="margin:8px 0">
+        <div class="small" style="margin-bottom:4px"><b>分钱包（按到期时间）</b></div>
+        <table><thead><tr><th>钱包</th><th>余额</th><th>到期时间</th><th>剩余</th></tr></thead><tbody>` +
+        wallets.slice().sort((x,y) => {
+          const ex = x.expires_at||'', ey = y.expires_at||'';
+          if (!ex !== !ey) return ex ? -1 : 1;
+          return ex < ey ? -1 : (ex > ey ? 1 : 0);
+        }).map(w => {
+          const days = w.expires_at ? Math.round((new Date(w.expires_at) - Date.now())/86400000) : null;
+          const cls = days === null ? 'muted' : (days <= 3 ? 'bad' : (days <= 7 ? 'warn' : 'ok'));
+          const left = days === null ? '无到期' : (days < 0 ? '已过期' : (days === 0 ? '今天到期' : days + ' 天'));
+          return `<tr><td class="small">${esc(w.name||w.wallet_id||'—')}</td>
+            <td class="mono">${esc(w.balance)} 点</td>
+            <td class="mono small">${w.expires_at?esc(fmtTime(w.expires_at)):'—'}</td>
+            <td class="${cls}">${esc(left)}</td></tr>`;
+        }).join('') + `</tbody></table></div>` : '');
+  // BP-348：国内新版签到卡（只读）。显示今天能领多少、连签几天、有没有限时活动；
+  // 不调用领取接口，当天的领取机会不受影响。
+  const card = d.checkin_card;
+  let cardSection = '';
+  if (d.checkin_card_error) {
+    cardSection = `<div class="small muted" style="margin:6px 0">签到卡（新版协议，只读）读取失败：${esc(d.checkin_card_error)}</div>`;
+  } else if (card) {
+    const bits = [];
+    if (!card.card_visible) bits.push('服务端未开放签到卡');
+    else {
+      if (card.daily_amount) bits.push(`今日 ${esc(card.daily_amount)} 点${card.daily_title?'（'+esc(card.daily_title)+'）':''}`);
+      if (card.streak_days) bits.push(`连签 ${esc(card.streak_days)}${card.streak_max_days?'/'+esc(card.streak_max_days):''} 天`);
+      if (card.claim_status) bits.push('状态 ' + esc(card.claim_status));
+      if (card.events && card.events.length) bits.push('限时活动：' + card.events.map(esc).join('、'));
+      if (card.experiment_group) bits.push('实验组 ' + esc(card.experiment_group));
+    }
+    cardSection = `<div class="small" style="margin:6px 0">签到卡（新版协议，只读）：${bits.join(' · ')||'—'}</div>`;
+  }
   return `<div style="padding:10px 12px">
     <div class="small"><b>余额 ${esc(det.balance)} 点</b> · ${esc(exp)} · 本次流水 ${esc(d.recent_count||0)} 笔共扣 ${esc(d.recent_spent||0)} 点</div>
     <div class="hint" style="margin:6px 0">扣点规则：上游按每次请求的 charged_amount 实时扣点（模型、token 用量、单次上限都在流水里）；负数=扣点，正数=签到/奖励。</div>
+    ${walletSection}${cardSection}
     <div class="tbl-wrap" style="max-height:320px;overflow:auto"><table><thead><tr><th>时间</th><th>模型</th><th>变动</th><th>实扣</th><th>单次上限</th><th>Token 用量</th><th>说明</th></tr></thead><tbody>${rows||'<tr><td colspan="7" class="muted">暂无流水</td></tr>'}</tbody></table></div>
   </div>`;
 }

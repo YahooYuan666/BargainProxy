@@ -50,9 +50,9 @@ import (
 const minStarvedBudget = 16
 
 // emptyReplyOf reports whether a cleanly-terminated turn produced NOTHING the
-// client can act on — no text, no reasoning, no tool call — while the request
-// declared a real output budget (a max_tokens=1 liveness probe is SUPPOSED to
-// answer nothing, so its empty answer is honest and must not be retried).
+// client can act on — no text, no reasoning, no tool call. Only an explicit
+// tiny budget (a max_tokens=1 liveness probe, which is SUPPOSED to answer
+// nothing) is exempt.
 //
 // BP-335 (magpie d847b796 + CLIProxyAPI 892fc486, both 2026-11-20): this shape
 // used to fall through every rescue and reach the success branch, so the
@@ -61,15 +61,25 @@ const minStarvedBudget = 16
 // account may answer fine — so the gateway treats it as a failed leg and lets
 // the existing cascade run.
 //
+// BP-351 (CLIProxyAPI 20be744e / d1bdee85): the max_tokens gate used to exempt
+// "no max_tokens at all" too. That exemption was inherited from the starved
+// rescue, where a client-declared budget IS the premise ("thinking ate the
+// budget that was declared"). A zero-output turn needs no such premise: an
+// upstream that ends cleanly having written nothing is a dead leg whether or
+// not the client named a budget, and the reference's failZeroOutput carries no
+// max_tokens precondition at all. Clients that omit max_tokens (ZCode and
+// several SDKs do) were the ones silently served an empty 200.
+//
 // The starved rescue does NOT cover this: shape A requires finish=length and
 // shape B requires reasoning to have streamed. Here there is neither.
 func emptyReplyOf(req *ir.ChatRequest, ledger *streamLedger) bool {
 	if req == nil || ledger == nil {
 		return false
 	}
-	// A probe (or a client that asked for no output) answering nothing is the
-	// honest result, not a failure.
-	if req.MaxTokens <= 0 || req.MaxTokens < minStarvedBudget {
+	// A liveness probe answering nothing is the honest result, not a failure.
+	// Only a DECLARED-but-tiny budget qualifies; MaxTokens<=0 means the client
+	// stated no preference and the upstream owes an answer (BP-351).
+	if req.MaxTokens > 0 && req.MaxTokens < minStarvedBudget {
 		return false
 	}
 	if ledger.sawTool || ledger.text.Len() > 0 || ledger.thinking.Len() > 0 {
