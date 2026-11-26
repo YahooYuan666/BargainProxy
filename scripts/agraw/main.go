@@ -13,7 +13,7 @@
 //
 // Usage:
 //
-//	go run ./scripts/agraw -model gemini-3.8-flash-high -timeout 40s
+//	go run ./scripts/agraw -model gemini-4-hydrogen -timeout 40s
 package main
 
 import (
@@ -34,7 +34,7 @@ import (
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config.json")
-	modelName := flag.String("model", "gemini-3.8-flash-high", "upstream model id")
+	modelName := flag.String("model", "gemini-4-hydrogen", "upstream model id")
 	prompt := flag.String("prompt", "你好", "user prompt")
 	perHost := flag.Duration("timeout", 40*time.Second, "per-host deadline")
 	nTools := flag.Int("tools", 0, "how many dummy tools to declare")

@@ -125,12 +125,13 @@ func domesticCatalog() []tierRow {
 
 func foreignCatalog() []tierRow {
 	return []tierRow{
-		// Google Antigravity 反代实际提供（AIClient2API gemini-antigravity 清单核对
-		// 2026-10-15）：一个 gemini-3.8-flash 模型族（四档） + 两个 Claude 模型。
-		{Source: "antigravity · Gemini", ID: "gemini-3.8-flash-high", Billing: "窗口账本（high 档消耗快）；API 价 $0.75/$3.75", ContextLen: 1048576, MaxOutput: 65536, InputModes: m("text", "image", "video", "audio", "pdf"), Reasoning: "low/medium/high", ToolCall: true, Structured: true},
-		{Source: "antigravity · Gemini", ID: "gemini-3.8-flash-medium", Billing: "窗口账本；API 价 $0.75/$3.75", ContextLen: 1048576, MaxOutput: 65536, InputModes: m("text", "image", "video", "audio", "pdf"), Reasoning: "low/medium/high", ToolCall: true, Structured: true},
-		{Source: "antigravity · Gemini", ID: "gemini-3.8-flash-low", Billing: "窗口账本（low 最省）；API 价 $0.75/$3.75", ContextLen: 1048576, MaxOutput: 65536, InputModes: m("text", "image", "video", "audio", "pdf"), Reasoning: "low/medium/high", ToolCall: true, Structured: true},
-		{Source: "antigravity · Gemini", ID: "gemini-3.8-flash", Billing: "窗口账本（默认档）；API 价 $0.75/$3.75", ContextLen: 1048576, MaxOutput: 65536, InputModes: m("text", "image", "video", "audio", "pdf"), Reasoning: "low/medium/high", ToolCall: true, Structured: true},
+		// Google Antigravity 反代实际提供。主档是 gemini-4-hydrogen（无档位后缀
+		// 的裸 id 不在上游目录里，驱动会借默认档的 enum，见 antigravity/catalog.go）；
+		// 它由 mergeRouted 从实际路由补进来，不在这里重复登记。
+		//
+		// gemini-3.8-flash 四档已于 2026-11-26 退役并删出本清单：那时起路由表只
+		// 有 gemini-4-hydrogen，留着四行「反代提供」的说法已不成立。历史说明见
+		// 下面「备用档」组的注释。
 		// Claude 经 Antigravity 走 3p/Claude 独立账本；倍率以 Sonnet 4.6 = 1.00× 基准（价取自 models.dev）
 		{Source: "antigravity · Claude 账本", ID: "gemini-claude-sonnet-4-6", Billing: "1.00×（基准）· $3/$15 · 3p 账本", ContextLen: 1000000, MaxOutput: 128000, InputModes: m("text", "image", "pdf"), Reasoning: "low/medium/high/max", ToolCall: true, Structured: true},
 		{Source: "antigravity · Claude 账本", ID: "gemini-claude-opus-4-6-thinking", Billing: "1.67× Sonnet · $5/$25 · 3p 账本 · thinking 版", ContextLen: 1000000, MaxOutput: 128000, InputModes: m("text", "image", "pdf"), Reasoning: "low/medium/high/max", ToolCall: true, Structured: true},

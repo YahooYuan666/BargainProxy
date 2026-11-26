@@ -133,3 +133,27 @@ func TestOutputLimitsMatchTheTierPage(t *testing.T) {
 		}
 	}
 }
+
+// TestRetiredGemini38HasNoClampEntry guards a cleanup that had no test: the
+// 2026-11-26 pass removed the retired gemini-3.8 band from the clamp table
+// (antigravity's live band is gemini-4-hydrogen), and re-adding an entry for a
+// model no route can reach is silent dead weight — it claims a ceiling for a
+// request that can never be served. The same mutation went undetected before
+// this test existed.
+//
+// This is deliberately narrow: it names the one family that was actually
+// retired, not "every entry must be routed" (which would need the router here
+// and would fail on models reachable only through channel-specific paths).
+func TestRetiredGemini38HasNoClampEntry(t *testing.T) {
+	for _, retired := range []string{
+		"gemini-3.8-flash",
+		"gemini-3.8-flash-high",
+		"gemini-3.8-flash-medium",
+		"gemini-3.8-flash-low",
+	} {
+		if _, ok := OutputLimit(retired); ok {
+			t.Errorf("%s is retired (no route can reach it) but still has a clamp entry — "+
+				"the entry is dead weight, remove it or restore the route", retired)
+		}
+	}
+}

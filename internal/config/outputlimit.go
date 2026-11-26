@@ -99,7 +99,11 @@ var outputLimits = map[string]int{
 	"minimax-m2.7": 512000,
 
 	// Google: Gemini's output ceiling is much higher than the CN models.
-	"gemini-3.8-flash":         65536,
+	// The retired 3.8 band was removed together with its route (antigravity's
+	// live band is gemini-4-hydrogen now): an entry here claims a ceiling for a
+	// model, and when no route can reach that model the entry is just dead
+	// weight. gemini-3.5-flash stays — it is still a live fallback tier in the
+	// driver's own lists.
 	"gemini-3.5-flash":         65536,
 	"gemini-claude-sonnet-4-6": 64000,
 	"gemini-claude-opus-4-6":   64000,

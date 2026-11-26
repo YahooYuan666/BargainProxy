@@ -114,12 +114,6 @@
       "priority": 9
     },
     {
-      "canonical": "gemini-3.8-flash-high",
-      "channel": "antigravity",
-      "upstream_model": "gemini-3.8-flash-high",
-      "priority": 0
-    },
-    {
       "canonical": "gemini-4-hydrogen",
       "channel": "aistudio",
       "upstream_model": "gemini-4-hydrogen",
@@ -289,7 +283,6 @@
     }
   ],
   "primary_models": [
-    "gemini-3.8-flash-high",
     "gemini-4-hydrogen",
     "gemini-claude-sonnet-4-6",
     "gemini-claude-opus-4-6-thinking",
