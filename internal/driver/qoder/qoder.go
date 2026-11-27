@@ -852,6 +852,16 @@ func irPayload(call driver.ChatCall) (map[string]any, error) {
 		pendingToolImages, pendingToolLabel = nil, ""
 	}
 	for _, m := range req.Messages {
+		// BP-360: a tool's images take their own message the moment the
+		// model's next turn begins — not on the user's next line. magpie runs
+		// showSeen() at the head of every assistant turn
+		// (internal/gateway/chat.go:488). Parking them until the user speaks
+		// re-attaches them to whatever the user says next; the client replays
+		// the whole history every turn, so the pictures move forward with each
+		// turn and read as freshly sent.
+		if m.Role == ir.RoleAssistant {
+			flushToolImages()
+		}
 		wire := map[string]any{"role": string(m.Role)}
 		switch {
 		case m.Role == ir.RoleTool:
